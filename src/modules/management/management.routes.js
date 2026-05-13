@@ -266,7 +266,8 @@ router.get(
       `SELECT id, name, status, created_at
        FROM tenant_types
        WHERE organization_id = :organizationId
-       ORDER BY name`,
+         AND name IN ('บุคคลธรรมดา', 'นิติบุคคล')
+       ORDER BY FIELD(name, 'บุคคลธรรมดา', 'นิติบุคคล')`,
       { organizationId: req.auth.organizationId },
     );
     return ok(res, rows);
@@ -278,12 +279,30 @@ router.post(
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
   validate(
     z.object({
-      body: z.object({ name: z.string().min(1), status: z.enum(['active', 'inactive']).default('active') }),
+      body: z.object({ name: z.enum(['บุคคลธรรมดา', 'นิติบุคคล']), status: z.enum(['active', 'inactive']).default('active') }),
       query: z.object({}).passthrough(),
       params: z.object({}).passthrough(),
     }),
   ),
   asyncHandler(async (req, res) => {
+    const existing = await query(
+      `SELECT id
+       FROM tenant_types
+       WHERE organization_id = :organizationId AND name = :name
+       LIMIT 1`,
+      { organizationId: req.auth.organizationId, name: req.validated.body.name },
+    );
+
+    if (existing[0]) {
+      await query(
+        `UPDATE tenant_types
+         SET status = :status
+         WHERE id = :id AND organization_id = :organizationId`,
+        { organizationId: req.auth.organizationId, id: existing[0].id, status: req.validated.body.status },
+      );
+      return ok(res, { id: existing[0].id }, 'tenant type updated');
+    }
+
     const result = await query(
       `INSERT INTO tenant_types (organization_id, name, status)
        VALUES (:organizationId, :name, :status)`,

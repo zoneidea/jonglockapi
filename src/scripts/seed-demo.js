@@ -133,11 +133,32 @@ async function findOrCreateByName(connection, table, organizationId, marketId, n
 }
 
 async function upsertTenantType(connection, organizationId, name) {
+  const existing = await one(
+    connection,
+    `SELECT id
+     FROM tenant_types
+     WHERE organization_id = :organizationId AND name = :name
+     ORDER BY id
+     LIMIT 1`,
+    { organizationId, name },
+  );
+
+  if (existing) {
+    await exec(
+      connection,
+      `UPDATE tenant_types
+       SET status = 'active'
+       WHERE id = :id AND organization_id = :organizationId`,
+      { organizationId, id: existing.id },
+    );
+    return existing;
+  }
+
   await exec(
     connection,
     `INSERT INTO tenant_types (organization_id, name, status)
      VALUES (:organizationId, :name, 'active')
-     ON DUPLICATE KEY UPDATE status = 'active'`,
+     `,
     { organizationId, name },
   );
 
@@ -374,9 +395,8 @@ async function main() {
     await assignMarket(connection, organizationId, marketAdmin.id, market.id);
     await assignMarket(connection, organizationId, audit.id, market.id);
 
-    await upsertTenantType(connection, organizationId, 'ผู้ค้าทั่วไป');
-    await upsertTenantType(connection, organizationId, 'ผู้ค้าอาหาร');
-    await upsertTenantType(connection, organizationId, 'ผู้ค้าเครื่องดื่ม');
+    await upsertTenantType(connection, organizationId, 'บุคคลธรรมดา');
+    await upsertTenantType(connection, organizationId, 'นิติบุคคล');
 
     const foodCategory = await findOrCreateByName(connection, 'product_categories', organizationId, market.id, 'อาหาร');
     const drinkCategory = await findOrCreateByName(connection, 'product_categories', organizationId, market.id, 'เครื่องดื่ม');
