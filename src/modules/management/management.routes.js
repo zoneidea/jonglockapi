@@ -114,6 +114,13 @@ function removeUploadedFile(imageUrl) {
   fs.unlink(filePath, () => {});
 }
 
+function copiedBoothCode(sourceCode, floorPlanId) {
+  const suffix = `-C${floorPlanId}`;
+  const base = String(sourceCode || 'BOOTH').replace(/[^A-Za-z0-9-_]/g, '').slice(0, 80);
+  const trimmedBase = base.slice(0, Math.max(1, 80 - suffix.length));
+  return `${trimmedBase}${suffix}`;
+}
+
 async function syncAnnouncementCoverImage(organizationId, announcementId) {
   const coverRows = await query(
     `SELECT image_url
@@ -1097,6 +1104,161 @@ router.post(
       { organizationId: req.auth.organizationId, marketId: parsed.params.marketId, planImageUrl, ...body },
     );
     return created(res, { id: result.insertId, planImageUrl }, 'booth type created');
+  }),
+);
+
+router.patch(
+  '/markets/:marketId/booth-types/:boothTypeId',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  imageUpload.single('planImage'),
+  asyncHandler(async (req, res) => {
+    const parsed = z
+      .object({
+        params: z.object({
+          marketId: z.coerce.number().int().positive(),
+          boothTypeId: z.coerce.number().int().positive(),
+        }),
+        body: z.object({
+          name: z.string().min(1),
+          startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+          endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+          status: z.enum(['active', 'inactive']).default('active'),
+        }),
+      })
+      .parse({ params: req.params, body: req.body });
+
+    const rows = await query(
+      `SELECT plan_image_url
+       FROM floor_plans
+       WHERE id = :boothTypeId AND organization_id = :organizationId AND market_id = :marketId
+       LIMIT 1`,
+      {
+        organizationId: req.auth.organizationId,
+        marketId: parsed.params.marketId,
+        boothTypeId: parsed.params.boothTypeId,
+      },
+    );
+    const current = rows[0];
+    if (!current) throw notFound('Booth type not found');
+
+    const planImageUrl = req.file ? publicUploadUrl(req, req.file.path) : current.plan_image_url;
+    await query(
+      `UPDATE floor_plans
+       SET name = :name,
+           plan_image_url = :planImageUrl,
+           start_date = :startDate,
+           end_date = :endDate,
+           status = :status
+       WHERE id = :boothTypeId AND organization_id = :organizationId AND market_id = :marketId`,
+      {
+        organizationId: req.auth.organizationId,
+        marketId: parsed.params.marketId,
+        boothTypeId: parsed.params.boothTypeId,
+        planImageUrl,
+        ...parsed.body,
+      },
+    );
+    if (req.file && current.plan_image_url !== planImageUrl) removeUploadedFile(current.plan_image_url);
+    return ok(res, { id: parsed.params.boothTypeId, planImageUrl }, 'booth type updated');
+  }),
+);
+
+router.post(
+  '/markets/:marketId/booth-types/copy',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  imageUpload.single('planImage'),
+  asyncHandler(async (req, res) => {
+    const parsed = z
+      .object({
+        params: z.object({ marketId: z.coerce.number().int().positive() }),
+        body: z.object({
+          sourceBoothTypeId: z.coerce.number().int().positive(),
+          name: z.string().min(1),
+          startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+          endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+          status: z.enum(['active', 'inactive']).default('active'),
+        }),
+      })
+      .parse({ params: req.params, body: req.body });
+
+    const sourceRows = await query(
+      `SELECT id, plan_image_url
+       FROM floor_plans
+       WHERE id = :sourceBoothTypeId
+         AND organization_id = :organizationId
+         AND market_id = :marketId
+       LIMIT 1`,
+      {
+        organizationId: req.auth.organizationId,
+        marketId: parsed.params.marketId,
+        sourceBoothTypeId: parsed.body.sourceBoothTypeId,
+      },
+    );
+    const source = sourceRows[0];
+    if (!source) throw notFound('Source booth type not found');
+
+    const result = await transaction(async (connection) => {
+      const planImageUrl = req.file ? publicUploadUrl(req, req.file.path) : source.plan_image_url;
+      const [insertResult] = await connection.execute(
+        `INSERT INTO floor_plans (organization_id, market_id, name, plan_image_url, start_date, end_date, status)
+         VALUES (:organizationId, :marketId, :name, :planImageUrl, :startDate, :endDate, :status)`,
+        {
+          organizationId: req.auth.organizationId,
+          marketId: parsed.params.marketId,
+          name: parsed.body.name,
+          planImageUrl,
+          startDate: parsed.body.startDate,
+          endDate: parsed.body.endDate,
+          status: parsed.body.status,
+        },
+      );
+      const newFloorPlanId = insertResult.insertId;
+
+      const [sourceBooths] = await connection.execute(
+        `SELECT category_id, code, name, price, x, y, width, height, sort_order, status
+         FROM booths
+         WHERE organization_id = :organizationId
+           AND market_id = :marketId
+           AND floor_plan_id = :sourceBoothTypeId
+         ORDER BY sort_order, id`,
+        {
+          organizationId: req.auth.organizationId,
+          marketId: parsed.params.marketId,
+          sourceBoothTypeId: parsed.body.sourceBoothTypeId,
+        },
+      );
+
+      for (const booth of sourceBooths) {
+        await connection.execute(
+          `INSERT INTO booths (
+            organization_id, market_id, floor_plan_id, category_id, code, name, price, x, y, width, height, sort_order, status
+          ) VALUES (
+            :organizationId, :marketId, :floorPlanId, :categoryId, :code, :name, :price, :x, :y, :width, :height, :sortOrder, :status
+          )`,
+          {
+            organizationId: req.auth.organizationId,
+            marketId: parsed.params.marketId,
+            floorPlanId: newFloorPlanId,
+            categoryId: booth.category_id,
+            code: copiedBoothCode(booth.code, newFloorPlanId),
+            name: booth.name,
+            price: booth.price,
+            x: booth.x,
+            y: booth.y,
+            width: booth.width,
+            height: booth.height,
+            sortOrder: booth.sort_order,
+            status: booth.status,
+          },
+        );
+      }
+
+      return { id: newFloorPlanId, planImageUrl, copiedBoothCount: sourceBooths.length };
+    });
+
+    return created(res, result, 'booth type copied');
   }),
 );
 
