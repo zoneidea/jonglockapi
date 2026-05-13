@@ -1,5 +1,8 @@
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const bcrypt = require('bcryptjs');
+const multer = require('multer');
 const { z } = require('zod');
 const { query, transaction } = require('../../config/db');
 const { authenticate } = require('../../middlewares/auth');
@@ -14,6 +17,37 @@ const { publicId } = require('../../utils/id');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
+const uploadRoot = path.join(__dirname, '..', '..', '..', 'uploads');
+const allowedImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+const imageUpload = multer({
+  storage: multer.diskStorage({
+    destination(req, file, callback) {
+      const marketId = String(req.params.marketId || 'unknown').replace(/[^\d]/g, '') || 'unknown';
+      const destination = path.join(uploadRoot, 'markets', marketId);
+      fs.mkdirSync(destination, { recursive: true });
+      callback(null, destination);
+    },
+    filename(req, file, callback) {
+      const extension = path.extname(file.originalname || '').toLowerCase();
+      const safeName = path
+        .basename(file.originalname || 'market-image', extension)
+        .replace(/[^a-zA-Z0-9-_]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 80) || 'market-image';
+      callback(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}-${safeName}${extension}`);
+    },
+  }),
+  limits: { files: 20, fileSize: 5 * 1024 * 1024 },
+  fileFilter(req, file, callback) {
+    if (!allowedImageTypes.has(file.mimetype)) return callback(badRequest('Only JPG, PNG, WEBP, and GIF images are allowed'));
+    return callback(null, true);
+  },
+});
+
+function publicUploadUrl(req, filePath) {
+  const relativePath = path.relative(uploadRoot, filePath).split(path.sep).join('/');
+  return `${req.protocol}://${req.get('host')}/uploads/${relativePath}`;
+}
 
 router.post(
   '/auth/login',
@@ -367,26 +401,52 @@ router.post(
   '/markets/:marketId/images',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
   requireMarketAccess(),
-  validate(
-    z.object({
-      body: z.object({
-        title: z.string().optional().default(''),
-        imageUrl: z.string().url(),
-        sortOrder: z.coerce.number().int().min(0).default(0),
-        status: z.enum(['active', 'inactive']).default('active'),
-      }),
-      query: z.object({}).passthrough(),
-      params: z.object({ marketId: z.coerce.number().int().positive() }),
-    }),
-  ),
+  imageUpload.array('images', 20),
   asyncHandler(async (req, res) => {
-    const body = req.validated.body;
-    const result = await query(
-      `INSERT INTO market_images (organization_id, market_id, title, image_url, sort_order, status)
-       VALUES (:organizationId, :marketId, :title, :imageUrl, :sortOrder, :status)`,
-      { organizationId: req.auth.organizationId, marketId: req.validated.params.marketId, ...body },
-    );
-    return created(res, { id: result.insertId }, 'image created');
+    const parsed = z
+      .object({
+        params: z.object({ marketId: z.coerce.number().int().positive() }),
+        body: z.object({
+          title: z.string().optional().default(''),
+          imageUrl: z.string().url().optional(),
+          sortOrder: z.coerce.number().int().min(0).default(0),
+          status: z.enum(['active', 'inactive']).default('active'),
+        }),
+      })
+      .parse({ params: req.params, body: req.body });
+    const files = req.files || [];
+    if (!files.length && !parsed.body.imageUrl) throw badRequest('Please upload at least one image');
+
+    const records = files.length
+      ? files.map((file, index) => ({
+        title: files.length === 1 ? parsed.body.title : parsed.body.title || file.originalname,
+        imageUrl: publicUploadUrl(req, file.path),
+        sortOrder: parsed.body.sortOrder + index,
+        status: parsed.body.status,
+      }))
+      : [{ title: parsed.body.title, imageUrl: parsed.body.imageUrl, sortOrder: parsed.body.sortOrder, status: parsed.body.status }];
+
+    const inserted = await transaction(async (connection) => {
+      const results = [];
+      for (const record of records) {
+        const [result] = await connection.execute(
+          `INSERT INTO market_images (organization_id, market_id, title, image_url, sort_order, status)
+           VALUES (:organizationId, :marketId, :title, :imageUrl, :sortOrder, :status)`,
+          {
+            organizationId: req.auth.organizationId,
+            marketId: parsed.params.marketId,
+            title: record.title,
+            imageUrl: record.imageUrl,
+            sortOrder: record.sortOrder,
+            status: record.status,
+          },
+        );
+        results.push({ id: result.insertId, ...record });
+      }
+      return results;
+    });
+
+    return created(res, inserted, 'images created');
   }),
 );
 
