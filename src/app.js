@@ -15,7 +15,24 @@ const { notFoundHandler, errorHandler } = require('./middlewares/error-handler')
 const app = express();
 
 app.use(helmet());
-app.use(cors({ origin: env.corsOrigins, credentials: true }));
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin) return callback(null, true);
+      if (env.corsOrigins === '*' || env.corsOrigins.includes(origin)) return callback(null, true);
+
+      try {
+        const hostname = new URL(origin).hostname;
+        if (hostname === 'localhost' || hostname.endsWith('.zonedevnode.com')) return callback(null, true);
+      } catch (error) {
+        return callback(error);
+      }
+
+      return callback(null, false);
+    },
+    credentials: true,
+  }),
+);
 app.use(compression());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
