@@ -287,44 +287,57 @@ async function findOrCreateProduct(connection, organizationId, marketId, categor
   return { id: result.insertId };
 }
 
-async function upsertDemoBooking(connection, organizationId, marketId, mobileUserId, boothId, productId) {
-  const publicId = 'BK-DEMO-PAID-001';
+async function upsertDemoBooking(connection, organizationId, marketId, mobileUserId, boothId, productId, options = {}) {
+  const publicId = options.publicId || 'BK-DEMO-PAID-001';
+  const bookingDate = options.bookingDate || '2026-05-14';
+  const bookingStatus = options.bookingStatus || 'paid';
+  const itemStatus = options.itemStatus || bookingStatus;
+  const amount = options.amount || 500;
+  const paidAt = bookingStatus === 'paid' ? new Date() : null;
   await exec(
     connection,
     `INSERT INTO bookings (
       organization_id, public_id, market_id, mobile_user_id, source, status,
       subtotal_amount, total_amount, paid_at
     ) VALUES (
-      :organizationId, :publicId, :marketId, :mobileUserId, 'mobile', 'paid',
-      500, 500, NOW()
+      :organizationId, :publicId, :marketId, :mobileUserId, 'mobile', :bookingStatus,
+      :amount, :amount, :paidAt
     )
     ON DUPLICATE KEY UPDATE
       market_id = VALUES(market_id),
       mobile_user_id = VALUES(mobile_user_id),
-      status = 'paid',
+      status = VALUES(status),
       subtotal_amount = VALUES(subtotal_amount),
       total_amount = VALUES(total_amount),
-      paid_at = COALESCE(paid_at, NOW())`,
-    { organizationId, publicId, marketId, mobileUserId },
+      paid_at = VALUES(paid_at)`,
+    { organizationId, publicId, marketId, mobileUserId, bookingStatus, amount, paidAt },
   );
 
   const booking = await one(connection, `SELECT id FROM bookings WHERE public_id = :publicId LIMIT 1`, { publicId });
   let item = await one(
     connection,
     `SELECT id FROM booking_items
-     WHERE organization_id = :organizationId AND booking_id = :bookingId AND booth_id = :boothId AND booking_date = '2026-05-13'
+     WHERE organization_id = :organizationId AND booking_id = :bookingId AND booth_id = :boothId AND booking_date = :bookingDate
      LIMIT 1`,
-    { organizationId, bookingId: booking.id, boothId },
+    { organizationId, bookingId: booking.id, boothId, bookingDate },
   );
 
   if (!item) {
     const result = await exec(
       connection,
       `INSERT INTO booking_items (organization_id, booking_id, booth_id, booking_date, unit_price, status, audit_status)
-       VALUES (:organizationId, :bookingId, :boothId, '2026-05-13', 500, 'paid', 'pending')`,
-      { organizationId, bookingId: booking.id, boothId },
+       VALUES (:organizationId, :bookingId, :boothId, :bookingDate, :amount, :itemStatus, 'pending')`,
+      { organizationId, bookingId: booking.id, boothId, bookingDate, amount, itemStatus },
     );
     item = { id: result.insertId };
+  } else {
+    await exec(
+      connection,
+      `UPDATE booking_items
+       SET unit_price = :amount, status = :itemStatus
+       WHERE id = :bookingItemId AND organization_id = :organizationId`,
+      { organizationId, bookingItemId: item.id, amount, itemStatus },
+    );
   }
 
   const linkedProduct = await one(
@@ -343,13 +356,17 @@ async function upsertDemoBooking(connection, organizationId, marketId, mobileUse
     );
   }
 
-  await exec(
-    connection,
-    `INSERT INTO payments (organization_id, public_id, booking_id, provider, provider_reference, status, amount, paid_at)
-     VALUES (:organizationId, 'PAY-DEMO-001', :bookingId, 'mock', 'MOCK-DEMO-001', 'paid', 500, NOW())
-     ON DUPLICATE KEY UPDATE status = 'paid', amount = VALUES(amount), paid_at = COALESCE(paid_at, NOW())`,
-    { organizationId, bookingId: booking.id },
-  );
+  if (bookingStatus === 'paid') {
+    const paymentPublicId = options.paymentPublicId || 'PAY-DEMO-001';
+    const providerReference = options.providerReference || `MOCK-${publicId}`;
+    await exec(
+      connection,
+      `INSERT INTO payments (organization_id, public_id, booking_id, provider, provider_reference, status, amount, paid_at)
+       VALUES (:organizationId, :paymentPublicId, :bookingId, 'mock', :providerReference, 'paid', :amount, NOW())
+       ON DUPLICATE KEY UPDATE status = 'paid', amount = VALUES(amount), paid_at = COALESCE(paid_at, NOW())`,
+      { organizationId, paymentPublicId, bookingId: booking.id, providerReference, amount },
+    );
+  }
 
   return { bookingId: booking.id, bookingItemId: item.id };
 }
@@ -467,7 +484,28 @@ async function main() {
     );
 
     const mobileUser = await upsertMobileUser(connection, organizationId);
-    const demoBooking = await upsertDemoBooking(connection, organizationId, market.id, mobileUser.id, booths[0].id, product.id);
+    const demoBooking = await upsertDemoBooking(connection, organizationId, market.id, mobileUser.id, booths[0].id, product.id, {
+      publicId: 'BK-DEMO-PAID-001',
+      paymentPublicId: 'PAY-DEMO-001',
+      bookingDate: '2026-05-14',
+      bookingStatus: 'paid',
+      itemStatus: 'paid',
+      amount: 500,
+    });
+    await upsertDemoBooking(connection, organizationId, market.id, mobileUser.id, booths[1].id, product.id, {
+      publicId: 'BK-DEMO-PENDING-001',
+      bookingDate: '2026-05-14',
+      bookingStatus: 'pending_payment',
+      itemStatus: 'pending_payment',
+      amount: 500,
+    });
+    await upsertDemoBooking(connection, organizationId, market.id, mobileUser.id, booths[2].id, product.id, {
+      publicId: 'BK-DEMO-PROCESS-001',
+      bookingDate: '2026-05-14',
+      bookingStatus: 'payment_processing',
+      itemStatus: 'payment_processing',
+      amount: 500,
+    });
 
     await connection.commit();
 

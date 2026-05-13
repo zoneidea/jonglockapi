@@ -121,6 +121,49 @@ function copiedBoothCode(sourceCode, floorPlanId) {
   return `${trimmedBase}${suffix}`;
 }
 
+function nextSequenceCode(rows, fieldName, defaultPrefix) {
+  let maxNumber = 0;
+  let bestPrefix = defaultPrefix;
+  let bestWidth = 3;
+
+  for (const row of rows) {
+    const rawValue = String(row?.[fieldName] || '').trim();
+    const match = rawValue.match(/^([^0-9]*?)(\d+)$/);
+    if (!match) continue;
+    const prefix = match[1] || defaultPrefix;
+    const digits = match[2];
+    const numericValue = Number(digits);
+    if (Number.isNaN(numericValue)) continue;
+    if (numericValue > maxNumber) {
+      maxNumber = numericValue;
+      bestPrefix = prefix;
+      bestWidth = Math.max(3, digits.length);
+    }
+  }
+
+  return `${bestPrefix}${String(maxNumber + 1).padStart(bestWidth, '0')}`;
+}
+
+async function buildNextMarketCode(organizationId) {
+  const rows = await query(
+    `SELECT code
+     FROM markets
+     WHERE organization_id = :organizationId`,
+    { organizationId },
+  );
+  return nextSequenceCode(rows, 'code', 'MKT');
+}
+
+async function buildNextBoothCode(organizationId, marketId) {
+  const rows = await query(
+    `SELECT code
+     FROM booths
+     WHERE organization_id = :organizationId AND market_id = :marketId`,
+    { organizationId, marketId },
+  );
+  return nextSequenceCode(rows, 'code', 'B');
+}
+
 async function syncAnnouncementCoverImage(organizationId, announcementId) {
   const coverRows = await query(
     `SELECT image_url
@@ -915,6 +958,15 @@ router.get(
   }),
 );
 
+router.get(
+  '/markets/next-code',
+  requireRoles(ROLES.SUPERVISOR),
+  asyncHandler(async (req, res) => {
+    const code = await buildNextMarketCode(req.auth.organizationId);
+    return ok(res, { code });
+  }),
+);
+
 router.patch(
   '/markets/:marketId',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
@@ -1281,8 +1333,60 @@ router.get(
   }),
 );
 
+router.get(
+  '/markets/:marketId/booths/next-code',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  asyncHandler(async (req, res) => {
+    const marketId = Number(req.params.marketId);
+    const code = await buildNextBoothCode(req.auth.organizationId, marketId);
+    return ok(res, { code });
+  }),
+);
+
 router.post(
   '/markets/:marketId/booths',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  validate(
+    z.object({
+      body: z.object({
+        floorPlanId: z.coerce.number().int().positive().optional().nullable(),
+        categoryId: z.coerce.number().int().positive().optional().nullable(),
+        code: z.string().optional().default(''),
+        name: z.string().min(1),
+        price: z.coerce.number().min(0),
+        sortOrder: z.coerce.number().int().min(0).default(0),
+        status: z.enum(['active', 'inactive', 'maintenance']).default('active'),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({ marketId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const body = req.validated.body;
+    const code = String(body.code || '').trim() || await buildNextBoothCode(req.auth.organizationId, req.validated.params.marketId);
+    const result = await query(
+      `INSERT INTO booths (organization_id, market_id, floor_plan_id, category_id, code, name, price, sort_order, status)
+       VALUES (:organizationId, :marketId, :floorPlanId, :categoryId, :code, :name, :price, :sortOrder, :status)`,
+      {
+        organizationId: req.auth.organizationId,
+        marketId: req.validated.params.marketId,
+        floorPlanId: body.floorPlanId || null,
+        categoryId: body.categoryId || null,
+        code,
+        name: body.name,
+        price: body.price,
+        sortOrder: body.sortOrder,
+        status: body.status,
+      },
+    );
+    return created(res, { id: result.insertId }, 'booth created');
+  }),
+);
+
+router.patch(
+  '/markets/:marketId/booths/:boothId',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
   requireMarketAccess(),
   validate(
@@ -1297,27 +1401,40 @@ router.post(
         status: z.enum(['active', 'inactive', 'maintenance']).default('active'),
       }),
       query: z.object({}).passthrough(),
-      params: z.object({ marketId: z.coerce.number().int().positive() }),
+      params: z.object({
+        marketId: z.coerce.number().int().positive(),
+        boothId: z.coerce.number().int().positive(),
+      }),
     }),
   ),
   asyncHandler(async (req, res) => {
+    const { marketId, boothId } = req.validated.params;
     const body = req.validated.body;
     const result = await query(
-      `INSERT INTO booths (organization_id, market_id, floor_plan_id, category_id, code, name, price, sort_order, status)
-       VALUES (:organizationId, :marketId, :floorPlanId, :categoryId, :code, :name, :price, :sortOrder, :status)`,
+      `UPDATE booths
+       SET floor_plan_id = :floorPlanId,
+           category_id = :categoryId,
+           code = :code,
+           name = :name,
+           price = :price,
+           sort_order = :sortOrder,
+           status = :status
+       WHERE id = :boothId AND organization_id = :organizationId AND market_id = :marketId`,
       {
         organizationId: req.auth.organizationId,
-        marketId: req.validated.params.marketId,
+        marketId,
+        boothId,
         floorPlanId: body.floorPlanId || null,
         categoryId: body.categoryId || null,
-        code: body.code,
+        code: String(body.code || '').trim(),
         name: body.name,
         price: body.price,
         sortOrder: body.sortOrder,
         status: body.status,
       },
     );
-    return created(res, { id: result.insertId }, 'booth created');
+    if (!result.affectedRows) throw notFound('Booth not found');
+    return ok(res, { id: boothId }, 'booth updated');
   }),
 );
 
@@ -1542,7 +1659,7 @@ router.post(
     const parsed = z
       .object({
         body: z.object({
-          code: z.string().min(1),
+          code: z.string().optional().default(''),
           name: z.string().min(1),
           description: z.string().optional().default(''),
           openDate: z.string().optional().nullable(),
@@ -1551,13 +1668,14 @@ router.post(
       })
       .parse({ body: req.body });
     const body = parsed.body;
+    const code = String(body.code || '').trim() || await buildNextMarketCode(req.auth.organizationId);
     const mainImageUrl = req.file ? publicUploadUrl(req, req.file.path) : null;
     const result = await query(
       `INSERT INTO markets (organization_id, code, name, description, main_image_url, open_date, close_date, status)
        VALUES (:organizationId, :code, :name, :description, :mainImageUrl, :openDate, :closeDate, 'active')`,
       {
         organizationId: req.auth.organizationId,
-        code: body.code,
+        code,
         name: body.name,
         description: body.description,
         mainImageUrl,
@@ -1584,6 +1702,86 @@ router.get(
        ORDER BY b.created_at DESC
        LIMIT 500`,
       { organizationId: req.auth.organizationId, marketId: Number(req.params.marketId) },
+    );
+    return ok(res, rows);
+  }),
+);
+
+router.get(
+  '/markets/:marketId/bookings/booth-availability',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({
+        bookingDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        productId: z.coerce.number().int().positive(),
+        floorPlanId: z.coerce.number().int().positive().optional(),
+      }),
+      params: z.object({ marketId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { marketId } = req.validated.params;
+    const { bookingDate, productId, floorPlanId } = req.validated.query;
+    const productRows = await query(
+      `SELECT id, category_id
+       FROM products
+       WHERE id = :productId
+         AND organization_id = :organizationId
+         AND market_id = :marketId
+         AND status = 'active'
+       LIMIT 1`,
+      { organizationId: req.auth.organizationId, marketId, productId },
+    );
+    const product = productRows[0];
+    if (!product) throw notFound('Product not found');
+
+    const rows = await query(
+      `SELECT b.id, b.code, b.name, b.price, b.category_id, c.name AS category_name,
+              b.floor_plan_id, fp.name AS floor_plan_name, b.sort_order, b.status,
+              CASE
+                WHEN booking_state.availability_rank = 2 THEN 'booked'
+                WHEN booking_state.availability_rank = 1 THEN 'processing'
+                ELSE 'available'
+              END AS availability_status,
+              booking_state.booking_public_id
+       FROM booths b
+       LEFT JOIN product_categories c ON c.id = b.category_id
+       LEFT JOIN floor_plans fp ON fp.id = b.floor_plan_id
+       LEFT JOIN (
+         SELECT bi.booth_id,
+                MAX(CASE
+                  WHEN bi.status = 'paid' OR bk.status = 'paid' THEN 2
+                  WHEN bi.status IN ('pending_payment', 'payment_processing')
+                    OR bk.status IN ('pending_payment', 'payment_processing') THEN 1
+                  ELSE 0
+                END) AS availability_rank,
+                MAX(bk.public_id) AS booking_public_id
+         FROM booking_items bi
+         JOIN bookings bk ON bk.id = bi.booking_id
+         WHERE bi.organization_id = :organizationId
+           AND bk.organization_id = :organizationId
+           AND bk.market_id = :marketId
+           AND bi.booking_date = :bookingDate
+           AND bi.status IN ('pending_payment', 'payment_processing', 'paid')
+           AND bk.status IN ('pending_payment', 'payment_processing', 'paid')
+         GROUP BY bi.booth_id
+       ) booking_state ON booking_state.booth_id = b.id
+       WHERE b.organization_id = :organizationId
+         AND b.market_id = :marketId
+         AND b.status = 'active'
+         AND b.category_id = :categoryId
+         AND (:floorPlanId IS NULL OR b.floor_plan_id = :floorPlanId)
+       ORDER BY b.sort_order ASC, b.code ASC, b.name ASC`,
+      {
+        organizationId: req.auth.organizationId,
+        marketId,
+        bookingDate,
+        categoryId: product.category_id,
+        floorPlanId: floorPlanId || null,
+      },
     );
     return ok(res, rows);
   }),
@@ -1723,7 +1921,7 @@ router.get(
   requireMarketAccess(),
   asyncHandler(async (req, res) => {
     const rows = await query(
-      `SELECT p.id, p.name, p.status, c.name AS category_name, g.name AS group_name
+      `SELECT p.id, p.name, p.category_id, p.group_id, p.status, c.name AS category_name, g.name AS group_name
        FROM products p
        LEFT JOIN product_categories c ON c.id = p.category_id
        LEFT JOIN product_groups g ON g.id = p.group_id
