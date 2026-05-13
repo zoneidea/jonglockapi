@@ -132,22 +132,41 @@ async function findOrCreateByName(connection, table, organizationId, marketId, n
   return { id: result.insertId };
 }
 
+async function upsertTenantType(connection, organizationId, name) {
+  await exec(
+    connection,
+    `INSERT INTO tenant_types (organization_id, name, status)
+     VALUES (:organizationId, :name, 'active')
+     ON DUPLICATE KEY UPDATE status = 'active'`,
+    { organizationId, name },
+  );
+
+  return one(
+    connection,
+    `SELECT id FROM tenant_types
+     WHERE organization_id = :organizationId AND name = :name
+     LIMIT 1`,
+    { organizationId, name },
+  );
+}
+
 async function upsertMobileUser(connection, organizationId) {
   const username = 'vendor001';
   await exec(
     connection,
     `INSERT INTO mobile_users (
-      organization_id, public_id, username_hash, password_hash,
+      organization_id, public_id, username_enc, username_hash, password_hash,
       first_name_enc, last_name_enc, phone_enc, phone_hash,
       email_enc, email_hash, id_card_enc, id_card_hash, address_enc,
       accepted_consent_at, status
     ) VALUES (
-      :organizationId, 'MB-DEMO-001', :usernameHash, :passwordHash,
+      :organizationId, 'MB-DEMO-001', :usernameEnc, :usernameHash, :passwordHash,
       :firstNameEnc, :lastNameEnc, :phoneEnc, :phoneHash,
       :emailEnc, :emailHash, :idCardEnc, :idCardHash, :addressEnc,
       NOW(), 'active'
     )
     ON DUPLICATE KEY UPDATE
+      username_enc = VALUES(username_enc),
       password_hash = VALUES(password_hash),
       first_name_enc = VALUES(first_name_enc),
       last_name_enc = VALUES(last_name_enc),
@@ -162,6 +181,7 @@ async function upsertMobileUser(connection, organizationId) {
       status = 'active'`,
     {
       organizationId,
+      usernameEnc: encryptField(username),
       usernameHash: blindIndex(username),
       passwordHash: await bcrypt.hash(DEFAULT_VENDOR_PASSWORD, 12),
       firstNameEnc: encryptField('สมชาย'),
@@ -353,6 +373,10 @@ async function main() {
     const market = await upsertMarket(connection, organizationId);
     await assignMarket(connection, organizationId, marketAdmin.id, market.id);
     await assignMarket(connection, organizationId, audit.id, market.id);
+
+    await upsertTenantType(connection, organizationId, 'ผู้ค้าทั่วไป');
+    await upsertTenantType(connection, organizationId, 'ผู้ค้าอาหาร');
+    await upsertTenantType(connection, organizationId, 'ผู้ค้าเครื่องดื่ม');
 
     const foodCategory = await findOrCreateByName(connection, 'product_categories', organizationId, market.id, 'อาหาร');
     const drinkCategory = await findOrCreateByName(connection, 'product_categories', organizationId, market.id, 'เครื่องดื่ม');

@@ -298,7 +298,7 @@ router.get(
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
   asyncHandler(async (req, res) => {
     const rows = await query(
-      `SELECT mu.id, mu.public_id, mu.tenant_type_id, tt.name AS tenant_type_name,
+      `SELECT mu.id, mu.public_id, mu.username_enc, mu.tenant_type_id, tt.name AS tenant_type_name,
               mu.first_name_enc, mu.last_name_enc, mu.phone_enc, mu.email_enc, mu.id_card_enc, mu.address_enc,
               mu.status, mu.accepted_consent_at, mu.created_at
        FROM mobile_users mu
@@ -313,10 +313,10 @@ router.get(
       rows.map((row) => ({
         id: row.id,
         public_id: row.public_id,
+        username: decryptField(row.username_enc),
         tenant_type_id: row.tenant_type_id,
         tenant_type_name: row.tenant_type_name,
-        first_name: decryptField(row.first_name_enc),
-        last_name: decryptField(row.last_name_enc),
+        name: [decryptField(row.first_name_enc), decryptField(row.last_name_enc)].filter(Boolean).join(' ').trim(),
         phone: decryptField(row.phone_enc),
         email: decryptField(row.email_enc),
         id_card: decryptField(row.id_card_enc),
@@ -335,16 +335,14 @@ router.post(
   validate(
     z.object({
       body: z.object({
-        username: z.string().min(1),
+        username: z.string().min(4).max(60),
         password: z.string().min(8).default('Vendor@123456'),
-        tenantTypeId: z.coerce.number().int().positive().optional().nullable(),
-        firstName: z.string().min(1),
-        lastName: z.string().optional().default(''),
-        phone: z.string().optional().default(''),
-        email: z.string().optional().default(''),
-        idCard: z.string().optional().default(''),
-        address: z.string().optional().default(''),
-        status: z.enum(['active', 'pending', 'suspended', 'deleted']).default('active'),
+        tenantTypeId: z.coerce.number().int().positive(),
+        name: z.string().min(1).max(255),
+        phone: z.string().min(8).max(20),
+        email: z.email(),
+        idCard: z.string().min(13).max(20),
+        address: z.string().min(5).max(1000),
       }),
       query: z.object({}).passthrough(),
       params: z.object({}).passthrough(),
@@ -354,22 +352,23 @@ router.post(
     const body = req.validated.body;
     const result = await query(
       `INSERT INTO mobile_users (
-        organization_id, tenant_type_id, public_id, username_hash, password_hash,
+        organization_id, tenant_type_id, public_id, username_enc, username_hash, password_hash,
         first_name_enc, last_name_enc, phone_enc, phone_hash, email_enc, email_hash,
         id_card_enc, id_card_hash, address_enc, status
       ) VALUES (
-        :organizationId, :tenantTypeId, :publicId, :usernameHash, :passwordHash,
+        :organizationId, :tenantTypeId, :publicId, :usernameEnc, :usernameHash, :passwordHash,
         :firstNameEnc, :lastNameEnc, :phoneEnc, :phoneHash, :emailEnc, :emailHash,
-        :idCardEnc, :idCardHash, :addressEnc, :status
+        :idCardEnc, :idCardHash, :addressEnc, 'active'
       )`,
       {
         organizationId: req.auth.organizationId,
-        tenantTypeId: body.tenantTypeId || null,
+        tenantTypeId: body.tenantTypeId,
         publicId: publicId('MB'),
+        usernameEnc: encryptField(body.username),
         usernameHash: blindIndex(body.username),
         passwordHash: await bcrypt.hash(body.password, 10),
-        firstNameEnc: encryptField(body.firstName),
-        lastNameEnc: encryptField(body.lastName),
+        firstNameEnc: encryptField(body.name),
+        lastNameEnc: encryptField(''),
         phoneEnc: encryptField(body.phone),
         phoneHash: body.phone ? blindIndex(body.phone) : null,
         emailEnc: encryptField(body.email),
@@ -377,10 +376,75 @@ router.post(
         idCardEnc: encryptField(body.idCard),
         idCardHash: body.idCard ? blindIndex(body.idCard) : null,
         addressEnc: encryptField(body.address),
-        status: body.status,
       },
     );
     return created(res, { id: result.insertId }, 'tenant created');
+  }),
+);
+
+router.patch(
+  '/tenants/:tenantId',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  validate(
+    z.object({
+      body: z.object({
+        username: z.string().min(4).max(60),
+        password: z.string().min(8).optional().or(z.literal('')),
+        tenantTypeId: z.coerce.number().int().positive(),
+        name: z.string().min(1).max(255),
+        phone: z.string().min(8).max(20),
+        email: z.email(),
+        idCard: z.string().min(13).max(20),
+        address: z.string().min(5).max(1000),
+        status: z.enum(['active', 'pending', 'suspended', 'deleted']).default('active'),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({ tenantId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const body = req.validated.body;
+    const tenantId = req.validated.params.tenantId;
+    const passwordSql = body.password ? ', password_hash = :passwordHash' : '';
+    const params = {
+      organizationId: req.auth.organizationId,
+      tenantId,
+      tenantTypeId: body.tenantTypeId,
+      usernameEnc: encryptField(body.username),
+      usernameHash: blindIndex(body.username),
+      firstNameEnc: encryptField(body.name),
+      lastNameEnc: encryptField(''),
+      phoneEnc: encryptField(body.phone),
+      phoneHash: blindIndex(body.phone),
+      emailEnc: encryptField(body.email),
+      emailHash: blindIndex(body.email),
+      idCardEnc: encryptField(body.idCard),
+      idCardHash: blindIndex(body.idCard),
+      addressEnc: encryptField(body.address),
+      status: body.status,
+    };
+    if (body.password) params.passwordHash = await bcrypt.hash(body.password, 10);
+
+    await query(
+      `UPDATE mobile_users
+       SET tenant_type_id = :tenantTypeId,
+           username_enc = :usernameEnc,
+           username_hash = :usernameHash,
+           first_name_enc = :firstNameEnc,
+           last_name_enc = :lastNameEnc,
+           phone_enc = :phoneEnc,
+           phone_hash = :phoneHash,
+           email_enc = :emailEnc,
+           email_hash = :emailHash,
+           id_card_enc = :idCardEnc,
+           id_card_hash = :idCardHash,
+           address_enc = :addressEnc,
+           status = :status
+           ${passwordSql}
+       WHERE id = :tenantId AND organization_id = :organizationId`,
+      params,
+    );
+    return ok(res, { id: tenantId }, 'tenant updated');
   }),
 );
 
