@@ -33,10 +33,11 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'jonglock-backend' });
 });
 
-app.use(`${env.API_PREFIX}/mobile`, mobileRoutes);
 app.use(`${env.API_PREFIX}/mobile/audit`, auditRoutes);
-app.use(`${env.API_PREFIX}/management`, managementRoutes);
 app.use(`${env.API_PREFIX}/mobile/payments`, paymentRoutes);
+app.use(`${env.API_PREFIX}/mobile`, mobileRoutes);
+app.use(`${env.API_PREFIX}/management`, managementRoutes);
+app.use('/management', managementRoutes);
 
 app.use(notFoundHandler);
 app.use(errorHandler);
