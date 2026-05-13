@@ -1076,26 +1076,27 @@ router.post(
   '/markets/:marketId/booth-types',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
   requireMarketAccess(),
-  validate(
-    z.object({
-      body: z.object({
-        name: z.string().min(1),
-        startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-        endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
-        status: z.enum(['active', 'inactive']).default('active'),
-      }),
-      query: z.object({}).passthrough(),
-      params: z.object({ marketId: z.coerce.number().int().positive() }),
-    }),
-  ),
+  imageUpload.single('planImage'),
   asyncHandler(async (req, res) => {
-    const body = req.validated.body;
+    const parsed = z
+      .object({
+        params: z.object({ marketId: z.coerce.number().int().positive() }),
+        body: z.object({
+          name: z.string().min(1),
+          startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+          endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+          status: z.enum(['active', 'inactive']).default('active'),
+        }),
+      })
+      .parse({ params: req.params, body: req.body });
+    const body = parsed.body;
+    const planImageUrl = req.file ? publicUploadUrl(req, req.file.path) : null;
     const result = await query(
-      `INSERT INTO floor_plans (organization_id, market_id, name, start_date, end_date, status)
-       VALUES (:organizationId, :marketId, :name, :startDate, :endDate, :status)`,
-      { organizationId: req.auth.organizationId, marketId: req.validated.params.marketId, ...body },
+      `INSERT INTO floor_plans (organization_id, market_id, name, plan_image_url, start_date, end_date, status)
+       VALUES (:organizationId, :marketId, :name, :planImageUrl, :startDate, :endDate, :status)`,
+      { organizationId: req.auth.organizationId, marketId: parsed.params.marketId, planImageUrl, ...body },
     );
-    return created(res, { id: result.insertId }, 'booth type created');
+    return created(res, { id: result.insertId, planImageUrl }, 'booth type created');
   }),
 );
 
