@@ -14,6 +14,7 @@ const { ok, created } = require('../../utils/api-response');
 const { badRequest, conflict, notFound } = require('../../utils/errors');
 const { encryptField, blindIndex, decryptField } = require('../../utils/crypto');
 const { publicId } = require('../../utils/id');
+const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/password-policy');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
@@ -355,7 +356,7 @@ router.post(
     z.object({
       body: z.object({
         username: z.string().min(4).max(60),
-        password: z.string().min(8).default('Vendor@123456'),
+        password: z.string().min(10).refine(assertPasswordPolicy, PASSWORD_POLICY_MESSAGE).default('Vendor@123456'),
         tenantTypeId: z.coerce.number().int().positive(),
         name: z.string().min(1).max(255),
         phone: z.string().min(8).max(20),
@@ -408,7 +409,7 @@ router.patch(
     z.object({
       body: z.object({
         username: z.string().min(4).max(60),
-        password: z.string().min(8).optional().or(z.literal('')),
+        password: z.string().min(10).refine(assertPasswordPolicy, PASSWORD_POLICY_MESSAGE).optional().or(z.literal('')),
         tenantTypeId: z.coerce.number().int().positive(),
         name: z.string().min(1).max(255),
         phone: z.string().min(8).max(20),
@@ -1389,7 +1390,7 @@ router.post(
     z.object({
       body: z.object({
         username: z.string().min(3),
-        password: z.string().min(8),
+        password: z.string().min(10).refine(assertPasswordPolicy, PASSWORD_POLICY_MESSAGE),
         role: z.enum([ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING, ROLES.AUDIT]),
         name: z.string().min(1),
         email: z.string().email().optional().or(z.literal('')).default(''),

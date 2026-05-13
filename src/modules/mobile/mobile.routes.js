@@ -10,6 +10,7 @@ const { ok, created } = require('../../utils/api-response');
 const { badRequest, conflict, forbidden, notFound } = require('../../utils/errors');
 const { encryptField, blindIndex } = require('../../utils/crypto');
 const { publicId } = require('../../utils/id');
+const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/password-policy');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
@@ -37,7 +38,7 @@ const registerSchema = z.object({
   body: z.object({
     organizationId: z.coerce.number().int().positive(),
     username: z.string().min(3),
-    password: z.string().min(8),
+    password: z.string().min(10).refine(assertPasswordPolicy, PASSWORD_POLICY_MESSAGE),
     firstName: z.string().min(1),
     lastName: z.string().min(1),
     phone: z.string().optional().default(''),

@@ -2,6 +2,7 @@ const bcrypt = require('bcryptjs');
 const { pool } = require('../config/db');
 const { logger } = require('../config/logger');
 const { encryptField, blindIndex } = require('../utils/crypto');
+const { isStrongPassword, PASSWORD_POLICY_MESSAGE } = require('../utils/password-policy');
 
 async function main() {
   const orgCode = process.env.SEED_ORG_CODE || 'ORG001';
@@ -14,6 +15,9 @@ async function main() {
 
   if (!username || !password) {
     throw new Error('SEED_ADMIN_USERNAME and SEED_ADMIN_PASSWORD are required');
+  }
+  if (!isStrongPassword(password)) {
+    throw new Error(PASSWORD_POLICY_MESSAGE);
   }
 
   const connection = await pool.getConnection();
