@@ -49,6 +49,20 @@ function publicUploadUrl(req, filePath) {
   return `${req.protocol}://${req.get('host')}/uploads/${relativePath}`;
 }
 
+function removeUploadedFile(imageUrl) {
+  if (!imageUrl) return;
+  let pathname = '';
+  try {
+    pathname = new URL(imageUrl).pathname;
+  } catch (error) {
+    pathname = imageUrl;
+  }
+  if (!pathname.startsWith('/uploads/')) return;
+  const filePath = path.join(uploadRoot, pathname.replace(/^\/uploads\//, ''));
+  if (!filePath.startsWith(uploadRoot)) return;
+  fs.unlink(filePath, () => {});
+}
+
 router.post(
   '/auth/login',
   validate(
@@ -447,6 +461,64 @@ router.post(
     });
 
     return created(res, inserted, 'images created');
+  }),
+);
+
+router.patch(
+  '/markets/:marketId/images/:imageId',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  imageUpload.single('image'),
+  asyncHandler(async (req, res) => {
+    const parsed = z
+      .object({
+        params: z.object({
+          marketId: z.coerce.number().int().positive(),
+          imageId: z.coerce.number().int().positive(),
+        }),
+        body: z.object({
+          title: z.string().optional().default(''),
+          sortOrder: z.coerce.number().int().min(0).default(0),
+          status: z.enum(['active', 'inactive']).default('active'),
+        }),
+      })
+      .parse({ params: req.params, body: req.body });
+
+    const rows = await query(
+      `SELECT id, image_url
+       FROM market_images
+       WHERE id = :imageId AND organization_id = :organizationId AND market_id = :marketId
+       LIMIT 1`,
+      {
+        organizationId: req.auth.organizationId,
+        marketId: parsed.params.marketId,
+        imageId: parsed.params.imageId,
+      },
+    );
+    const current = rows[0];
+    if (!current) throw notFound('Market image not found');
+
+    const imageUrl = req.file ? publicUploadUrl(req, req.file.path) : current.image_url;
+    await query(
+      `UPDATE market_images
+       SET title = :title,
+           image_url = :imageUrl,
+           sort_order = :sortOrder,
+           status = :status
+       WHERE id = :imageId AND organization_id = :organizationId AND market_id = :marketId`,
+      {
+        organizationId: req.auth.organizationId,
+        marketId: parsed.params.marketId,
+        imageId: parsed.params.imageId,
+        title: parsed.body.title,
+        imageUrl,
+        sortOrder: parsed.body.sortOrder,
+        status: parsed.body.status,
+      },
+    );
+
+    if (req.file && current.image_url !== imageUrl) removeUploadedFile(current.image_url);
+    return ok(res, { id: parsed.params.imageId, title: parsed.body.title, imageUrl, sortOrder: parsed.body.sortOrder, status: parsed.body.status }, 'image updated');
   }),
 );
 
