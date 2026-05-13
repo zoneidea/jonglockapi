@@ -12,7 +12,7 @@ const { ROLES, MENU_ACCESS } = require('../../constants/roles');
 const { asyncHandler } = require('../../utils/async-handler');
 const { ok, created } = require('../../utils/api-response');
 const { badRequest, conflict, notFound } = require('../../utils/errors');
-const { encryptField, blindIndex } = require('../../utils/crypto');
+const { encryptField, blindIndex, decryptField } = require('../../utils/crypto');
 const { publicId } = require('../../utils/id');
 const authService = require('../auth/auth.service');
 
@@ -92,6 +92,363 @@ router.get('/me', (req, res) => {
     marketIds: req.auth.marketIds || [],
   });
 });
+
+router.get(
+  '/announcements',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  asyncHandler(async (req, res) => {
+    const type = ['news', 'banner'].includes(req.query.type) ? req.query.type : null;
+    const rows = await query(
+      `SELECT id, market_id, type, title, description, image_url, start_date, end_date, status, created_at
+       FROM announcement_items
+       WHERE organization_id = :organizationId
+         AND (:type IS NULL OR type = :type)
+       ORDER BY start_date DESC, id DESC`,
+      { organizationId: req.auth.organizationId, type },
+    );
+    return ok(res, rows);
+  }),
+);
+
+router.post(
+  '/announcements',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  imageUpload.single('image'),
+  asyncHandler(async (req, res) => {
+    const parsed = z
+      .object({
+        body: z.object({
+          type: z.enum(['news', 'banner']),
+          marketId: z.coerce.number().int().positive().optional().nullable(),
+          title: z.string().min(1),
+          description: z.string().optional().default(''),
+          startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+          endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+          status: z.enum(['active', 'inactive']).default('active'),
+        }),
+      })
+      .parse({ body: req.body });
+    const body = parsed.body;
+    const imageUrl = req.file ? publicUploadUrl(req, req.file.path) : null;
+    const result = await query(
+      `INSERT INTO announcement_items (
+        organization_id, market_id, type, title, description, image_url, start_date, end_date, status, created_by_admin_id
+      ) VALUES (
+        :organizationId, :marketId, :type, :title, :description, :imageUrl, :startDate, :endDate, :status, :createdByAdminId
+      )`,
+      {
+        organizationId: req.auth.organizationId,
+        marketId: body.marketId || null,
+        type: body.type,
+        title: body.title,
+        description: body.description,
+        imageUrl,
+        startDate: body.startDate || null,
+        endDate: body.endDate || null,
+        status: body.status,
+        createdByAdminId: req.auth.sub,
+      },
+    );
+    return created(res, { id: result.insertId, imageUrl }, 'announcement created');
+  }),
+);
+
+router.patch(
+  '/announcements/:announcementId',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  imageUpload.single('image'),
+  asyncHandler(async (req, res) => {
+    const parsed = z
+      .object({
+        params: z.object({ announcementId: z.coerce.number().int().positive() }),
+        body: z.object({
+          title: z.string().min(1),
+          description: z.string().optional().default(''),
+          startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+          endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+          status: z.enum(['active', 'inactive']).default('active'),
+        }),
+      })
+      .parse({ params: req.params, body: req.body });
+    const rows = await query(
+      `SELECT image_url
+       FROM announcement_items
+       WHERE id = :announcementId AND organization_id = :organizationId
+       LIMIT 1`,
+      { organizationId: req.auth.organizationId, announcementId: parsed.params.announcementId },
+    );
+    const current = rows[0];
+    if (!current) throw notFound('Announcement not found');
+    const imageUrl = req.file ? publicUploadUrl(req, req.file.path) : current.image_url;
+    await query(
+      `UPDATE announcement_items
+       SET title = :title,
+           description = :description,
+           image_url = :imageUrl,
+           start_date = :startDate,
+           end_date = :endDate,
+           status = :status
+       WHERE id = :announcementId AND organization_id = :organizationId`,
+      {
+        organizationId: req.auth.organizationId,
+        announcementId: parsed.params.announcementId,
+        title: parsed.body.title,
+        description: parsed.body.description,
+        imageUrl,
+        startDate: parsed.body.startDate || null,
+        endDate: parsed.body.endDate || null,
+        status: parsed.body.status,
+      },
+    );
+    if (req.file && current.image_url !== imageUrl) removeUploadedFile(current.image_url);
+    return ok(res, { id: parsed.params.announcementId, imageUrl }, 'announcement updated');
+  }),
+);
+
+router.get(
+  '/contact-us',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  asyncHandler(async (req, res) => {
+    const rows = await query(
+      `SELECT id, market_id, title, phone, email, line_id, address, status, updated_at
+       FROM contact_us_settings
+       WHERE organization_id = :organizationId
+       ORDER BY id DESC`,
+      { organizationId: req.auth.organizationId },
+    );
+    return ok(res, rows);
+  }),
+);
+
+router.post(
+  '/contact-us',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  validate(
+    z.object({
+      body: z.object({
+        marketId: z.coerce.number().int().positive().optional().nullable(),
+        title: z.string().min(1),
+        phone: z.string().optional().default(''),
+        email: z.string().optional().default(''),
+        lineId: z.string().optional().default(''),
+        address: z.string().optional().default(''),
+        status: z.enum(['active', 'inactive']).default('active'),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const body = req.validated.body;
+    const result = await query(
+      `INSERT INTO contact_us_settings (organization_id, market_id, title, phone, email, line_id, address, status)
+       VALUES (:organizationId, :marketId, :title, :phone, :email, :lineId, :address, :status)`,
+      {
+        organizationId: req.auth.organizationId,
+        marketId: body.marketId || null,
+        title: body.title,
+        phone: body.phone,
+        email: body.email,
+        lineId: body.lineId,
+        address: body.address,
+        status: body.status,
+      },
+    );
+    return created(res, { id: result.insertId }, 'contact created');
+  }),
+);
+
+router.get(
+  '/tenant-types',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  asyncHandler(async (req, res) => {
+    const rows = await query(
+      `SELECT id, name, status, created_at
+       FROM tenant_types
+       WHERE organization_id = :organizationId
+       ORDER BY name`,
+      { organizationId: req.auth.organizationId },
+    );
+    return ok(res, rows);
+  }),
+);
+
+router.post(
+  '/tenant-types',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  validate(
+    z.object({
+      body: z.object({ name: z.string().min(1), status: z.enum(['active', 'inactive']).default('active') }),
+      query: z.object({}).passthrough(),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const result = await query(
+      `INSERT INTO tenant_types (organization_id, name, status)
+       VALUES (:organizationId, :name, :status)`,
+      { organizationId: req.auth.organizationId, ...req.validated.body },
+    );
+    return created(res, { id: result.insertId }, 'tenant type created');
+  }),
+);
+
+router.get(
+  '/tenants',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  asyncHandler(async (req, res) => {
+    const rows = await query(
+      `SELECT mu.id, mu.public_id, mu.tenant_type_id, tt.name AS tenant_type_name,
+              mu.first_name_enc, mu.last_name_enc, mu.phone_enc, mu.email_enc, mu.id_card_enc, mu.address_enc,
+              mu.status, mu.accepted_consent_at, mu.created_at
+       FROM mobile_users mu
+       LEFT JOIN tenant_types tt ON tt.id = mu.tenant_type_id AND tt.organization_id = mu.organization_id
+       WHERE mu.organization_id = :organizationId
+       ORDER BY mu.created_at DESC
+       LIMIT 500`,
+      { organizationId: req.auth.organizationId },
+    );
+    return ok(
+      res,
+      rows.map((row) => ({
+        id: row.id,
+        public_id: row.public_id,
+        tenant_type_id: row.tenant_type_id,
+        tenant_type_name: row.tenant_type_name,
+        first_name: decryptField(row.first_name_enc),
+        last_name: decryptField(row.last_name_enc),
+        phone: decryptField(row.phone_enc),
+        email: decryptField(row.email_enc),
+        id_card: decryptField(row.id_card_enc),
+        address: decryptField(row.address_enc),
+        status: row.status,
+        accepted_consent_at: row.accepted_consent_at,
+        created_at: row.created_at,
+      })),
+    );
+  }),
+);
+
+router.post(
+  '/tenants',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  validate(
+    z.object({
+      body: z.object({
+        username: z.string().min(1),
+        password: z.string().min(8).default('Vendor@123456'),
+        tenantTypeId: z.coerce.number().int().positive().optional().nullable(),
+        firstName: z.string().min(1),
+        lastName: z.string().optional().default(''),
+        phone: z.string().optional().default(''),
+        email: z.string().optional().default(''),
+        idCard: z.string().optional().default(''),
+        address: z.string().optional().default(''),
+        status: z.enum(['active', 'pending', 'suspended', 'deleted']).default('active'),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const body = req.validated.body;
+    const result = await query(
+      `INSERT INTO mobile_users (
+        organization_id, tenant_type_id, public_id, username_hash, password_hash,
+        first_name_enc, last_name_enc, phone_enc, phone_hash, email_enc, email_hash,
+        id_card_enc, id_card_hash, address_enc, status
+      ) VALUES (
+        :organizationId, :tenantTypeId, :publicId, :usernameHash, :passwordHash,
+        :firstNameEnc, :lastNameEnc, :phoneEnc, :phoneHash, :emailEnc, :emailHash,
+        :idCardEnc, :idCardHash, :addressEnc, :status
+      )`,
+      {
+        organizationId: req.auth.organizationId,
+        tenantTypeId: body.tenantTypeId || null,
+        publicId: publicId('MB'),
+        usernameHash: blindIndex(body.username),
+        passwordHash: await bcrypt.hash(body.password, 10),
+        firstNameEnc: encryptField(body.firstName),
+        lastNameEnc: encryptField(body.lastName),
+        phoneEnc: encryptField(body.phone),
+        phoneHash: body.phone ? blindIndex(body.phone) : null,
+        emailEnc: encryptField(body.email),
+        emailHash: body.email ? blindIndex(body.email) : null,
+        idCardEnc: encryptField(body.idCard),
+        idCardHash: body.idCard ? blindIndex(body.idCard) : null,
+        addressEnc: encryptField(body.address),
+        status: body.status,
+      },
+    );
+    return created(res, { id: result.insertId }, 'tenant created');
+  }),
+);
+
+router.patch(
+  '/tenants/:tenantId/status',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  validate(
+    z.object({
+      body: z.object({ status: z.enum(['active', 'pending', 'suspended', 'deleted']) }),
+      query: z.object({}).passthrough(),
+      params: z.object({ tenantId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    await query(
+      `UPDATE mobile_users
+       SET status = :status
+       WHERE id = :tenantId AND organization_id = :organizationId`,
+      { organizationId: req.auth.organizationId, tenantId: req.validated.params.tenantId, status: req.validated.body.status },
+    );
+    return ok(res, { id: req.validated.params.tenantId, status: req.validated.body.status }, 'tenant status updated');
+  }),
+);
+
+router.get(
+  '/pdpa',
+  requireRoles(ROLES.SUPERVISOR),
+  asyncHandler(async (req, res) => {
+    const rows = await query(
+      `SELECT id, title, content, status, updated_at
+       FROM pdpa_policies
+       WHERE organization_id = :organizationId
+       LIMIT 1`,
+      { organizationId: req.auth.organizationId },
+    );
+    return ok(res, rows[0] || { title: 'PDPA Consent', content: '', status: 'active' });
+  }),
+);
+
+router.put(
+  '/pdpa',
+  requireRoles(ROLES.SUPERVISOR),
+  validate(
+    z.object({
+      body: z.object({
+        title: z.string().min(1).default('PDPA Consent'),
+        content: z.string().optional().default(''),
+        status: z.enum(['active', 'inactive']).default('active'),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const body = req.validated.body;
+    await query(
+      `INSERT INTO pdpa_policies (organization_id, title, content, status, updated_by_admin_id)
+       VALUES (:organizationId, :title, :content, :status, :adminId)
+       ON DUPLICATE KEY UPDATE
+         title = VALUES(title),
+         content = VALUES(content),
+         status = VALUES(status),
+         updated_by_admin_id = VALUES(updated_by_admin_id)`,
+      { organizationId: req.auth.organizationId, title: body.title, content: body.content, status: body.status, adminId: req.auth.sub },
+    );
+    return ok(res, body, 'pdpa updated');
+  }),
+);
 
 router.get(
   '/markets',
