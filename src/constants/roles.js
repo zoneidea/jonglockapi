@@ -7,7 +7,7 @@ const ROLES = Object.freeze({
 });
 
 const MENU_ACCESS = Object.freeze({
-  [ROLES.SUPERVISOR]: ['markets', 'products', 'coupons', 'bookings', 'reports', 'market_audit', 'announcements', 'tenants', 'pdpa', 'accounting', 'admins'],
+  [ROLES.SUPERVISOR]: ['markets', 'products', 'coupons', 'bookings', 'reports', 'market_audit', 'announcements', 'tenants', 'pdpa', 'accounting', 'admins', 'organization_settings'],
   [ROLES.ADMIN]: ['markets', 'products', 'coupons', 'bookings', 'reports', 'market_audit', 'announcements', 'tenants'],
   [ROLES.ACCOUNTING]: ['dashboard', 'accounting'],
   [ROLES.AUDIT]: ['mobile_audit'],

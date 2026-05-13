@@ -182,6 +182,73 @@ router.get('/me', (req, res) => {
 });
 
 router.get(
+  '/organization-settings',
+  requireRoles(ROLES.SUPERVISOR),
+  asyncHandler(async (req, res) => {
+    const rows = await query(
+      `SELECT id, code, name, address, email, phone, line_id, status, created_at, updated_at
+       FROM organizations
+       WHERE id = :organizationId
+       LIMIT 1`,
+      { organizationId: req.auth.organizationId },
+    );
+    const organization = rows[0];
+    if (!organization) throw notFound('Organization not found');
+    return ok(res, organization);
+  }),
+);
+
+router.put(
+  '/organization-settings',
+  requireRoles(ROLES.SUPERVISOR),
+  validate(
+    z.object({
+      body: z.object({
+        name: z.string().min(1).max(255),
+        address: z.string().optional().default(''),
+        email: z.string().email().optional().or(z.literal('')).default(''),
+        phone: z.string().optional().default(''),
+        lineId: z.string().optional().default(''),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const body = req.validated.body;
+    await query(
+      `UPDATE organizations
+       SET name = :name,
+           address = :address,
+           email = :email,
+           phone = :phone,
+           line_id = :lineId
+       WHERE id = :organizationId`,
+      {
+        organizationId: req.auth.organizationId,
+        name: body.name,
+        address: body.address,
+        email: body.email,
+        phone: body.phone,
+        lineId: body.lineId,
+      },
+    );
+    return ok(
+      res,
+      {
+        id: req.auth.organizationId,
+        name: body.name,
+        address: body.address,
+        email: body.email,
+        phone: body.phone,
+        line_id: body.lineId,
+      },
+      'organization settings updated',
+    );
+  }),
+);
+
+router.get(
   '/announcements',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
   asyncHandler(async (req, res) => {

@@ -1,0 +1,5 @@
+ALTER TABLE organizations
+  ADD COLUMN address TEXT NULL AFTER name,
+  ADD COLUMN email VARCHAR(255) NULL AFTER address,
+  ADD COLUMN phone VARCHAR(80) NULL AFTER email,
+  ADD COLUMN line_id VARCHAR(120) NULL AFTER phone;
