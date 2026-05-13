@@ -22,7 +22,7 @@ const allowedImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'ima
 const imageUpload = multer({
   storage: multer.diskStorage({
     destination(req, file, callback) {
-      const marketId = String(req.params.marketId || 'unknown').replace(/[^\d]/g, '') || 'unknown';
+      const marketId = String(req.params.marketId || 'markets').replace(/[^\d]/g, '') || 'markets';
       const destination = path.join(uploadRoot, 'markets', marketId);
       fs.mkdirSync(destination, { recursive: true });
       callback(null, destination);
@@ -98,7 +98,7 @@ router.get(
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
   asyncHandler(async (req, res) => {
     const rows = await query(
-      `SELECT m.id, m.code, m.name, m.description, m.address, m.opening_hours, m.phone, m.line_id, m.email, m.terms,
+      `SELECT m.id, m.code, m.name, m.description, m.main_image_url, m.address, m.opening_hours, m.phone, m.line_id, m.email, m.terms,
               m.status, m.open_date, m.close_date
        FROM markets m
        LEFT JOIN admin_market_assignments ama
@@ -120,28 +120,39 @@ router.patch(
   '/markets/:marketId',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
   requireMarketAccess(),
-  validate(
-    z.object({
-      body: z.object({
-        name: z.string().min(1).optional(),
-        description: z.string().optional().default(''),
-        address: z.string().optional().default(''),
-        openingHours: z.string().optional().default(''),
-        phone: z.string().optional().default(''),
-        lineId: z.string().optional().default(''),
-        email: z.string().optional().default(''),
-        terms: z.string().optional().default(''),
-      }),
-      query: z.object({}).passthrough(),
-      params: z.object({ marketId: z.coerce.number().int().positive() }),
-    }),
-  ),
+  imageUpload.single('mainImage'),
   asyncHandler(async (req, res) => {
-    const body = req.validated.body;
+    const parsed = z
+      .object({
+        params: z.object({ marketId: z.coerce.number().int().positive() }),
+        body: z.object({
+          name: z.string().min(1).optional(),
+          description: z.string().optional().default(''),
+          address: z.string().optional().default(''),
+          openingHours: z.string().optional().default(''),
+          phone: z.string().optional().default(''),
+          lineId: z.string().optional().default(''),
+          email: z.string().optional().default(''),
+          terms: z.string().optional().default(''),
+        }),
+      })
+      .parse({ params: req.params, body: req.body });
+    const body = parsed.body;
+    const currentRows = await query(
+      `SELECT main_image_url
+       FROM markets
+       WHERE id = :marketId AND organization_id = :organizationId
+       LIMIT 1`,
+      { organizationId: req.auth.organizationId, marketId: parsed.params.marketId },
+    );
+    const current = currentRows[0];
+    if (!current) throw notFound('Market not found');
+    const mainImageUrl = req.file ? publicUploadUrl(req, req.file.path) : current.main_image_url;
     await query(
       `UPDATE markets
        SET name = COALESCE(:name, name),
            description = :description,
+           main_image_url = :mainImageUrl,
            address = :address,
            opening_hours = :openingHours,
            phone = :phone,
@@ -151,9 +162,10 @@ router.patch(
        WHERE id = :marketId AND organization_id = :organizationId`,
       {
         organizationId: req.auth.organizationId,
-        marketId: req.validated.params.marketId,
+        marketId: parsed.params.marketId,
         name: body.name || null,
         description: body.description,
+        mainImageUrl,
         address: body.address,
         openingHours: body.openingHours,
         phone: body.phone,
@@ -162,7 +174,8 @@ router.patch(
         terms: body.terms,
       },
     );
-    return ok(res, { id: req.validated.params.marketId }, 'market updated');
+    if (req.file && current.main_image_url !== mainImageUrl) removeUploadedFile(current.main_image_url);
+    return ok(res, { id: parsed.params.marketId, mainImageUrl }, 'market updated');
   }),
 );
 
@@ -528,7 +541,7 @@ router.get(
   requireMarketAccess(),
   asyncHandler(async (req, res) => {
     const rows = await query(
-      `SELECT id, name, price, stock_quantity AS quantity, status
+      `SELECT id, name, image_url, price, stock_quantity AS quantity, status
        FROM accessories
        WHERE organization_id = :organizationId AND market_id = :marketId
        ORDER BY name`,
@@ -542,60 +555,62 @@ router.post(
   '/markets/:marketId/accessories',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
   requireMarketAccess(),
-  validate(
-    z.object({
-      body: z.object({
-        name: z.string().min(1),
-        price: z.coerce.number().min(0),
-        quantity: z.coerce.number().int().min(0).default(0),
-        status: z.enum(['active', 'inactive']).default('active'),
-      }),
-      query: z.object({}).passthrough(),
-      params: z.object({ marketId: z.coerce.number().int().positive() }),
-    }),
-  ),
+  imageUpload.single('image'),
   asyncHandler(async (req, res) => {
-    const body = req.validated.body;
+    const parsed = z
+      .object({
+        params: z.object({ marketId: z.coerce.number().int().positive() }),
+        body: z.object({
+          name: z.string().min(1),
+          price: z.coerce.number().min(0),
+          quantity: z.coerce.number().int().min(0).default(0),
+          status: z.enum(['active', 'inactive']).default('active'),
+        }),
+      })
+      .parse({ params: req.params, body: req.body });
+    const body = parsed.body;
+    const imageUrl = req.file ? publicUploadUrl(req, req.file.path) : null;
     const result = await query(
-      `INSERT INTO accessories (organization_id, market_id, name, price, stock_quantity, status)
-       VALUES (:organizationId, :marketId, :name, :price, :quantity, :status)`,
-      { organizationId: req.auth.organizationId, marketId: req.validated.params.marketId, ...body },
+      `INSERT INTO accessories (organization_id, market_id, name, image_url, price, stock_quantity, status)
+       VALUES (:organizationId, :marketId, :name, :imageUrl, :price, :quantity, :status)`,
+      { organizationId: req.auth.organizationId, marketId: parsed.params.marketId, imageUrl, ...body },
     );
-    return created(res, { id: result.insertId }, 'accessory created');
+    return created(res, { id: result.insertId, imageUrl }, 'accessory created');
   }),
 );
 
 router.post(
   '/markets',
   requireRoles(ROLES.SUPERVISOR),
-  validate(
-    z.object({
-      body: z.object({
-        code: z.string().min(1),
-        name: z.string().min(1),
-        description: z.string().optional().default(''),
-        openDate: z.string().optional().nullable(),
-        closeDate: z.string().optional().nullable(),
-      }),
-      query: z.object({}).passthrough(),
-      params: z.object({}).passthrough(),
-    }),
-  ),
+  imageUpload.single('mainImage'),
   asyncHandler(async (req, res) => {
-    const body = req.validated.body;
+    const parsed = z
+      .object({
+        body: z.object({
+          code: z.string().min(1),
+          name: z.string().min(1),
+          description: z.string().optional().default(''),
+          openDate: z.string().optional().nullable(),
+          closeDate: z.string().optional().nullable(),
+        }),
+      })
+      .parse({ body: req.body });
+    const body = parsed.body;
+    const mainImageUrl = req.file ? publicUploadUrl(req, req.file.path) : null;
     const result = await query(
-      `INSERT INTO markets (organization_id, code, name, description, open_date, close_date, status)
-       VALUES (:organizationId, :code, :name, :description, :openDate, :closeDate, 'active')`,
+      `INSERT INTO markets (organization_id, code, name, description, main_image_url, open_date, close_date, status)
+       VALUES (:organizationId, :code, :name, :description, :mainImageUrl, :openDate, :closeDate, 'active')`,
       {
         organizationId: req.auth.organizationId,
         code: body.code,
         name: body.name,
         description: body.description,
+        mainImageUrl,
         openDate: body.openDate || null,
         closeDate: body.closeDate || null,
       },
     );
-    return created(res, { id: result.insertId }, 'market created');
+    return created(res, { id: result.insertId, mainImageUrl }, 'market created');
   }),
 );
 
