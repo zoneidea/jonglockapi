@@ -70,6 +70,31 @@ const pdpaAssetUpload = multer({
   },
 });
 
+const announcementAssetUpload = multer({
+  storage: multer.diskStorage({
+    destination(req, file, callback) {
+      const organizationId = String(req.auth?.organizationId || 'org').replace(/[^\d]/g, '') || 'org';
+      const destination = path.join(uploadRoot, 'announcements', organizationId);
+      fs.mkdirSync(destination, { recursive: true });
+      callback(null, destination);
+    },
+    filename(req, file, callback) {
+      const extension = path.extname(file.originalname || '').toLowerCase();
+      const safeName = path
+        .basename(file.originalname || 'announcement-image', extension)
+        .replace(/[^a-zA-Z0-9-_]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 80) || 'announcement-image';
+      callback(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}-${safeName}${extension}`);
+    },
+  }),
+  limits: { files: 20, fileSize: 5 * 1024 * 1024 },
+  fileFilter(req, file, callback) {
+    if (!allowedImageTypes.has(file.mimetype)) return callback(badRequest('Only JPG, PNG, WEBP, and GIF images are allowed'));
+    return callback(null, true);
+  },
+});
+
 function publicUploadUrl(req, filePath) {
   const relativePath = path.relative(uploadRoot, filePath).split(path.sep).join('/');
   return `${req.protocol}://${req.get('host')}/uploads/${relativePath}`;
@@ -87,6 +112,43 @@ function removeUploadedFile(imageUrl) {
   const filePath = path.join(uploadRoot, pathname.replace(/^\/uploads\//, ''));
   if (!filePath.startsWith(uploadRoot)) return;
   fs.unlink(filePath, () => {});
+}
+
+async function syncAnnouncementCoverImage(organizationId, announcementId) {
+  const coverRows = await query(
+    `SELECT image_url
+     FROM announcement_item_images
+     WHERE organization_id = :organizationId
+       AND announcement_item_id = :announcementId
+       AND status = 'active'
+       AND is_cover = 1
+     ORDER BY sort_order, id
+     LIMIT 1`,
+    { organizationId, announcementId },
+  );
+
+  const fallbackRows = coverRows.length
+    ? coverRows
+    : await query(
+      `SELECT image_url
+       FROM announcement_item_images
+       WHERE organization_id = :organizationId
+         AND announcement_item_id = :announcementId
+         AND status = 'active'
+       ORDER BY sort_order, id
+       LIMIT 1`,
+      { organizationId, announcementId },
+    );
+
+  const nextImageUrl = fallbackRows[0]?.image_url || null;
+  await query(
+    `UPDATE announcement_items
+     SET image_url = :imageUrl
+     WHERE id = :announcementId AND organization_id = :organizationId`,
+    { organizationId, announcementId, imageUrl: nextImageUrl },
+  );
+
+  return nextImageUrl;
 }
 
 router.post(
@@ -125,21 +187,61 @@ router.get(
   asyncHandler(async (req, res) => {
     const type = ['news', 'banner'].includes(req.query.type) ? req.query.type : null;
     const rows = await query(
-      `SELECT id, market_id, type, title, description, image_url, start_date, end_date, status, created_at
+      `SELECT ai.id, ai.market_id, ai.type, ai.title, ai.description, ai.image_url, ai.start_date, ai.end_date, ai.status, ai.created_at,
+              (
+                SELECT COUNT(*)
+                FROM announcement_item_images aii
+                WHERE aii.announcement_item_id = ai.id
+                  AND aii.organization_id = ai.organization_id
+                  AND aii.status = 'active'
+              ) AS image_count
        FROM announcement_items
-       WHERE organization_id = :organizationId
+       ai
+       WHERE ai.organization_id = :organizationId
          AND (:type IS NULL OR type = :type)
-       ORDER BY start_date DESC, id DESC`,
+       ORDER BY ai.start_date DESC, ai.id DESC`,
       { organizationId: req.auth.organizationId, type },
     );
     return ok(res, rows);
   }),
 );
 
+router.get(
+  '/announcements/:announcementId',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  asyncHandler(async (req, res) => {
+    const announcementId = Number(req.params.announcementId);
+    const rows = await query(
+      `SELECT id, market_id, type, title, description, image_url, start_date, end_date, status, created_at, updated_at
+       FROM announcement_items
+       WHERE id = :announcementId AND organization_id = :organizationId
+       LIMIT 1`,
+      { organizationId: req.auth.organizationId, announcementId },
+    );
+    const current = rows[0];
+    if (!current) throw notFound('Announcement not found');
+
+    const images = await query(
+      `SELECT id, image_url, sort_order, is_cover, status, created_at
+       FROM announcement_item_images
+       WHERE organization_id = :organizationId
+         AND announcement_item_id = :announcementId
+         AND status = 'active'
+       ORDER BY is_cover DESC, sort_order, id`,
+      { organizationId: req.auth.organizationId, announcementId },
+    );
+
+    return ok(res, { ...current, images });
+  }),
+);
+
 router.post(
   '/announcements',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
-  imageUpload.single('image'),
+  announcementAssetUpload.fields([
+    { name: 'image', maxCount: 1 },
+    { name: 'images', maxCount: 20 },
+  ]),
   asyncHandler(async (req, res) => {
     const parsed = z
       .object({
@@ -155,7 +257,12 @@ router.post(
       })
       .parse({ body: req.body });
     const body = parsed.body;
-    const imageUrl = req.file ? publicUploadUrl(req, req.file.path) : null;
+    const bannerImage = req.files?.image?.[0] || null;
+    const galleryImages = req.files?.images || [];
+    const createdImageUrls = galleryImages.map((file) => publicUploadUrl(req, file.path));
+    const imageUrl = bannerImage
+      ? publicUploadUrl(req, bannerImage.path)
+      : createdImageUrls[0] || null;
     const result = await query(
       `INSERT INTO announcement_items (
         organization_id, market_id, type, title, description, image_url, start_date, end_date, status, created_by_admin_id
@@ -175,6 +282,25 @@ router.post(
         createdByAdminId: req.auth.sub,
       },
     );
+    if (body.type === 'news' && createdImageUrls.length) {
+      for (const [index, createdUrl] of createdImageUrls.entries()) {
+        await query(
+          `INSERT INTO announcement_item_images (
+            organization_id, announcement_item_id, image_url, sort_order, is_cover, status, created_by_admin_id
+          ) VALUES (
+            :organizationId, :announcementId, :imageUrl, :sortOrder, :isCover, 'active', :createdByAdminId
+          )`,
+          {
+            organizationId: req.auth.organizationId,
+            announcementId: result.insertId,
+            imageUrl: createdUrl,
+            sortOrder: index,
+            isCover: index === 0 ? 1 : 0,
+            createdByAdminId: req.auth.sub,
+          },
+        );
+      }
+    }
     return created(res, { id: result.insertId, imageUrl }, 'announcement created');
   }),
 );
@@ -182,7 +308,10 @@ router.post(
 router.patch(
   '/announcements/:announcementId',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
-  imageUpload.single('image'),
+  announcementAssetUpload.fields([
+    { name: 'image', maxCount: 1 },
+    { name: 'images', maxCount: 20 },
+  ]),
   asyncHandler(async (req, res) => {
     const parsed = z
       .object({
@@ -192,12 +321,13 @@ router.patch(
           description: z.string().optional().default(''),
           startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
           endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
+          coverImageId: z.coerce.number().int().positive().optional().nullable(),
           status: z.enum(['active', 'inactive']).default('active'),
         }),
       })
       .parse({ params: req.params, body: req.body });
     const rows = await query(
-      `SELECT image_url
+      `SELECT image_url, type
        FROM announcement_items
        WHERE id = :announcementId AND organization_id = :organizationId
        LIMIT 1`,
@@ -205,7 +335,9 @@ router.patch(
     );
     const current = rows[0];
     if (!current) throw notFound('Announcement not found');
-    const imageUrl = req.file ? publicUploadUrl(req, req.file.path) : current.image_url;
+    const bannerImage = req.files?.image?.[0] || null;
+    const galleryImages = req.files?.images || [];
+    const imageUrl = bannerImage ? publicUploadUrl(req, bannerImage.path) : current.image_url;
     await query(
       `UPDATE announcement_items
        SET title = :title,
@@ -226,8 +358,118 @@ router.patch(
         status: parsed.body.status,
       },
     );
-    if (req.file && current.image_url !== imageUrl) removeUploadedFile(current.image_url);
+
+    if (current.type === 'news' && galleryImages.length) {
+      const lastImageRow = await query(
+        `SELECT COALESCE(MAX(sort_order), -1) AS max_sort
+         FROM announcement_item_images
+         WHERE organization_id = :organizationId AND announcement_item_id = :announcementId`,
+        { organizationId: req.auth.organizationId, announcementId: parsed.params.announcementId },
+      );
+      let nextSort = Number(lastImageRow[0]?.max_sort || -1) + 1;
+      for (const file of galleryImages) {
+        await query(
+          `INSERT INTO announcement_item_images (
+            organization_id, announcement_item_id, image_url, sort_order, is_cover, status, created_by_admin_id
+          ) VALUES (
+            :organizationId, :announcementId, :imageUrl, :sortOrder, 0, 'active', :createdByAdminId
+          )`,
+          {
+            organizationId: req.auth.organizationId,
+            announcementId: parsed.params.announcementId,
+            imageUrl: publicUploadUrl(req, file.path),
+            sortOrder: nextSort,
+            createdByAdminId: req.auth.sub,
+          },
+        );
+        nextSort += 1;
+      }
+    }
+
+    if (parsed.body.coverImageId) {
+      await query(
+        `UPDATE announcement_item_images
+         SET is_cover = CASE WHEN id = :coverImageId THEN 1 ELSE 0 END
+         WHERE organization_id = :organizationId
+           AND announcement_item_id = :announcementId
+           AND status = 'active'`,
+        {
+          organizationId: req.auth.organizationId,
+          announcementId: parsed.params.announcementId,
+          coverImageId: parsed.body.coverImageId,
+        },
+      );
+      await syncAnnouncementCoverImage(req.auth.organizationId, parsed.params.announcementId);
+    } else if (current.type === 'news' && galleryImages.length) {
+      await syncAnnouncementCoverImage(req.auth.organizationId, parsed.params.announcementId);
+    }
+
+    if (bannerImage && current.image_url !== imageUrl) removeUploadedFile(current.image_url);
     return ok(res, { id: parsed.params.announcementId, imageUrl }, 'announcement updated');
+  }),
+);
+
+router.patch(
+  '/announcements/:announcementId/images/:imageId/cover',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  asyncHandler(async (req, res) => {
+    const announcementId = Number(req.params.announcementId);
+    const imageId = Number(req.params.imageId);
+    const rows = await query(
+      `SELECT id
+       FROM announcement_item_images
+       WHERE id = :imageId
+         AND announcement_item_id = :announcementId
+         AND organization_id = :organizationId
+         AND status = 'active'
+       LIMIT 1`,
+      { organizationId: req.auth.organizationId, announcementId, imageId },
+    );
+    if (!rows[0]) throw notFound('Announcement image not found');
+
+    await query(
+      `UPDATE announcement_item_images
+       SET is_cover = CASE WHEN id = :imageId THEN 1 ELSE 0 END
+       WHERE organization_id = :organizationId
+         AND announcement_item_id = :announcementId
+         AND status = 'active'`,
+      { organizationId: req.auth.organizationId, announcementId, imageId },
+    );
+    const imageUrl = await syncAnnouncementCoverImage(req.auth.organizationId, announcementId);
+    return ok(res, { announcementId, imageId, imageUrl }, 'announcement cover updated');
+  }),
+);
+
+router.delete(
+  '/announcements/:announcementId/images/:imageId',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  asyncHandler(async (req, res) => {
+    const announcementId = Number(req.params.announcementId);
+    const imageId = Number(req.params.imageId);
+    const rows = await query(
+      `SELECT image_url
+       FROM announcement_item_images
+       WHERE id = :imageId
+         AND announcement_item_id = :announcementId
+         AND organization_id = :organizationId
+         AND status = 'active'
+       LIMIT 1`,
+      { organizationId: req.auth.organizationId, announcementId, imageId },
+    );
+    const current = rows[0];
+    if (!current) throw notFound('Announcement image not found');
+
+    await query(
+      `UPDATE announcement_item_images
+       SET status = 'inactive', is_cover = 0
+       WHERE id = :imageId
+         AND announcement_item_id = :announcementId
+         AND organization_id = :organizationId`,
+      { organizationId: req.auth.organizationId, announcementId, imageId },
+    );
+    removeUploadedFile(current.image_url);
+    const imageUrl = await syncAnnouncementCoverImage(req.auth.organizationId, announcementId);
+    return ok(res, { announcementId, imageId, imageUrl }, 'announcement image deleted');
   }),
 );
 
