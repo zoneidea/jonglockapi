@@ -30,7 +30,7 @@ function requireMobileAccount(req, res, next) {
 function requireMarketAccess(paramName = 'marketId') {
   return (req, res, next) => {
     if (!req.auth) return next(forbidden());
-    if (req.auth.role === ROLES.SUPERVISOR) return next();
+    if ([ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role)) return next();
 
     const marketId = Number(req.params[paramName] || req.query[paramName] || req.body[paramName]);
     const allowed = req.auth.marketIds || [];

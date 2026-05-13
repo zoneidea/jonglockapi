@@ -578,7 +578,7 @@ router.post(
 
 router.get(
   '/markets',
-  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
   asyncHandler(async (req, res) => {
     const rows = await query(
       `SELECT m.id, m.code, m.name, m.description, m.main_image_url, m.address, m.opening_hours, m.phone, m.line_id, m.email, m.terms,
@@ -587,12 +587,12 @@ router.get(
        LEFT JOIN admin_market_assignments ama
          ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE m.organization_id = :organizationId
-         AND (:isSupervisor = 1 OR ama.id IS NOT NULL)
+         AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
        ORDER BY m.name`,
       {
         organizationId: req.auth.organizationId,
         adminUserId: req.auth.sub,
-        isSupervisor: req.auth.role === ROLES.SUPERVISOR ? 1 : 0,
+        hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
       },
     );
     return ok(res, rows);
@@ -1381,7 +1381,7 @@ router.get(
 
 router.get(
   '/reports/bookings',
-  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
   asyncHandler(async (req, res) => {
     const rows = await query(
       `SELECT m.id AS market_id, m.name AS market_name, b.status,
@@ -1391,7 +1391,7 @@ router.get(
        LEFT JOIN admin_market_assignments ama
          ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE b.organization_id = :organizationId
-         AND (:isSupervisor = 1 OR ama.id IS NOT NULL)
+         AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          AND (:startDate IS NULL OR DATE(b.created_at) >= :startDate)
          AND (:endDate IS NULL OR DATE(b.created_at) <= :endDate)
        GROUP BY m.id, m.name, b.status
@@ -1399,7 +1399,7 @@ router.get(
       {
         organizationId: req.auth.organizationId,
         adminUserId: req.auth.sub,
-        isSupervisor: req.auth.role === ROLES.SUPERVISOR ? 1 : 0,
+        hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
         startDate: req.query.startDate || null,
         endDate: req.query.endDate || null,
       },
@@ -1410,18 +1410,58 @@ router.get(
 
 router.get(
   '/accounting/payments',
-  requireRoles(ROLES.SUPERVISOR, ROLES.ACCOUNTING),
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
   asyncHandler(async (req, res) => {
     const rows = await query(
       `SELECT p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at, b.public_id AS booking_public_id
        FROM payments p
        LEFT JOIN bookings b ON b.id = p.booking_id
+       LEFT JOIN admin_market_assignments ama
+         ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE p.organization_id = :organizationId
+         AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
        ORDER BY p.created_at DESC
        LIMIT 500`,
-      { organizationId: req.auth.organizationId },
+      {
+        organizationId: req.auth.organizationId,
+        adminUserId: req.auth.sub,
+        hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
+      },
     );
     return ok(res, rows);
+  }),
+);
+
+router.get(
+  '/admins',
+  requireRoles(ROLES.SUPERVISOR),
+  asyncHandler(async (req, res) => {
+    const rows = await query(
+      `SELECT au.id, au.role, au.name_enc, au.email_enc, au.phone_enc, au.status, au.created_at,
+              GROUP_CONCAT(DISTINCT m.name ORDER BY m.name SEPARATOR ', ') AS assigned_markets
+       FROM admin_users au
+       LEFT JOIN admin_market_assignments ama
+         ON ama.admin_user_id = au.id AND ama.organization_id = au.organization_id AND ama.status = 'active'
+       LEFT JOIN markets m
+         ON m.id = ama.market_id
+       WHERE au.organization_id = :organizationId
+       GROUP BY au.id, au.role, au.name_enc, au.email_enc, au.phone_enc, au.status, au.created_at
+       ORDER BY au.created_at DESC`,
+      { organizationId: req.auth.organizationId },
+    );
+    return ok(
+      res,
+      rows.map((row) => ({
+        id: row.id,
+        role: row.role,
+        name: decryptField(row.name_enc),
+        email: decryptField(row.email_enc),
+        phone: decryptField(row.phone_enc),
+        assigned_markets: row.assigned_markets || '',
+        status: row.status,
+        created_at: row.created_at,
+      })),
+    );
   }),
 );
 
