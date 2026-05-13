@@ -45,6 +45,31 @@ const imageUpload = multer({
   },
 });
 
+const pdpaAssetUpload = multer({
+  storage: multer.diskStorage({
+    destination(req, file, callback) {
+      const organizationId = String(req.auth?.organizationId || 'org').replace(/[^\d]/g, '') || 'org';
+      const destination = path.join(uploadRoot, 'pdpa', organizationId);
+      fs.mkdirSync(destination, { recursive: true });
+      callback(null, destination);
+    },
+    filename(req, file, callback) {
+      const extension = path.extname(file.originalname || '').toLowerCase();
+      const safeName = path
+        .basename(file.originalname || 'pdpa-asset', extension)
+        .replace(/[^a-zA-Z0-9-_]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 80) || 'pdpa-asset';
+      callback(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}-${safeName}${extension}`);
+    },
+  }),
+  limits: { files: 1, fileSize: 5 * 1024 * 1024 },
+  fileFilter(req, file, callback) {
+    if (!allowedImageTypes.has(file.mimetype)) return callback(badRequest('Only JPG, PNG, WEBP, and GIF images are allowed'));
+    return callback(null, true);
+  },
+});
+
 function publicUploadUrl(req, filePath) {
   const relativePath = path.relative(uploadRoot, filePath).split(path.sep).join('/');
   return `${req.protocol}://${req.get('host')}/uploads/${relativePath}`;
@@ -531,6 +556,23 @@ router.put(
       { organizationId: req.auth.organizationId, title: body.title, content: body.content, status: body.status, adminId: req.auth.sub },
     );
     return ok(res, body, 'pdpa updated');
+  }),
+);
+
+router.post(
+  '/pdpa/assets',
+  requireRoles(ROLES.SUPERVISOR),
+  pdpaAssetUpload.single('image'),
+  asyncHandler(async (req, res) => {
+    if (!req.file) throw badRequest('Please upload an image');
+    return created(
+      res,
+      {
+        imageUrl: publicUploadUrl(req, req.file.path),
+        fileName: req.file.filename,
+      },
+      'pdpa asset uploaded',
+    );
   }),
 );
 
