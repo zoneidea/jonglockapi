@@ -1760,9 +1760,12 @@ router.get(
   asyncHandler(async (req, res) => {
     const rows = await query(
       `SELECT b.id, b.public_id, b.status, b.total_amount, b.source, b.created_at,
-              COUNT(bi.id) AS item_count
+              COUNT(bi.id) AS item_count,
+              GROUP_CONCAT(DISTINCT DATE_FORMAT(bi.booking_date, '%Y-%m-%d') ORDER BY bi.booking_date SEPARATOR ', ') AS booking_dates,
+              GROUP_CONCAT(DISTINCT CONCAT(COALESCE(bo.code, ''), CASE WHEN bo.name IS NULL OR bo.name = '' THEN '' ELSE CONCAT(' ', bo.name) END) ORDER BY bo.sort_order, bo.code SEPARATOR ', ') AS booths
        FROM bookings b
        LEFT JOIN booking_items bi ON bi.booking_id = b.id
+       LEFT JOIN booths bo ON bo.id = bi.booth_id
        WHERE b.organization_id = :organizationId AND b.market_id = :marketId
        GROUP BY b.id
        ORDER BY b.created_at DESC
@@ -2423,18 +2426,20 @@ router.get(
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
   asyncHandler(async (req, res) => {
     const rows = await query(
-      `SELECT m.id AS market_id, m.name AS market_name, b.status,
-              COUNT(*) AS booking_count, COALESCE(SUM(b.total_amount), 0) AS total_amount
+      `SELECT m.id AS market_id, m.name AS market_name, b.public_id AS booking_public_id, b.status,
+              bi.booking_date, bo.code AS booth_code, bo.name AS booth_name,
+              b.source, b.created_at, 1 AS booking_count, COALESCE(bi.unit_price, 0) AS total_amount
        FROM bookings b
        JOIN markets m ON m.id = b.market_id
+       JOIN booking_items bi ON bi.booking_id = b.id
+       JOIN booths bo ON bo.id = bi.booth_id
        LEFT JOIN admin_market_assignments ama
          ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE b.organization_id = :organizationId
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
-         AND (:startDate IS NULL OR DATE(b.created_at) >= :startDate)
-         AND (:endDate IS NULL OR DATE(b.created_at) <= :endDate)
-       GROUP BY m.id, m.name, b.status
-       ORDER BY m.name, b.status`,
+         AND (:startDate IS NULL OR bi.booking_date >= :startDate)
+         AND (:endDate IS NULL OR bi.booking_date <= :endDate)
+       ORDER BY bi.booking_date DESC, m.name, bo.sort_order, bo.code`,
       {
         organizationId: req.auth.organizationId,
         adminUserId: req.auth.sub,
@@ -2452,13 +2457,18 @@ router.get(
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
   asyncHandler(async (req, res) => {
     const rows = await query(
-      `SELECT p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at, b.public_id AS booking_public_id
+      `SELECT p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at, b.public_id AS booking_public_id,
+              GROUP_CONCAT(DISTINCT DATE_FORMAT(bi.booking_date, '%Y-%m-%d') ORDER BY bi.booking_date SEPARATOR ', ') AS booking_dates,
+              GROUP_CONCAT(DISTINCT CONCAT(COALESCE(bo.code, ''), CASE WHEN bo.name IS NULL OR bo.name = '' THEN '' ELSE CONCAT(' ', bo.name) END) ORDER BY bo.sort_order, bo.code SEPARATOR ', ') AS booths
        FROM payments p
        LEFT JOIN bookings b ON b.id = p.booking_id
+       LEFT JOIN booking_items bi ON bi.booking_id = b.id
+       LEFT JOIN booths bo ON bo.id = bi.booth_id
        LEFT JOIN admin_market_assignments ama
          ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE p.organization_id = :organizationId
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+       GROUP BY p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at, b.public_id
        ORDER BY p.created_at DESC
        LIMIT 500`,
       {
