@@ -2045,7 +2045,7 @@ router.patch(
     const { bookingDate, boothId } = req.validated.body;
     const result = await transaction(async (conn) => {
       const [items] = await conn.execute(
-        `SELECT bi.id, bi.booking_id, bi.booth_id, bi.booking_date, bi.status, b.status AS booking_status
+        `SELECT bi.id, bi.booking_id, bi.booth_id, bi.booking_date, bi.unit_price, bi.status, b.status AS booking_status
          FROM booking_items bi
          JOIN bookings b ON b.id = bi.booking_id
          WHERE bi.id = :bookingItemId
@@ -2099,6 +2099,31 @@ router.patch(
         { organizationId: req.auth.organizationId, bookingItemId, boothId, bookingDate, unitPrice: booth.price },
       );
 
+      await conn.execute(
+        `INSERT INTO booking_edit_logs (
+          organization_id, market_id, booking_id, booking_item_id,
+          old_booth_id, new_booth_id, old_booking_date, new_booking_date,
+          old_unit_price, new_unit_price, edited_by_admin_id
+        ) VALUES (
+          :organizationId, :marketId, :bookingId, :bookingItemId,
+          :oldBoothId, :newBoothId, :oldBookingDate, :newBookingDate,
+          :oldUnitPrice, :newUnitPrice, :editedByAdminId
+        )`,
+        {
+          organizationId: req.auth.organizationId,
+          marketId,
+          bookingId: item.booking_id,
+          bookingItemId,
+          oldBoothId: item.booth_id,
+          newBoothId: boothId,
+          oldBookingDate: item.booking_date,
+          newBookingDate: bookingDate,
+          oldUnitPrice: item.unit_price,
+          newUnitPrice: booth.price,
+          editedByAdminId: req.auth.sub,
+        },
+      );
+
       const [totals] = await conn.execute(
         `SELECT COALESCE(SUM(unit_price), 0) AS total_amount
          FROM booking_items
@@ -2119,6 +2144,61 @@ router.patch(
       return { id: bookingItemId, bookingId: item.booking_id, totalAmount };
     });
     return ok(res, result, 'booking item updated');
+  }),
+);
+
+router.get(
+  '/markets/:marketId/booking-edit-logs',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({
+        limit: z.coerce.number().int().positive().max(500).optional().default(100),
+        offset: z.coerce.number().int().min(0).optional().default(0),
+      }),
+      params: z.object({ marketId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { marketId } = req.validated.params;
+    const { limit, offset } = req.validated.query;
+    const rows = await query(
+      `SELECT bel.id, bel.booking_id, bel.booking_item_id,
+              bel.old_booth_id, old_booth.code AS old_booth_code, old_booth.name AS old_booth_name,
+              bel.new_booth_id, new_booth.code AS new_booth_code, new_booth.name AS new_booth_name,
+              bel.old_booking_date, bel.new_booking_date, bel.old_unit_price, bel.new_unit_price,
+              bel.created_at, b.public_id AS booking_public_id,
+              mu.public_id AS mobile_public_id, mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc,
+              au.name_enc AS edited_by_name_enc
+       FROM booking_edit_logs bel
+       JOIN bookings b ON b.id = bel.booking_id
+       JOIN mobile_users mu ON mu.id = b.mobile_user_id
+       JOIN booths old_booth ON old_booth.id = bel.old_booth_id
+       JOIN booths new_booth ON new_booth.id = bel.new_booth_id
+       JOIN admin_users au ON au.id = bel.edited_by_admin_id
+       WHERE bel.organization_id = :organizationId
+         AND bel.market_id = :marketId
+       ORDER BY bel.created_at DESC, bel.id DESC
+       LIMIT :limit OFFSET :offset`,
+      { organizationId: req.auth.organizationId, marketId, limit, offset },
+    );
+    return ok(
+      res,
+      rows.map((row) => ({
+        ...row,
+        username: decryptField(row.username_enc),
+        mobile_name: [decryptField(row.first_name_enc), decryptField(row.last_name_enc)].filter(Boolean).join(' ').trim(),
+        mobile_phone: decryptField(row.phone_enc),
+        edited_by_name: decryptField(row.edited_by_name_enc),
+        username_enc: undefined,
+        first_name_enc: undefined,
+        last_name_enc: undefined,
+        phone_enc: undefined,
+        edited_by_name_enc: undefined,
+      })),
+    );
   }),
 );
 
