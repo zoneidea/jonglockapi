@@ -258,6 +258,26 @@ router.get('/me', (req, res) => {
 });
 
 router.get(
+  '/event-logs',
+  requireRoles(ROLES.SUPERVISOR),
+  asyncHandler(async (req, res) => {
+    const limit = Math.min(Number(req.query.limit || 100), 500);
+    const offset = Math.max(Number(req.query.offset || 0), 0);
+    const rows = await query(
+      `SELECT id, organization_id, actor_type, actor_id, actor_role, channel, action,
+              entity_type, entity_id, method, path, route_path, status_code, success,
+              ip_address, user_agent, request_json, response_json, created_at
+       FROM event_logs
+       WHERE organization_id = :organizationId
+       ORDER BY created_at DESC, id DESC
+       LIMIT :limit OFFSET :offset`,
+      { organizationId: req.auth.organizationId, limit, offset },
+    );
+    return ok(res, rows);
+  }),
+);
+
+router.get(
   '/organization-settings',
   requireRoles(ROLES.SUPERVISOR),
   asyncHandler(async (req, res) => {

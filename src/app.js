@@ -12,6 +12,7 @@ const managementRoutes = require('./modules/management/management.routes');
 const auditRoutes = require('./modules/audit/audit.routes');
 const paymentRoutes = require('./modules/payments/payments.routes');
 const { notFoundHandler, errorHandler } = require('./middlewares/error-handler');
+const { eventLogger } = require('./middlewares/event-logger');
 
 const app = express();
 
@@ -48,6 +49,7 @@ app.use(
     legacyHeaders: false,
   }),
 );
+app.use(eventLogger());
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'jonglock-backend' });
