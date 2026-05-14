@@ -15,6 +15,7 @@ const { badRequest, conflict, notFound } = require('../../utils/errors');
 const { encryptField, blindIndex, decryptField } = require('../../utils/crypto');
 const { publicId } = require('../../utils/id');
 const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/password-policy');
+const { expireStaleBookings } = require('../../utils/booking-status');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
@@ -1793,6 +1794,7 @@ router.get(
     }),
   ),
   asyncHandler(async (req, res) => {
+    await expireStaleBookings({ execute: query }, req.auth.organizationId);
     const { marketId } = req.validated.params;
     const { bookingDate, productId, floorPlanId, excludeBookingItemId } = req.validated.query;
     const productRows = await query(
@@ -1886,6 +1888,7 @@ router.post(
     const { mobileUserId, items } = req.validated.body;
 
     const result = await transaction(async (conn) => {
+      await expireStaleBookings(conn, req.auth.organizationId);
       const [users] = await conn.execute(
         `SELECT id FROM mobile_users
          WHERE id = :mobileUserId AND organization_id = :organizationId AND status = 'active'
@@ -1985,6 +1988,7 @@ router.get(
     }),
   ),
   asyncHandler(async (req, res) => {
+    await expireStaleBookings({ execute: query }, req.auth.organizationId);
     const marketId = req.validated.params.marketId;
     const bookingDate = req.validated.query.bookingDate || new Date().toISOString().slice(0, 10);
     const rows = await query(
@@ -2004,8 +2008,8 @@ router.get(
          AND b.organization_id = :organizationId
          AND b.market_id = :marketId
          AND bi.booking_date = :bookingDate
-         AND b.status IN ('pending_payment', 'payment_processing', 'paid')
-         AND bi.status IN ('pending_payment', 'payment_processing', 'paid')
+         AND b.status = 'paid'
+         AND bi.status = 'paid'
        ORDER BY b.created_at DESC, bi.id DESC
        LIMIT 500`,
       { organizationId: req.auth.organizationId, marketId, bookingDate },
@@ -2047,6 +2051,7 @@ router.patch(
     const { marketId, bookingItemId } = req.validated.params;
     const { bookingDate, boothId } = req.validated.body;
     const result = await transaction(async (conn) => {
+      await expireStaleBookings(conn, req.auth.organizationId);
       const [items] = await conn.execute(
         `SELECT bi.id, bi.booking_id, bi.booth_id, bi.booking_date, bi.unit_price, bi.status, b.status AS booking_status
          FROM booking_items bi
@@ -2055,8 +2060,8 @@ router.patch(
            AND bi.organization_id = :organizationId
            AND b.organization_id = :organizationId
            AND b.market_id = :marketId
-           AND b.status IN ('pending_payment', 'payment_processing', 'paid')
-           AND bi.status IN ('pending_payment', 'payment_processing', 'paid')
+           AND b.status = 'paid'
+           AND bi.status = 'paid'
          LIMIT 1
          FOR UPDATE`,
         { organizationId: req.auth.organizationId, marketId, bookingItemId },
@@ -2220,10 +2225,30 @@ router.patch(
     }),
   ),
   asyncHandler(async (req, res) => {
+    throw badRequest('Booking cancellation is not supported. Delete pending_payment bookings or let unpaid bookings expire.');
+  }),
+);
+
+router.delete(
+  '/markets/:marketId/bookings/:bookingId',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({}).passthrough(),
+      params: z.object({
+        marketId: z.coerce.number().int().positive(),
+        bookingId: z.coerce.number().int().positive(),
+      }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
     const { marketId, bookingId } = req.validated.params;
     const result = await transaction(async (conn) => {
+      await expireStaleBookings(conn, req.auth.organizationId);
       const [bookings] = await conn.execute(
-        `SELECT id
+        `SELECT id, status
          FROM bookings
          WHERE id = :bookingId
            AND organization_id = :organizationId
@@ -2232,23 +2257,47 @@ router.patch(
          FOR UPDATE`,
         { organizationId: req.auth.organizationId, marketId, bookingId },
       );
-      if (!bookings[0]) throw notFound('Booking not found');
+      const booking = bookings[0];
+      if (!booking) throw notFound('Booking not found');
+      if (booking.status !== 'pending_payment') throw badRequest('Only pending_payment bookings can be deleted');
+
+      const [items] = await conn.execute(
+        `SELECT id
+         FROM booking_items
+         WHERE booking_id = :bookingId AND organization_id = :organizationId
+         FOR UPDATE`,
+        { organizationId: req.auth.organizationId, bookingId },
+      );
+      for (const item of items) {
+        await conn.execute(
+          `DELETE FROM booking_products
+           WHERE organization_id = :organizationId AND booking_item_id = :bookingItemId`,
+          { organizationId: req.auth.organizationId, bookingItemId: item.id },
+        );
+        await conn.execute(
+          `DELETE FROM booking_accessories
+           WHERE organization_id = :organizationId AND booking_item_id = :bookingItemId`,
+          { organizationId: req.auth.organizationId, bookingItemId: item.id },
+        );
+      }
       await conn.execute(
-        `UPDATE bookings
-         SET status = 'cancelled',
-             comment = :comment
-         WHERE id = :bookingId AND organization_id = :organizationId`,
-        { organizationId: req.auth.organizationId, bookingId, comment: req.validated.body.comment },
+        `DELETE FROM booking_items
+         WHERE booking_id = :bookingId AND organization_id = :organizationId`,
+        { organizationId: req.auth.organizationId, bookingId },
       );
       await conn.execute(
-        `UPDATE booking_items
-         SET status = 'cancelled'
-         WHERE booking_id = :bookingId AND organization_id = :organizationId`,
+        `DELETE FROM payments
+         WHERE booking_id = :bookingId AND organization_id = :organizationId AND status <> 'paid'`,
+        { organizationId: req.auth.organizationId, bookingId },
+      );
+      await conn.execute(
+        `DELETE FROM bookings
+         WHERE id = :bookingId AND organization_id = :organizationId`,
         { organizationId: req.auth.organizationId, bookingId },
       );
       return { id: bookingId };
     });
-    return ok(res, result, 'booking cancelled');
+    return ok(res, result, 'booking deleted');
   }),
 );
 
@@ -2425,6 +2474,7 @@ router.get(
   '/reports/bookings',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
   asyncHandler(async (req, res) => {
+    await expireStaleBookings({ execute: query }, req.auth.organizationId);
     const rows = await query(
       `SELECT m.id AS market_id, m.name AS market_name, b.public_id AS booking_public_id, b.status,
               bi.booking_date, bo.code AS booth_code, bo.name AS booth_name,
@@ -2437,6 +2487,8 @@ router.get(
          ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE b.organization_id = :organizationId
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+         AND b.status IN ('pending_payment', 'payment_processing', 'expired')
+         AND bi.status IN ('pending_payment', 'payment_processing', 'expired')
          AND (:startDate IS NULL OR bi.booking_date >= :startDate)
          AND (:endDate IS NULL OR bi.booking_date <= :endDate)
        ORDER BY bi.booking_date DESC, m.name, bo.sort_order, bo.code`,
@@ -2453,9 +2505,51 @@ router.get(
 );
 
 router.get(
+  '/reports/available-booths',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  asyncHandler(async (req, res) => {
+    await expireStaleBookings({ execute: query }, req.auth.organizationId);
+    const bookingDate = req.query.bookingDate || req.query.startDate || new Date().toISOString().slice(0, 10);
+    const rows = await query(
+      `SELECT m.id AS market_id, m.name AS market_name, b.id AS booth_id, b.code AS booth_code, b.name AS booth_name,
+              b.price, c.name AS category_name, c.name AS production_category_name, fp.name AS floor_plan_name, :bookingDate AS booking_date
+       FROM booths b
+       JOIN markets m ON m.id = b.market_id
+       LEFT JOIN product_categories c ON c.id = b.category_id
+       LEFT JOIN floor_plans fp ON fp.id = b.floor_plan_id
+       LEFT JOIN admin_market_assignments ama
+         ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+       LEFT JOIN booking_items bi
+         ON bi.booth_id = b.id
+        AND bi.organization_id = b.organization_id
+        AND bi.booking_date = :bookingDate
+        AND bi.status IN ('pending_payment', 'payment_processing', 'paid')
+       LEFT JOIN bookings bk
+         ON bk.id = bi.booking_id
+        AND bk.organization_id = b.organization_id
+        AND bk.status IN ('pending_payment', 'payment_processing', 'paid')
+       WHERE b.organization_id = :organizationId
+         AND b.status = 'active'
+         AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+         AND bk.id IS NULL
+       ORDER BY m.name, fp.name, b.sort_order, b.code`,
+      {
+        organizationId: req.auth.organizationId,
+        adminUserId: req.auth.sub,
+        hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
+        bookingDate,
+      },
+    );
+    return ok(res, rows);
+  }),
+);
+
+router.get(
   '/accounting/payments',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
   asyncHandler(async (req, res) => {
+    await expireStaleBookings({ execute: query }, req.auth.organizationId);
+    const paidOnly = req.query.paidOnly === '1' || req.query.status === 'paid';
     const rows = await query(
       `SELECT p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at, b.public_id AS booking_public_id,
               GROUP_CONCAT(DISTINCT DATE_FORMAT(bi.booking_date, '%Y-%m-%d') ORDER BY bi.booking_date SEPARATOR ', ') AS booking_dates,
@@ -2468,6 +2562,8 @@ router.get(
          ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE p.organization_id = :organizationId
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+         AND (:paidOnly = 0 OR p.status = 'paid')
+         AND (:paidOnly = 0 OR b.status = 'paid')
        GROUP BY p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at, b.public_id
        ORDER BY p.created_at DESC
        LIMIT 500`,
@@ -2475,6 +2571,7 @@ router.get(
         organizationId: req.auth.organizationId,
         adminUserId: req.auth.sub,
         hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
+        paidOnly: paidOnly ? 1 : 0,
       },
     );
     return ok(res, rows);

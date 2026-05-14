@@ -11,6 +11,7 @@ const { badRequest, conflict, forbidden, notFound } = require('../../utils/error
 const { encryptField, blindIndex } = require('../../utils/crypto');
 const { publicId } = require('../../utils/id');
 const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/password-policy');
+const { expireStaleBookings } = require('../../utils/booking-status');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
@@ -139,6 +140,7 @@ router.get(
 router.get(
   '/markets/:marketId/booths',
   asyncHandler(async (req, res) => {
+    await expireStaleBookings({ execute: query }, req.auth.organizationId);
     const marketId = Number(req.params.marketId);
     const bookingDate = req.query.date;
     const categoryId = req.query.categoryId ? Number(req.query.categoryId) : null;
@@ -194,6 +196,7 @@ router.post(
   asyncHandler(async (req, res) => {
     const { marketId, items } = req.validated.body;
     const result = await transaction(async (conn) => {
+      await expireStaleBookings(conn, req.auth.organizationId);
       const [marketRows] = await conn.execute(
         `SELECT id FROM markets WHERE id = :marketId AND organization_id = :organizationId AND status = 'active' FOR UPDATE`,
         { marketId, organizationId: req.auth.organizationId },
@@ -294,6 +297,7 @@ router.post(
 router.get(
   '/bookings',
   asyncHandler(async (req, res) => {
+    await expireStaleBookings({ execute: query }, req.auth.organizationId);
     if (req.auth.userType !== 'customer') throw forbidden('Customer account is required');
 
     const rows = await query(

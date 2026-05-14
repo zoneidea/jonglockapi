@@ -8,6 +8,7 @@ const { asyncHandler } = require('../../utils/async-handler');
 const { created, ok } = require('../../utils/api-response');
 const { badRequest, notFound } = require('../../utils/errors');
 const { publicId } = require('../../utils/id');
+const { expireStaleBookings } = require('../../utils/booking-status');
 
 const router = express.Router();
 
@@ -29,6 +30,7 @@ router.post(
   asyncHandler(async (req, res) => {
     const body = req.validated.body;
     const result = await transaction(async (conn) => {
+      await expireStaleBookings(conn, req.auth.organizationId);
       const [bookings] = await conn.execute(
         `SELECT id, total_amount, status
          FROM bookings
