@@ -317,9 +317,9 @@ async function upsertDemoBooking(connection, organizationId, marketId, mobileUse
   let item = await one(
     connection,
     `SELECT id FROM booking_items
-     WHERE organization_id = :organizationId AND booking_id = :bookingId AND booth_id = :boothId AND booking_date = :bookingDate
+     WHERE organization_id = :organizationId AND booking_id = :bookingId AND booth_id = :boothId
      LIMIT 1`,
-    { organizationId, bookingId: booking.id, boothId, bookingDate },
+    { organizationId, bookingId: booking.id, boothId },
   );
 
   if (!item) {
@@ -334,11 +334,32 @@ async function upsertDemoBooking(connection, organizationId, marketId, mobileUse
     await exec(
       connection,
       `UPDATE booking_items
-       SET unit_price = :amount, status = :itemStatus
+       SET booking_date = :bookingDate,
+           unit_price = :amount,
+           status = :itemStatus
        WHERE id = :bookingItemId AND organization_id = :organizationId`,
-      { organizationId, bookingItemId: item.id, amount, itemStatus },
+      { organizationId, bookingItemId: item.id, bookingDate, amount, itemStatus },
     );
   }
+
+  await exec(
+    connection,
+    `DELETE bp
+     FROM booking_products bp
+     JOIN booking_items bi ON bi.id = bp.booking_item_id
+     WHERE bi.organization_id = :organizationId
+       AND bi.booking_id = :bookingId
+       AND bi.id <> :bookingItemId`,
+    { organizationId, bookingId: booking.id, bookingItemId: item.id },
+  );
+  await exec(
+    connection,
+    `DELETE FROM booking_items
+     WHERE organization_id = :organizationId
+       AND booking_id = :bookingId
+       AND id <> :bookingItemId`,
+    { organizationId, bookingId: booking.id, bookingItemId: item.id },
+  );
 
   const linkedProduct = await one(
     connection,
@@ -416,14 +437,13 @@ async function main() {
     await upsertTenantType(connection, organizationId, 'นิติบุคคล');
 
     const foodCategory = await findOrCreateByName(connection, 'product_categories', organizationId, market.id, 'อาหาร');
-    const drinkCategory = await findOrCreateByName(connection, 'product_categories', organizationId, market.id, 'เครื่องดื่ม');
-    const fashionCategory = await findOrCreateByName(connection, 'product_categories', organizationId, market.id, 'แฟชั่น');
+    const nonFoodCategory = await findOrCreateByName(connection, 'product_categories', organizationId, market.id, 'ไม่ใช่อาหาร');
 
     const foodGroup = await findOrCreateByName(connection, 'product_groups', organizationId, market.id, 'อาหารพร้อมทาน', {
       category_id: foodCategory.id,
     });
-    const drinkGroup = await findOrCreateByName(connection, 'product_groups', organizationId, market.id, 'กาแฟและชา', {
-      category_id: drinkCategory.id,
+    const nonFoodGroup = await findOrCreateByName(connection, 'product_groups', organizationId, market.id, 'สินค้าและบริการทั่วไป', {
+      category_id: nonFoodCategory.id,
     });
 
     const floorPlan = await findOrCreateByName(connection, 'floor_plans', organizationId, market.id, 'Demo Floor Plan 2026', {
@@ -435,7 +455,7 @@ async function main() {
 
     const booths = [];
     for (let index = 1; index <= 10; index += 1) {
-      const categoryId = index <= 4 ? foodCategory.id : index <= 7 ? drinkCategory.id : fashionCategory.id;
+      const categoryId = index <= 4 ? foodCategory.id : nonFoodCategory.id;
       booths.push(
         await upsertBooth(
           connection,
@@ -452,8 +472,8 @@ async function main() {
     }
 
     const product = await findOrCreateProduct(connection, organizationId, market.id, foodCategory.id, foodGroup.id, 'อาหารไทย');
-    await findOrCreateProduct(connection, organizationId, market.id, drinkCategory.id, drinkGroup.id, 'กาแฟ');
-    await findOrCreateProduct(connection, organizationId, market.id, fashionCategory.id, null, 'เสื้อผ้า');
+    await findOrCreateProduct(connection, organizationId, market.id, foodCategory.id, foodGroup.id, 'กาแฟ');
+    await findOrCreateProduct(connection, organizationId, market.id, nonFoodCategory.id, nonFoodGroup.id, 'เสื้อผ้า');
 
     await findOrCreateByName(connection, 'accessories', organizationId, market.id, 'โต๊ะพับ', {
       price: 100,

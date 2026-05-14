@@ -164,6 +164,32 @@ async function buildNextBoothCode(organizationId, marketId) {
   return nextSequenceCode(rows, 'code', 'B');
 }
 
+async function ensureFixedProductCategories(organizationId, marketId) {
+  for (const name of ['อาหาร', 'ไม่ใช่อาหาร']) {
+    const existing = await query(
+      `SELECT id
+       FROM product_categories
+       WHERE organization_id = :organizationId AND market_id = :marketId AND name = :name
+       LIMIT 1`,
+      { organizationId, marketId, name },
+    );
+    if (existing[0]) {
+      await query(
+        `UPDATE product_categories
+         SET status = 'active'
+         WHERE id = :id AND organization_id = :organizationId`,
+        { organizationId, id: existing[0].id },
+      );
+      continue;
+    }
+    await query(
+      `INSERT INTO product_categories (organization_id, market_id, name, status)
+       VALUES (:organizationId, :marketId, :name, 'active')`,
+      { organizationId, marketId, name },
+    );
+  }
+}
+
 async function syncAnnouncementCoverImage(organizationId, announcementId) {
   const coverRows = await query(
     `SELECT image_url
@@ -1035,12 +1061,16 @@ router.get(
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
   requireMarketAccess(),
   asyncHandler(async (req, res) => {
+    const marketId = Number(req.params.marketId);
+    await ensureFixedProductCategories(req.auth.organizationId, marketId);
     const rows = await query(
       `SELECT id, name, status
        FROM product_categories
-       WHERE organization_id = :organizationId AND (market_id = :marketId OR market_id IS NULL)
-       ORDER BY name`,
-      { organizationId: req.auth.organizationId, marketId: Number(req.params.marketId) },
+       WHERE organization_id = :organizationId
+         AND market_id = :marketId
+         AND name IN ('อาหาร', 'ไม่ใช่อาหาร')
+       ORDER BY FIELD(name, 'อาหาร', 'ไม่ใช่อาหาร')`,
+      { organizationId: req.auth.organizationId, marketId },
     );
     return ok(res, rows);
   }),
@@ -1052,12 +1082,28 @@ router.post(
   requireMarketAccess(),
   validate(
     z.object({
-      body: z.object({ name: z.string().min(1), status: z.enum(['active', 'inactive']).default('active') }),
+      body: z.object({ name: z.enum(['อาหาร', 'ไม่ใช่อาหาร']), status: z.enum(['active', 'inactive']).default('active') }),
       query: z.object({}).passthrough(),
       params: z.object({ marketId: z.coerce.number().int().positive() }),
     }),
   ),
   asyncHandler(async (req, res) => {
+    const existing = await query(
+      `SELECT id
+       FROM product_categories
+       WHERE organization_id = :organizationId AND market_id = :marketId AND name = :name
+       LIMIT 1`,
+      { organizationId: req.auth.organizationId, marketId: req.validated.params.marketId, name: req.validated.body.name },
+    );
+    if (existing[0]) {
+      await query(
+        `UPDATE product_categories
+         SET status = :status
+         WHERE id = :id AND organization_id = :organizationId`,
+        { organizationId: req.auth.organizationId, id: existing[0].id, status: req.validated.body.status },
+      );
+      return ok(res, { id: existing[0].id }, 'category updated');
+    }
     const result = await query(
       `INSERT INTO product_categories (organization_id, market_id, name, status)
        VALUES (:organizationId, :marketId, :name, :status)`,
@@ -1718,13 +1764,14 @@ router.get(
         bookingDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
         productId: z.coerce.number().int().positive(),
         floorPlanId: z.coerce.number().int().positive().optional(),
+        excludeBookingItemId: z.coerce.number().int().positive().optional(),
       }),
       params: z.object({ marketId: z.coerce.number().int().positive() }),
     }),
   ),
   asyncHandler(async (req, res) => {
     const { marketId } = req.validated.params;
-    const { bookingDate, productId, floorPlanId } = req.validated.query;
+    const { bookingDate, productId, floorPlanId, excludeBookingItemId } = req.validated.query;
     const productRows = await query(
       `SELECT id, category_id
        FROM products
@@ -1765,6 +1812,7 @@ router.get(
            AND bk.organization_id = :organizationId
            AND bk.market_id = :marketId
            AND bi.booking_date = :bookingDate
+           AND (:excludeBookingItemId IS NULL OR bi.id <> :excludeBookingItemId)
            AND bi.status IN ('pending_payment', 'payment_processing', 'paid')
            AND bk.status IN ('pending_payment', 'payment_processing', 'paid')
          GROUP BY bi.booth_id
@@ -1781,6 +1829,7 @@ router.get(
         bookingDate,
         categoryId: product.category_id,
         floorPlanId: floorPlanId || null,
+        excludeBookingItemId: excludeBookingItemId || null,
       },
     );
     return ok(res, rows);
@@ -1900,18 +1949,238 @@ router.post(
 );
 
 router.get(
+  '/markets/:marketId/booking-items',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({
+        bookingDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      }),
+      params: z.object({ marketId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const marketId = req.validated.params.marketId;
+    const bookingDate = req.validated.query.bookingDate || new Date().toISOString().slice(0, 10);
+    const rows = await query(
+      `SELECT bi.id, bi.booking_id, bi.booth_id, bi.booking_date, bi.unit_price, bi.status AS item_status,
+              b.public_id AS booking_public_id, b.status AS booking_status, b.total_amount, b.created_at,
+              b.mobile_user_id, b.comment,
+              mu.public_id AS mobile_public_id, mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc,
+              bo.code AS booth_code, bo.name AS booth_name, bo.category_id,
+              bp.product_id, p.name AS product_name
+       FROM booking_items bi
+       JOIN bookings b ON b.id = bi.booking_id
+       JOIN booths bo ON bo.id = bi.booth_id
+       JOIN mobile_users mu ON mu.id = b.mobile_user_id
+       LEFT JOIN booking_products bp ON bp.booking_item_id = bi.id
+       LEFT JOIN products p ON p.id = bp.product_id
+       WHERE bi.organization_id = :organizationId
+         AND b.organization_id = :organizationId
+         AND b.market_id = :marketId
+         AND bi.booking_date = :bookingDate
+         AND b.status IN ('pending_payment', 'payment_processing', 'paid')
+         AND bi.status IN ('pending_payment', 'payment_processing', 'paid')
+       ORDER BY b.created_at DESC, bi.id DESC
+       LIMIT 500`,
+      { organizationId: req.auth.organizationId, marketId, bookingDate },
+    );
+    return ok(
+      res,
+      rows.map((row) => ({
+        ...row,
+        username: decryptField(row.username_enc),
+        mobile_name: [decryptField(row.first_name_enc), decryptField(row.last_name_enc)].filter(Boolean).join(' ').trim(),
+        mobile_phone: decryptField(row.phone_enc),
+        username_enc: undefined,
+        first_name_enc: undefined,
+        last_name_enc: undefined,
+        phone_enc: undefined,
+      })),
+    );
+  }),
+);
+
+router.patch(
+  '/markets/:marketId/booking-items/:bookingItemId',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  validate(
+    z.object({
+      body: z.object({
+        bookingDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        boothId: z.coerce.number().int().positive(),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({
+        marketId: z.coerce.number().int().positive(),
+        bookingItemId: z.coerce.number().int().positive(),
+      }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { marketId, bookingItemId } = req.validated.params;
+    const { bookingDate, boothId } = req.validated.body;
+    const result = await transaction(async (conn) => {
+      const [items] = await conn.execute(
+        `SELECT bi.id, bi.booking_id, bi.booth_id, bi.booking_date, bi.status, b.status AS booking_status
+         FROM booking_items bi
+         JOIN bookings b ON b.id = bi.booking_id
+         WHERE bi.id = :bookingItemId
+           AND bi.organization_id = :organizationId
+           AND b.organization_id = :organizationId
+           AND b.market_id = :marketId
+           AND b.status IN ('pending_payment', 'payment_processing', 'paid')
+           AND bi.status IN ('pending_payment', 'payment_processing', 'paid')
+         LIMIT 1
+         FOR UPDATE`,
+        { organizationId: req.auth.organizationId, marketId, bookingItemId },
+      );
+      const item = items[0];
+      if (!item) throw notFound('Booking item not found');
+
+      const [booths] = await conn.execute(
+        `SELECT id, price
+         FROM booths
+         WHERE id = :boothId
+           AND organization_id = :organizationId
+           AND market_id = :marketId
+           AND status = 'active'
+         LIMIT 1
+         FOR UPDATE`,
+        { organizationId: req.auth.organizationId, marketId, boothId },
+      );
+      const booth = booths[0];
+      if (!booth) throw notFound('Booth not found');
+
+      const [locked] = await conn.execute(
+        `SELECT bi.id
+         FROM booking_items bi
+         JOIN bookings b ON b.id = bi.booking_id
+         WHERE bi.booth_id = :boothId
+           AND bi.booking_date = :bookingDate
+           AND bi.id <> :bookingItemId
+           AND bi.status IN ('pending_payment', 'paid', 'payment_processing')
+           AND b.status IN ('pending_payment', 'paid', 'payment_processing')
+         LIMIT 1
+         FOR UPDATE`,
+        { boothId, bookingDate, bookingItemId },
+      );
+      if (locked.length) throw conflict(`Booth ${boothId} has already been booked on ${bookingDate}`);
+
+      await conn.execute(
+        `UPDATE booking_items
+         SET booth_id = :boothId,
+             booking_date = :bookingDate,
+             unit_price = :unitPrice
+         WHERE id = :bookingItemId AND organization_id = :organizationId`,
+        { organizationId: req.auth.organizationId, bookingItemId, boothId, bookingDate, unitPrice: booth.price },
+      );
+
+      const [totals] = await conn.execute(
+        `SELECT COALESCE(SUM(unit_price), 0) AS total_amount
+         FROM booking_items
+         WHERE booking_id = :bookingId
+           AND organization_id = :organizationId
+           AND status IN ('pending_payment', 'payment_processing', 'paid')`,
+        { organizationId: req.auth.organizationId, bookingId: item.booking_id },
+      );
+      const totalAmount = Number(totals[0]?.total_amount || 0);
+      await conn.execute(
+        `UPDATE bookings
+         SET subtotal_amount = :totalAmount,
+             total_amount = GREATEST(:totalAmount - discount_amount, 0)
+         WHERE id = :bookingId AND organization_id = :organizationId`,
+        { organizationId: req.auth.organizationId, bookingId: item.booking_id, totalAmount },
+      );
+
+      return { id: bookingItemId, bookingId: item.booking_id, totalAmount };
+    });
+    return ok(res, result, 'booking item updated');
+  }),
+);
+
+router.patch(
+  '/markets/:marketId/bookings/:bookingId/cancel',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  validate(
+    z.object({
+      body: z.object({ comment: z.string().min(1).max(1000) }),
+      query: z.object({}).passthrough(),
+      params: z.object({
+        marketId: z.coerce.number().int().positive(),
+        bookingId: z.coerce.number().int().positive(),
+      }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { marketId, bookingId } = req.validated.params;
+    const result = await transaction(async (conn) => {
+      const [bookings] = await conn.execute(
+        `SELECT id
+         FROM bookings
+         WHERE id = :bookingId
+           AND organization_id = :organizationId
+           AND market_id = :marketId
+         LIMIT 1
+         FOR UPDATE`,
+        { organizationId: req.auth.organizationId, marketId, bookingId },
+      );
+      if (!bookings[0]) throw notFound('Booking not found');
+      await conn.execute(
+        `UPDATE bookings
+         SET status = 'cancelled',
+             comment = :comment
+         WHERE id = :bookingId AND organization_id = :organizationId`,
+        { organizationId: req.auth.organizationId, bookingId, comment: req.validated.body.comment },
+      );
+      await conn.execute(
+        `UPDATE booking_items
+         SET status = 'cancelled'
+         WHERE booking_id = :bookingId AND organization_id = :organizationId`,
+        { organizationId: req.auth.organizationId, bookingId },
+      );
+      return { id: bookingId };
+    });
+    return ok(res, result, 'booking cancelled');
+  }),
+);
+
+router.get(
   '/mobile-users',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
   asyncHandler(async (req, res) => {
     const rows = await query(
-      `SELECT id, public_id, status, created_at
+      `SELECT id, public_id, username_enc, first_name_enc, last_name_enc, phone_enc, email_enc, status, created_at
        FROM mobile_users
        WHERE organization_id = :organizationId
        ORDER BY created_at DESC
        LIMIT 500`,
       { organizationId: req.auth.organizationId },
     );
-    return ok(res, rows);
+    const keyword = String(req.query.keyword || '').trim().toLowerCase();
+    const mapped = rows.map((row) => {
+      const firstName = decryptField(row.first_name_enc);
+      const lastName = decryptField(row.last_name_enc);
+      const name = [firstName, lastName].filter(Boolean).join(' ').trim();
+      return {
+        id: row.id,
+        public_id: row.public_id,
+        username: decryptField(row.username_enc),
+        name,
+        phone: decryptField(row.phone_enc),
+        email: decryptField(row.email_enc),
+        status: row.status,
+        created_at: row.created_at,
+      };
+    });
+    const filtered = keyword
+      ? mapped.filter((row) => `${row.public_id} ${row.username} ${row.name} ${row.phone} ${row.email}`.toLowerCase().includes(keyword))
+      : mapped;
+    return ok(res, filtered.slice(0, 50));
   }),
 );
 
