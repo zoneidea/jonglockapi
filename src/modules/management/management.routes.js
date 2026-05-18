@@ -3189,36 +3189,98 @@ router.get(
 router.get(
   '/accounting/payments',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({
+        paidOnly: z.enum(['0', '1']).optional(),
+        status: z.enum(['paid']).optional(),
+        startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        marketId: z.coerce.number().int().positive().optional(),
+        dateField: z.enum(['created_date', 'booking_date', 'payment_date']).optional().default('payment_date'),
+        sortBy: z.enum(['booking_public_id', 'booking_date', 'payment_date']).optional().default('payment_date'),
+      }),
+      params: z.object({}).passthrough(),
+    }),
+  ),
   asyncHandler(async (req, res) => {
     await expireStaleBookings({ execute: query }, req.auth.organizationId);
-    const paidOnly = req.query.paidOnly === '1' || req.query.status === 'paid';
+    const { startDate, endDate, marketId, dateField, sortBy } = req.validated.query;
+    const paidOnly = req.validated.query.paidOnly === '1' || req.validated.query.status === 'paid';
+    const orderBy = {
+      booking_public_id: 'b.public_id ASC',
+      booking_date: 'MIN(bi.booking_date) DESC, b.public_id ASC',
+      payment_date: 'COALESCE(p.paid_at, p.created_at) DESC, b.public_id ASC',
+    }[sortBy];
     const rows = await query(
       `SELECT p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at, b.public_id AS booking_public_id,
               b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
+              m.id AS market_id, m.name AS market_name,
+              mu.username_enc, mu.first_name_enc, mu.last_name_enc,
+              o.name AS organization_name, o.address AS organization_address, o.email AS organization_email, o.phone AS organization_phone,
+              o.vat_enabled, o.vat_rate, o.registered_name, o.registered_tax_id, o.registered_subdistrict,
+              o.registered_district, o.registered_province, o.registered_postcode,
               GROUP_CONCAT(DISTINCT DATE_FORMAT(bi.booking_date, '%Y-%m-%d') ORDER BY bi.booking_date SEPARATOR ', ') AS booking_dates,
               GROUP_CONCAT(DISTINCT CONCAT(COALESCE(bo.code, ''), CASE WHEN bo.name IS NULL OR bo.name = '' THEN '' ELSE CONCAT(' ', bo.name) END) ORDER BY bo.sort_order, bo.code SEPARATOR ', ') AS booths
        FROM payments p
        LEFT JOIN bookings b ON b.id = p.booking_id
+       LEFT JOIN organizations o ON o.id = p.organization_id
+       LEFT JOIN markets m ON m.id = b.market_id
+       LEFT JOIN mobile_users mu ON mu.id = b.mobile_user_id
        LEFT JOIN booking_items bi ON bi.booking_id = b.id
        LEFT JOIN booths bo ON bo.id = bi.booth_id
        LEFT JOIN admin_market_assignments ama
          ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE p.organization_id = :organizationId
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+         AND (:marketId IS NULL OR b.market_id = :marketId)
          AND (:paidOnly = 0 OR p.status = 'paid')
          AND (:paidOnly = 0 OR b.status = 'paid')
+         AND (
+           :startDate IS NULL
+           OR (
+             (:dateField = 'created_date' AND DATE(p.created_at) >= :startDate)
+             OR (:dateField = 'booking_date' AND bi.booking_date >= :startDate)
+             OR (:dateField = 'payment_date' AND DATE(COALESCE(p.paid_at, p.created_at)) >= :startDate)
+           )
+         )
+         AND (
+           :endDate IS NULL
+           OR (
+             (:dateField = 'created_date' AND DATE(p.created_at) <= :endDate)
+             OR (:dateField = 'booking_date' AND bi.booking_date <= :endDate)
+             OR (:dateField = 'payment_date' AND DATE(COALESCE(p.paid_at, p.created_at)) <= :endDate)
+           )
+         )
        GROUP BY p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at, b.public_id,
-                b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount
-       ORDER BY p.created_at DESC
+                b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
+                m.id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc,
+                o.name, o.address, o.email, o.phone, o.vat_enabled, o.vat_rate, o.registered_name,
+                o.registered_tax_id, o.registered_subdistrict, o.registered_district, o.registered_province, o.registered_postcode
+       ORDER BY ${orderBy}
        LIMIT 500`,
       {
         organizationId: req.auth.organizationId,
         adminUserId: req.auth.sub,
         hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
         paidOnly: paidOnly ? 1 : 0,
+        marketId: marketId || null,
+        startDate: startDate || null,
+        endDate: endDate || null,
+        dateField,
       },
     );
-    return ok(res, rows);
+    return ok(
+      res,
+      rows.map((row) => ({
+        ...row,
+        customer_name: [decryptField(row.first_name_enc), decryptField(row.last_name_enc)].filter(Boolean).join(' ').trim() || decryptField(row.username_enc) || '-',
+        username_enc: undefined,
+        first_name_enc: undefined,
+        last_name_enc: undefined,
+      })),
+    );
   }),
 );
 
