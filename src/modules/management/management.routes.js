@@ -3069,6 +3069,7 @@ router.get(
         startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
         endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
         marketId: z.coerce.number().int().positive().optional(),
+        paidOnly: z.enum(['0', '1']).optional(),
         dateField: z.enum(['created_date', 'booking_date', 'payment_date']).optional().default('payment_date'),
         sortBy: z.enum(['booking_public_id', 'booking_date', 'payment_date']).optional().default('payment_date'),
       }),
@@ -3078,6 +3079,7 @@ router.get(
   asyncHandler(async (req, res) => {
     await expireStaleBookings({ execute: query }, req.auth.organizationId);
     const { startDate, endDate, marketId, dateField, sortBy } = req.validated.query;
+    const paidOnly = req.validated.query.paidOnly === '1';
     const orderBy = {
       booking_public_id: 'b.public_id ASC',
       booking_date: 'item_summary.first_booking_date DESC, b.public_id ASC',
@@ -3106,6 +3108,15 @@ router.get(
               item_summary.booking_dates,
               COALESCE(item_summary.booth_service_amount, 0) AS booth_service_amount,
               COALESCE(accessory_summary.other_service_amount, 0) AS other_service_amount,
+              COALESCE(fine_summary.fine_amount, 0) AS fine_amount,
+              COALESCE(fine_summary.fine_vat_amount, 0) AS fine_vat_amount,
+              COALESCE(fine_summary.total_fine_amount, 0) AS total_fine_amount,
+              GREATEST(
+                COALESCE(b.subtotal_amount, 0)
+                - COALESCE(b.discount_amount, 0)
+                + COALESCE(fine_summary.fine_amount, 0),
+                0
+              ) AS amount_before_vat,
               0 AS withholding_tax_amount
        FROM bookings b
        JOIN markets m ON m.id = b.market_id
@@ -3128,6 +3139,16 @@ router.get(
          WHERE ba.organization_id = :organizationId
          GROUP BY bi.booking_id
        ) accessory_summary ON accessory_summary.booking_id = b.id
+       LEFT JOIN (
+         SELECT bi.booking_id,
+                COALESCE(SUM(ac.fine_amount + ac.accessories_fine_amount + ac.damage_fine_amount), 0) AS fine_amount,
+                COALESCE(SUM(ac.vat_amount), 0) AS fine_vat_amount,
+                COALESCE(SUM(ac.total_fine_amount), 0) AS total_fine_amount
+         FROM audit_checks ac
+         JOIN booking_items bi ON bi.id = ac.booking_item_id
+         WHERE ac.organization_id = :organizationId
+         GROUP BY bi.booking_id
+       ) fine_summary ON fine_summary.booking_id = b.id
        LEFT JOIN payments p
          ON p.id = (
            SELECT p2.id
@@ -3143,6 +3164,7 @@ router.get(
          AND mu.organization_id = :organizationId
          AND (:marketId IS NULL OR b.market_id = :marketId)
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+         AND (:paidOnly = 0 OR (b.status = 'paid' AND p.status = 'paid'))
          AND (
            :startDate IS NULL
            OR (
@@ -3166,6 +3188,7 @@ router.get(
         adminUserId: req.auth.sub,
         hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
         marketId: marketId || null,
+        paidOnly: paidOnly ? 1 : 0,
         startDate: startDate || null,
         endDate: endDate || null,
         dateField,
