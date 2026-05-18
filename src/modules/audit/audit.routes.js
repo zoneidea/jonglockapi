@@ -8,6 +8,7 @@ const { ROLES } = require('../../constants/roles');
 const { asyncHandler } = require('../../utils/async-handler');
 const { ok, created } = require('../../utils/api-response');
 const { notFound } = require('../../utils/errors');
+const { applyVatToAmount, getOrganizationVatSettings } = require('../../utils/vat');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
@@ -91,7 +92,8 @@ router.post(
       );
       if (!items.length) throw notFound('Booking item not found');
 
-      const totalFine = body.fineAmount + body.accessoriesFineAmount + body.damageFineAmount;
+      const vatSettings = await getOrganizationVatSettings(conn, req.auth.organizationId);
+      const totalFine = applyVatToAmount(body.fineAmount + body.accessoriesFineAmount + body.damageFineAmount, vatSettings);
       const [check] = await conn.execute(
         `INSERT INTO audit_checks (
           organization_id, market_id, booking_item_id, checked_by_admin_id,

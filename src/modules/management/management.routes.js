@@ -16,6 +16,7 @@ const { encryptField, blindIndex, decryptField } = require('../../utils/crypto')
 const { publicId } = require('../../utils/id');
 const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/password-policy');
 const { expireStaleBookings } = require('../../utils/booking-status');
+const { applyVatToAmount, getOrganizationVatSettings } = require('../../utils/vat');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
@@ -292,7 +293,10 @@ router.get(
   requireRoles(ROLES.SUPERVISOR),
   asyncHandler(async (req, res) => {
     const rows = await query(
-      `SELECT id, code, name, address, email, phone, line_id, status, created_at, updated_at
+      `SELECT id, code, name, address, email, phone, line_id,
+              vat_enabled, vat_rate, registered_name, registered_tax_id, registered_address,
+              registered_subdistrict, registered_district, registered_province, registered_postcode,
+              status, created_at, updated_at
        FROM organizations
        WHERE id = :organizationId
        LIMIT 1`,
@@ -315,6 +319,15 @@ router.put(
         email: z.string().email().optional().or(z.literal('')).default(''),
         phone: z.string().optional().default(''),
         lineId: z.string().optional().default(''),
+        vatEnabled: z.boolean().optional().default(false),
+        vatRate: z.coerce.number().min(0).max(100).optional().default(7),
+        registeredName: z.string().optional().default(''),
+        registeredTaxId: z.string().optional().default(''),
+        registeredAddress: z.string().optional().default(''),
+        registeredSubdistrict: z.string().optional().default(''),
+        registeredDistrict: z.string().optional().default(''),
+        registeredProvince: z.string().optional().default(''),
+        registeredPostcode: z.string().optional().default(''),
       }),
       query: z.object({}).passthrough(),
       params: z.object({}).passthrough(),
@@ -322,13 +335,37 @@ router.put(
   ),
   asyncHandler(async (req, res) => {
     const body = req.validated.body;
+    if (body.vatEnabled) {
+      const requiredFields = [
+        ['vatRate', body.vatRate],
+        ['registeredName', body.registeredName],
+        ['registeredTaxId', body.registeredTaxId],
+        ['registeredAddress', body.registeredAddress],
+        ['registeredSubdistrict', body.registeredSubdistrict],
+        ['registeredDistrict', body.registeredDistrict],
+        ['registeredProvince', body.registeredProvince],
+        ['registeredPostcode', body.registeredPostcode],
+      ];
+      const missingField = requiredFields.find(([, value]) => String(value || '').trim() === '' || Number(value) === 0);
+      if (missingField) throw badRequest('VAT registration information is required');
+    }
+
     await query(
       `UPDATE organizations
        SET name = :name,
            address = :address,
            email = :email,
            phone = :phone,
-           line_id = :lineId
+           line_id = :lineId,
+           vat_enabled = :vatEnabled,
+           vat_rate = :vatRate,
+           registered_name = :registeredName,
+           registered_tax_id = :registeredTaxId,
+           registered_address = :registeredAddress,
+           registered_subdistrict = :registeredSubdistrict,
+           registered_district = :registeredDistrict,
+           registered_province = :registeredProvince,
+           registered_postcode = :registeredPostcode
        WHERE id = :organizationId`,
       {
         organizationId: req.auth.organizationId,
@@ -337,6 +374,15 @@ router.put(
         email: body.email,
         phone: body.phone,
         lineId: body.lineId,
+        vatEnabled: body.vatEnabled ? 1 : 0,
+        vatRate: body.vatRate,
+        registeredName: body.registeredName,
+        registeredTaxId: body.registeredTaxId,
+        registeredAddress: body.registeredAddress,
+        registeredSubdistrict: body.registeredSubdistrict,
+        registeredDistrict: body.registeredDistrict,
+        registeredProvince: body.registeredProvince,
+        registeredPostcode: body.registeredPostcode,
       },
     );
     return ok(
@@ -348,6 +394,15 @@ router.put(
         email: body.email,
         phone: body.phone,
         line_id: body.lineId,
+        vat_enabled: body.vatEnabled ? 1 : 0,
+        vat_rate: body.vatRate,
+        registered_name: body.registeredName,
+        registered_tax_id: body.registeredTaxId,
+        registered_address: body.registeredAddress,
+        registered_subdistrict: body.registeredSubdistrict,
+        registered_district: body.registeredDistrict,
+        registered_province: body.registeredProvince,
+        registered_postcode: body.registeredPostcode,
       },
       'organization settings updated',
     );
@@ -1866,7 +1921,8 @@ router.get(
         excludeBookingItemId: excludeBookingItemId || null,
       },
     );
-    return ok(res, rows);
+    const vatSettings = await getOrganizationVatSettings({ execute: query }, req.auth.organizationId);
+    return ok(res, rows.map((row) => ({ ...row, gross_price: applyVatToAmount(row.price, vatSettings) })));
   }),
 );
 
@@ -1906,7 +1962,9 @@ router.post(
       );
       if (!users.length) throw notFound('Mobile user not found');
 
+      const vatSettings = await getOrganizationVatSettings(conn, req.auth.organizationId);
       let total = 0;
+      const pricedItems = [];
       for (const item of items) {
         const [booths] = await conn.execute(
           `SELECT id, price FROM booths
@@ -1930,7 +1988,9 @@ router.post(
           { boothId: item.boothId, bookingDate: item.bookingDate },
         );
         if (locked.length) throw conflict(`Booth ${item.boothId} has already been booked on ${item.bookingDate}`);
-        total += Number(booths[0].price);
+        const unitPrice = applyVatToAmount(booths[0].price, vatSettings);
+        total += unitPrice;
+        pricedItems.push({ ...item, unitPrice });
       }
 
       const publicBookingId = publicId('BK');
@@ -1953,8 +2013,7 @@ router.post(
         },
       );
 
-      for (const item of items) {
-        const [booths] = await conn.execute(`SELECT price FROM booths WHERE id = :boothId`, { boothId: item.boothId });
+      for (const item of pricedItems) {
         const [bookingItem] = await conn.execute(
           `INSERT INTO booking_items (organization_id, booking_id, booth_id, booking_date, unit_price, status)
            VALUES (:organizationId, :bookingId, :boothId, :bookingDate, :unitPrice, 'pending_payment')`,
@@ -1963,7 +2022,7 @@ router.post(
             bookingId: booking.insertId,
             boothId: item.boothId,
             bookingDate: item.bookingDate,
-            unitPrice: booths[0].price,
+            unitPrice: item.unitPrice,
           },
         );
 
@@ -2091,6 +2150,8 @@ router.patch(
       );
       const booth = booths[0];
       if (!booth) throw notFound('Booth not found');
+      const vatSettings = await getOrganizationVatSettings(conn, req.auth.organizationId);
+      const unitPrice = applyVatToAmount(booth.price, vatSettings);
 
       const [locked] = await conn.execute(
         `SELECT bi.id
@@ -2113,7 +2174,7 @@ router.patch(
              booking_date = :bookingDate,
              unit_price = :unitPrice
          WHERE id = :bookingItemId AND organization_id = :organizationId`,
-        { organizationId: req.auth.organizationId, bookingItemId, boothId, bookingDate, unitPrice: booth.price },
+        { organizationId: req.auth.organizationId, bookingItemId, boothId, bookingDate, unitPrice },
       );
 
       await conn.execute(
@@ -2136,7 +2197,7 @@ router.patch(
           oldBookingDate: item.booking_date,
           newBookingDate: bookingDate,
           oldUnitPrice: item.unit_price,
-          newUnitPrice: booth.price,
+          newUnitPrice: unitPrice,
           editedByAdminId: req.auth.sub,
         },
       );

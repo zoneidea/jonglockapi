@@ -12,6 +12,7 @@ const { encryptField, blindIndex } = require('../../utils/crypto');
 const { publicId } = require('../../utils/id');
 const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/password-policy');
 const { expireStaleBookings } = require('../../utils/booking-status');
+const { applyVatToAmount, getOrganizationVatSettings } = require('../../utils/vat');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
@@ -166,7 +167,8 @@ router.get(
       { organizationId: req.auth.organizationId, marketId, bookingDate, categoryId },
     );
 
-    return ok(res, rows);
+    const vatSettings = await getOrganizationVatSettings({ execute: query }, req.auth.organizationId);
+    return ok(res, rows.map((row) => ({ ...row, gross_price: applyVatToAmount(row.price, vatSettings) })));
   }),
 );
 
@@ -203,7 +205,9 @@ router.post(
       );
       if (!marketRows.length) throw notFound('Market not found');
 
+      const vatSettings = await getOrganizationVatSettings(conn, req.auth.organizationId);
       let total = 0;
+      const pricedItems = [];
       for (const item of items) {
         const [boothRows] = await conn.execute(
           `SELECT id, price FROM booths
@@ -226,7 +230,9 @@ router.post(
           { boothId: item.boothId, bookingDate: item.bookingDate },
         );
         if (locked.length) throw conflict(`Booth ${item.boothId} has already been booked on ${item.bookingDate}`);
-        total += Number(boothRows[0].price);
+        const unitPrice = applyVatToAmount(boothRows[0].price, vatSettings);
+        total += unitPrice;
+        pricedItems.push({ ...item, unitPrice });
       }
 
       const publicBookingId = publicId('BK');
@@ -248,8 +254,7 @@ router.post(
         },
       );
 
-      for (const item of items) {
-        const [boothRows] = await conn.execute(`SELECT price FROM booths WHERE id = :boothId`, { boothId: item.boothId });
+      for (const item of pricedItems) {
         const [detailResult] = await conn.execute(
           `INSERT INTO booking_items (
             organization_id, booking_id, booth_id, booking_date, unit_price, status
@@ -261,7 +266,7 @@ router.post(
             bookingId: bookingResult.insertId,
             boothId: item.boothId,
             bookingDate: item.bookingDate,
-            unitPrice: boothRows[0].price,
+            unitPrice: item.unitPrice,
           },
         );
 
