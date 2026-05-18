@@ -238,6 +238,172 @@ async function syncAnnouncementCoverImage(organizationId, announcementId) {
   return nextImageUrl;
 }
 
+const ACCOUNTING_DOCUMENT_PREFIX = {
+  receipt: 'RC',
+  tax_invoice: 'TAX',
+  credit_note: 'CN',
+};
+
+function toJson(value) {
+  return JSON.stringify(value || null);
+}
+
+function normalizeJsonValue(value) {
+  if (!value) return null;
+  if (typeof value !== 'string') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function accountingDocumentTypeLabel(type) {
+  if (type === 'tax_invoice') return 'ใบกำกับภาษี / ใบเสร็จรับเงิน';
+  if (type === 'credit_note') return 'ใบลดหนี้';
+  return 'ใบเสร็จรับเงิน';
+}
+
+async function nextAccountingDocumentNo(conn, organizationId, documentType, issueDate) {
+  const periodYm = String(issueDate).replace(/-/g, '').slice(0, 6);
+  await conn.execute(
+    `INSERT INTO accounting_document_sequences (organization_id, document_type, period_ym, sequence_no)
+     VALUES (:organizationId, :documentType, :periodYm, 1)
+     ON DUPLICATE KEY UPDATE sequence_no = sequence_no + 1`,
+    { organizationId, documentType, periodYm },
+  );
+  const [rows] = await conn.execute(
+    `SELECT sequence_no
+     FROM accounting_document_sequences
+     WHERE organization_id = :organizationId
+       AND document_type = :documentType
+       AND period_ym = :periodYm
+     LIMIT 1
+     FOR UPDATE`,
+    { organizationId, documentType, periodYm },
+  );
+  return `${ACCOUNTING_DOCUMENT_PREFIX[documentType]}${periodYm}${String(rows[0].sequence_no).padStart(5, '0')}`;
+}
+
+async function fetchPaymentAccountingDetail(conn, organizationId, paymentId, adminUserId, hasGlobalMarketAccess) {
+  const [rows] = await conn.execute(
+    `SELECT p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at,
+            b.id AS booking_id, b.public_id AS booking_public_id,
+            b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
+            m.id AS market_id, m.name AS market_name,
+            mu.username_enc, mu.first_name_enc, mu.last_name_enc,
+            o.name AS organization_name, o.address AS organization_address, o.email AS organization_email, o.phone AS organization_phone,
+            o.vat_enabled, o.vat_rate, o.registered_name, o.registered_tax_id, o.registered_subdistrict,
+            o.registered_district, o.registered_province, o.registered_postcode,
+            GROUP_CONCAT(DISTINCT DATE_FORMAT(bi.booking_date, '%Y-%m-%d') ORDER BY bi.booking_date SEPARATOR ', ') AS booking_dates,
+            GROUP_CONCAT(DISTINCT CONCAT(COALESCE(bo.code, ''), CASE WHEN bo.name IS NULL OR bo.name = '' THEN '' ELSE CONCAT(' ', bo.name) END) ORDER BY bo.sort_order, bo.code SEPARATOR ', ') AS booths
+     FROM payments p
+     JOIN bookings b ON b.id = p.booking_id
+     JOIN organizations o ON o.id = p.organization_id
+     JOIN markets m ON m.id = b.market_id
+     JOIN mobile_users mu ON mu.id = b.mobile_user_id
+     LEFT JOIN booking_items bi ON bi.booking_id = b.id
+     LEFT JOIN booths bo ON bo.id = bi.booth_id
+     LEFT JOIN admin_market_assignments ama
+       ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+     WHERE p.id = :paymentId
+       AND p.organization_id = :organizationId
+       AND p.status = 'paid'
+       AND b.status = 'paid'
+       AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+     GROUP BY p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at,
+              b.id, b.public_id, b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
+              m.id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc,
+              o.name, o.address, o.email, o.phone, o.vat_enabled, o.vat_rate, o.registered_name,
+              o.registered_tax_id, o.registered_subdistrict, o.registered_district, o.registered_province, o.registered_postcode
+     LIMIT 1
+     FOR UPDATE`,
+    { organizationId, paymentId, adminUserId, hasGlobalMarketAccess },
+  );
+  return rows[0] || null;
+}
+
+async function issueAccountingDocument(conn, { organizationId, paymentId, adminUserId, hasGlobalMarketAccess, documentType }) {
+  const payment = await fetchPaymentAccountingDetail(conn, organizationId, paymentId, adminUserId, hasGlobalMarketAccess);
+  if (!payment) throw notFound('Paid payment not found');
+
+  const resolvedType = documentType || (Number(payment.vat_enabled || 0) === 1 ? 'tax_invoice' : 'receipt');
+  const [existing] = await conn.execute(
+    `SELECT *
+     FROM accounting_documents
+     WHERE organization_id = :organizationId
+       AND payment_id = :paymentId
+       AND document_type = :documentType
+       AND document_status = 'issued'
+     ORDER BY id DESC
+     LIMIT 1`,
+    { organizationId, paymentId, documentType: resolvedType },
+  );
+  if (existing[0]) return { ...payment, document: existing[0] };
+
+  const issueDate = currentDateBangkok();
+  const documentNo = await nextAccountingDocumentNo(conn, organizationId, resolvedType, issueDate);
+  const customerName = [decryptField(payment.first_name_enc), decryptField(payment.last_name_enc)].filter(Boolean).join(' ').trim() || decryptField(payment.username_enc) || '-';
+  const lineItems = [
+    {
+      description: 'ค่าจอง Booth',
+      detail: payment.booths || '-',
+      amount: Number(payment.subtotal_amount || 0),
+    },
+  ];
+  const organizationSnapshot = {
+    name: payment.organization_name,
+    address: payment.organization_address,
+    email: payment.organization_email,
+    phone: payment.organization_phone,
+    vatEnabled: Number(payment.vat_enabled || 0) === 1,
+    vatRate: payment.vat_rate,
+    registeredName: payment.registered_name,
+    registeredTaxId: payment.registered_tax_id,
+    registeredSubdistrict: payment.registered_subdistrict,
+    registeredDistrict: payment.registered_district,
+    registeredProvince: payment.registered_province,
+    registeredPostcode: payment.registered_postcode,
+  };
+  const customerSnapshot = {
+    name: customerName,
+    marketName: payment.market_name,
+    bookingPublicId: payment.booking_public_id,
+    bookingDates: payment.booking_dates,
+  };
+
+  const [createdDocument] = await conn.execute(
+    `INSERT INTO accounting_documents (
+      organization_id, document_type, document_no, document_status, payment_id, booking_id,
+      issue_date, subtotal_amount, discount_amount, vat_amount, withholding_tax_amount, total_amount,
+      customer_name, organization_snapshot_json, customer_snapshot_json, line_items_json, issued_by_admin_id
+    ) VALUES (
+      :organizationId, :documentType, :documentNo, 'issued', :paymentId, :bookingId,
+      :issueDate, :subtotalAmount, :discountAmount, :vatAmount, 0, :totalAmount,
+      :customerName, :organizationSnapshotJson, :customerSnapshotJson, :lineItemsJson, :adminUserId
+    )`,
+    {
+      organizationId,
+      documentType: resolvedType,
+      documentNo,
+      paymentId: payment.id,
+      bookingId: payment.booking_id,
+      issueDate,
+      subtotalAmount: payment.subtotal_amount || 0,
+      discountAmount: payment.discount_amount || 0,
+      vatAmount: payment.vat_amount || 0,
+      totalAmount: payment.amount || payment.total_amount || 0,
+      customerName,
+      organizationSnapshotJson: toJson(organizationSnapshot),
+      customerSnapshotJson: toJson(customerSnapshot),
+      lineItemsJson: toJson(lineItems),
+      adminUserId,
+    },
+  );
+  const [documents] = await conn.execute(`SELECT * FROM accounting_documents WHERE id = :id LIMIT 1`, { id: createdDocument.insertId });
+  return { ...payment, customer_name: customerName, document: documents[0] };
+}
+
 router.post(
   '/auth/login',
   validate(
@@ -3241,6 +3407,7 @@ router.get(
               b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
               m.id AS market_id, m.name AS market_name,
               mu.username_enc, mu.first_name_enc, mu.last_name_enc,
+              ad.id AS document_id, ad.document_type, ad.document_no, ad.document_status, ad.issue_date,
               o.name AS organization_name, o.address AS organization_address, o.email AS organization_email, o.phone AS organization_phone,
               o.vat_enabled, o.vat_rate, o.registered_name, o.registered_tax_id, o.registered_subdistrict,
               o.registered_district, o.registered_province, o.registered_postcode,
@@ -3251,6 +3418,16 @@ router.get(
        LEFT JOIN organizations o ON o.id = p.organization_id
        LEFT JOIN markets m ON m.id = b.market_id
        LEFT JOIN mobile_users mu ON mu.id = b.mobile_user_id
+       LEFT JOIN accounting_documents ad
+         ON ad.id = (
+           SELECT ad2.id
+           FROM accounting_documents ad2
+           WHERE ad2.payment_id = p.id
+             AND ad2.organization_id = p.organization_id
+             AND ad2.document_status = 'issued'
+           ORDER BY ad2.id DESC
+           LIMIT 1
+         )
        LEFT JOIN booking_items bi ON bi.booking_id = b.id
        LEFT JOIN booths bo ON bo.id = bi.booth_id
        LEFT JOIN admin_market_assignments ama
@@ -3279,6 +3456,7 @@ router.get(
        GROUP BY p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at, b.public_id,
                 b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
                 m.id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc,
+                ad.id, ad.document_type, ad.document_no, ad.document_status, ad.issue_date,
                 o.name, o.address, o.email, o.phone, o.vat_enabled, o.vat_rate, o.registered_name,
                 o.registered_tax_id, o.registered_subdistrict, o.registered_district, o.registered_province, o.registered_postcode
        ORDER BY ${orderBy}
@@ -3304,6 +3482,156 @@ router.get(
         last_name_enc: undefined,
       })),
     );
+  }),
+);
+
+router.post(
+  '/accounting/payments/:paymentId/document',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  validate(
+    z.object({
+      body: z.object({
+        documentType: z.enum(['receipt', 'tax_invoice']).optional(),
+      }).optional().default({}),
+      query: z.object({}).passthrough(),
+      params: z.object({ paymentId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const result = await transaction(async (conn) => issueAccountingDocument(conn, {
+      organizationId: req.auth.organizationId,
+      paymentId: req.validated.params.paymentId,
+      adminUserId: req.auth.sub,
+      hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
+      documentType: req.validated.body.documentType,
+    }));
+    return created(res, result, `${accountingDocumentTypeLabel(result.document.document_type)} issued`);
+  }),
+);
+
+router.patch(
+  '/accounting/documents/:documentId/cancel',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  validate(
+    z.object({
+      body: z.object({
+        reason: z.string().optional().default(''),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({ documentId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const result = await transaction(async (conn) => {
+      const [documents] = await conn.execute(
+        `SELECT id, document_type, document_no, payment_id
+         FROM accounting_documents
+         WHERE id = :documentId
+           AND organization_id = :organizationId
+           AND document_status = 'issued'
+         LIMIT 1
+         FOR UPDATE`,
+        { organizationId: req.auth.organizationId, documentId: req.validated.params.documentId },
+      );
+      const document = documents[0];
+      if (!document) throw notFound('Issued document not found');
+
+      await conn.execute(
+        `UPDATE accounting_documents
+         SET document_status = 'cancelled',
+             cancelled_by_admin_id = :adminUserId,
+             cancelled_at = NOW(),
+             cancel_reason = :reason
+         WHERE id = :documentId AND organization_id = :organizationId`,
+        {
+          organizationId: req.auth.organizationId,
+          documentId: document.id,
+          adminUserId: req.auth.sub,
+          reason: req.validated.body.reason,
+        },
+      );
+      return { id: document.id, documentNo: document.document_no, documentStatus: 'cancelled' };
+    });
+    return ok(res, result, 'accounting document cancelled');
+  }),
+);
+
+router.post(
+  '/accounting/documents/:documentId/credit-note',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  validate(
+    z.object({
+      body: z.object({
+        reason: z.string().optional().default(''),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({ documentId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const result = await transaction(async (conn) => {
+      const [documents] = await conn.execute(
+        `SELECT *
+         FROM accounting_documents
+         WHERE id = :documentId
+           AND organization_id = :organizationId
+           AND document_status = 'issued'
+         LIMIT 1
+         FOR UPDATE`,
+        { organizationId: req.auth.organizationId, documentId: req.validated.params.documentId },
+      );
+      const source = documents[0];
+      if (!source) throw notFound('Source document not found');
+
+      const [existing] = await conn.execute(
+        `SELECT *
+         FROM accounting_documents
+         WHERE organization_id = :organizationId
+           AND source_document_id = :sourceDocumentId
+           AND document_type = 'credit_note'
+           AND document_status = 'issued'
+         LIMIT 1`,
+        { organizationId: req.auth.organizationId, sourceDocumentId: source.id },
+      );
+      if (existing[0]) return existing[0];
+
+      const issueDate = currentDateBangkok();
+      const documentNo = await nextAccountingDocumentNo(conn, req.auth.organizationId, 'credit_note', issueDate);
+      const [createdDocument] = await conn.execute(
+        `INSERT INTO accounting_documents (
+          organization_id, document_type, document_no, document_status, payment_id, booking_id, audit_check_id, source_document_id,
+          issue_date, subtotal_amount, discount_amount, vat_amount, withholding_tax_amount, total_amount,
+          customer_name, organization_snapshot_json, customer_snapshot_json, line_items_json, issued_by_admin_id, cancel_reason
+        ) VALUES (
+          :organizationId, 'credit_note', :documentNo, 'issued', :paymentId, :bookingId, :auditCheckId, :sourceDocumentId,
+          :issueDate, :subtotalAmount, :discountAmount, :vatAmount, :withholdingTaxAmount, :totalAmount,
+          :customerName, :organizationSnapshotJson, :customerSnapshotJson, :lineItemsJson, :adminUserId, :reason
+        )`,
+        {
+          organizationId: req.auth.organizationId,
+          documentNo,
+          paymentId: source.payment_id,
+          bookingId: source.booking_id,
+          auditCheckId: source.audit_check_id,
+          sourceDocumentId: source.id,
+          issueDate,
+          subtotalAmount: source.subtotal_amount,
+          discountAmount: source.discount_amount,
+          vatAmount: source.vat_amount,
+          withholdingTaxAmount: source.withholding_tax_amount,
+          totalAmount: source.total_amount,
+          customerName: source.customer_name,
+          organizationSnapshotJson: toJson(normalizeJsonValue(source.organization_snapshot_json)),
+          customerSnapshotJson: toJson(normalizeJsonValue(source.customer_snapshot_json)),
+          lineItemsJson: toJson(normalizeJsonValue(source.line_items_json)),
+          adminUserId: req.auth.sub,
+          reason: req.validated.body.reason,
+        },
+      );
+      const [creditNotes] = await conn.execute(`SELECT * FROM accounting_documents WHERE id = :id LIMIT 1`, { id: createdDocument.insertId });
+      return creditNotes[0];
+    });
+    return created(res, result, 'credit note issued');
   }),
 );
 
