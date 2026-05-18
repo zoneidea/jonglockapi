@@ -171,8 +171,15 @@ async function upsertTenantType(connection, organizationId, name) {
   );
 }
 
-async function upsertMobileUser(connection, organizationId) {
-  const username = 'vendor001';
+async function upsertMobileUser(connection, organizationId, profile = {}) {
+  const username = profile.username || 'vendor001';
+  const publicId = profile.publicId || 'MB-DEMO-001';
+  const firstName = profile.firstName || 'สมชาย';
+  const lastName = profile.lastName || 'ค้าขาย';
+  const phone = profile.phone || '0800000000';
+  const email = profile.email || 'vendor001@example.com';
+  const idCard = profile.idCard || '1100000000000';
+  const address = profile.address || 'Bangkok';
   await exec(
     connection,
     `INSERT INTO mobile_users (
@@ -181,7 +188,7 @@ async function upsertMobileUser(connection, organizationId) {
       email_enc, email_hash, id_card_enc, id_card_hash, address_enc,
       accepted_consent_at, status
     ) VALUES (
-      :organizationId, 'MB-DEMO-001', :usernameEnc, :usernameHash, :passwordHash,
+      :organizationId, :publicId, :usernameEnc, :usernameHash, :passwordHash,
       :firstNameEnc, :lastNameEnc, :phoneEnc, :phoneHash,
       :emailEnc, :emailHash, :idCardEnc, :idCardHash, :addressEnc,
       NOW(), 'active'
@@ -202,18 +209,19 @@ async function upsertMobileUser(connection, organizationId) {
       status = 'active'`,
     {
       organizationId,
+      publicId,
       usernameEnc: encryptField(username),
       usernameHash: blindIndex(username),
       passwordHash: await bcrypt.hash(DEFAULT_VENDOR_PASSWORD, 12),
-      firstNameEnc: encryptField('สมชาย'),
-      lastNameEnc: encryptField('ค้าขาย'),
-      phoneEnc: encryptField('0800000000'),
-      phoneHash: blindIndex('0800000000'),
-      emailEnc: encryptField('vendor001@example.com'),
-      emailHash: blindIndex('vendor001@example.com'),
-      idCardEnc: encryptField('1100000000000'),
-      idCardHash: blindIndex('1100000000000'),
-      addressEnc: encryptField('Bangkok'),
+      firstNameEnc: encryptField(firstName),
+      lastNameEnc: encryptField(lastName),
+      phoneEnc: encryptField(phone),
+      phoneHash: blindIndex(phone),
+      emailEnc: encryptField(email),
+      emailHash: blindIndex(email),
+      idCardEnc: encryptField(idCard),
+      idCardHash: blindIndex(idCard),
+      addressEnc: encryptField(address),
     },
   );
 
@@ -392,6 +400,92 @@ async function upsertDemoBooking(connection, organizationId, marketId, mobileUse
   return { bookingId: booking.id, bookingItemId: item.id };
 }
 
+async function upsertAuditCheck(connection, organizationId, marketId, bookingItemId, checkedByAdminId, options = {}) {
+  const result = options.result || 'pass';
+  const fineAmount = Number(options.fineAmount || 0);
+  const accessoriesFineAmount = Number(options.accessoriesFineAmount || 0);
+  const damageFineAmount = Number(options.damageFineAmount || 0);
+  const totalFineAmount = fineAmount + accessoriesFineAmount + damageFineAmount;
+  const finePaymentStatus = totalFineAmount > 0 ? (options.finePaymentStatus || 'pending') : 'none';
+  const checkedAt = options.checkedAt || new Date();
+
+  const existing = await one(
+    connection,
+    `SELECT id
+     FROM audit_checks
+     WHERE organization_id = :organizationId
+       AND market_id = :marketId
+       AND booking_item_id = :bookingItemId
+     ORDER BY id DESC
+     LIMIT 1`,
+    { organizationId, marketId, bookingItemId },
+  );
+
+  if (existing) {
+    await exec(
+      connection,
+      `UPDATE audit_checks
+       SET checked_by_admin_id = :checkedByAdminId,
+           result = :result,
+           note = :note,
+           fine_amount = :fineAmount,
+           accessories_fine_amount = :accessoriesFineAmount,
+           damage_fine_amount = :damageFineAmount,
+           total_fine_amount = :totalFineAmount,
+           fine_payment_status = :finePaymentStatus,
+           checked_at = :checkedAt
+       WHERE id = :id`,
+      {
+        id: existing.id,
+        checkedByAdminId,
+        result,
+        note: options.note || '',
+        fineAmount,
+        accessoriesFineAmount,
+        damageFineAmount,
+        totalFineAmount,
+        finePaymentStatus,
+        checkedAt,
+      },
+    );
+  } else {
+    await exec(
+      connection,
+      `INSERT INTO audit_checks (
+         organization_id, market_id, booking_item_id, checked_by_admin_id,
+         result, note, fine_amount, accessories_fine_amount, damage_fine_amount,
+         total_fine_amount, fine_payment_status, checked_at
+       ) VALUES (
+         :organizationId, :marketId, :bookingItemId, :checkedByAdminId,
+         :result, :note, :fineAmount, :accessoriesFineAmount, :damageFineAmount,
+         :totalFineAmount, :finePaymentStatus, :checkedAt
+       )`,
+      {
+        organizationId,
+        marketId,
+        bookingItemId,
+        checkedByAdminId,
+        result,
+        note: options.note || '',
+        fineAmount,
+        accessoriesFineAmount,
+        damageFineAmount,
+        totalFineAmount,
+        finePaymentStatus,
+        checkedAt,
+      },
+    );
+  }
+
+  await exec(
+    connection,
+    `UPDATE booking_items
+     SET audit_status = :auditStatus
+     WHERE id = :bookingItemId AND organization_id = :organizationId`,
+    { organizationId, bookingItemId, auditStatus: result },
+  );
+}
+
 async function main() {
   const connection = await pool.getConnection();
   try {
@@ -504,6 +598,11 @@ async function main() {
     );
 
     const mobileUser = await upsertMobileUser(connection, organizationId);
+    const productCoffee = await findOrCreateProduct(connection, organizationId, market.id, foodCategory.id, foodGroup.id, 'กาแฟ');
+    const productDessert = await findOrCreateProduct(connection, organizationId, market.id, foodCategory.id, foodGroup.id, 'น้ำสุขภาพ');
+    const productClothes = await findOrCreateProduct(connection, organizationId, market.id, nonFoodCategory.id, nonFoodGroup.id, 'เสื้อผ้า');
+    const productSnack = await findOrCreateProduct(connection, organizationId, market.id, foodCategory.id, foodGroup.id, 'ขนมไทย');
+
     const demoBooking = await upsertDemoBooking(connection, organizationId, market.id, mobileUser.id, booths[0].id, product.id, {
       publicId: 'BK-DEMO-PAID-001',
       paymentPublicId: 'PAY-DEMO-001',
@@ -527,6 +626,107 @@ async function main() {
       amount: 500,
     });
 
+    const customerProfiles = [
+      ['vendor002', 'MB-DEMO-002', 'รุ่งนภา', 'ธำรงผลิต', '0956465653', 'vendor002@example.com'],
+      ['vendor003', 'MB-DEMO-003', 'ฐิติญากรณ์', 'คล้ายสุบรรณ', '0625811765', 'vendor003@example.com'],
+      ['vendor004', 'MB-DEMO-004', 'สุนิสา', 'พาณิชย์ดี', '0814001001', 'vendor004@example.com'],
+      ['vendor005', 'MB-DEMO-005', 'ชุติมา', 'ทองมาก', '0814001002', 'vendor005@example.com'],
+      ['vendor006', 'MB-DEMO-006', 'ประภัสสร', 'แซ่ลิ้ม', '0814001003', 'vendor006@example.com'],
+      ['vendor007', 'MB-DEMO-007', 'กิตติศักดิ์', 'แสนคำ', '0814001004', 'vendor007@example.com'],
+      ['vendor008', 'MB-DEMO-008', 'พิมพ์ชนก', 'ทวีโชค', '0814001005', 'vendor008@example.com'],
+      ['vendor009', 'MB-DEMO-009', 'ศิริพร', 'เพชรดี', '0814001006', 'vendor009@example.com'],
+      ['vendor010', 'MB-DEMO-010', 'กมลชนก', 'ทรัพย์สม', '0814001007', 'vendor010@example.com'],
+      ['vendor011', 'MB-DEMO-011', 'ณัฐพล', 'เจริญกิจ', '0814001008', 'vendor011@example.com'],
+      ['vendor012', 'MB-DEMO-012', 'วรรณภา', 'เพิ่มพูน', '0814001009', 'vendor012@example.com'],
+      ['vendor013', 'MB-DEMO-013', 'มณฑา', 'อรุณรุ่ง', '0814001010', 'vendor013@example.com'],
+    ];
+
+    const mobileUsers = [mobileUser];
+    for (const [username, publicId, firstName, lastName, phone, email] of customerProfiles) {
+      const user = await upsertMobileUser(connection, organizationId, {
+        username,
+        publicId,
+        firstName,
+        lastName,
+        phone,
+        email,
+        idCard: `110000000${phone.slice(-4)}`,
+        address: 'Bangkok',
+      });
+      mobileUsers.push(user);
+    }
+
+    const paidBookingDates = [
+      '2026-05-01', '2026-05-02', '2026-05-03', '2026-05-04', '2026-05-05', '2026-05-06',
+      '2026-05-07', '2026-05-08', '2026-05-09', '2026-05-10', '2026-05-11', '2026-05-12',
+      '2026-05-13', '2026-05-14', '2026-05-15', '2026-05-16', '2026-05-17', '2026-05-18',
+    ];
+    const products = [product, productCoffee, productDessert, productClothes, productSnack];
+    const failedIndexes = new Set([1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31, 34]);
+    const warningIndexes = new Set([5, 11, 17, 23, 29]);
+    const seededBookings = [];
+
+    for (let index = 0; index < 36; index += 1) {
+      const bookingDate = paidBookingDates[index % paidBookingDates.length];
+      const booth = booths[index % booths.length];
+      const selectedProduct = products[index % products.length];
+      const selectedUser = mobileUsers[index % mobileUsers.length];
+      const publicId = `BK-DEMO-${String(index + 2).padStart(4, '0')}`;
+      const paymentPublicId = `PAY-DEMO-${String(index + 2).padStart(4, '0')}`;
+      const amount = Number(index % 2 === 0 ? 500 : 650);
+      const booking = await upsertDemoBooking(
+        connection,
+        organizationId,
+        market.id,
+        selectedUser.id,
+        booth.id,
+        selectedProduct.id,
+        {
+          publicId,
+          paymentPublicId,
+          providerReference: `MOCK-${publicId}`,
+          bookingDate,
+          bookingStatus: 'paid',
+          itemStatus: 'paid',
+          amount,
+        },
+      );
+      seededBookings.push({ ...booking, bookingDate, boothId: booth.id, publicId });
+    }
+
+    await upsertAuditCheck(connection, organizationId, market.id, demoBooking.bookingItemId, audit.id, {
+      result: 'pass',
+      note: 'ข้อมูลทดสอบผ่านการตรวจ',
+      checkedAt: '2026-05-14 10:00:00',
+    });
+
+    for (let index = 0; index < seededBookings.length; index += 1) {
+      const seededBooking = seededBookings[index];
+      if (failedIndexes.has(index)) {
+        await upsertAuditCheck(connection, organizationId, market.id, seededBooking.bookingItemId, audit.id, {
+          result: 'failed',
+          note: 'ขายผิดประเภทสินค้าและตั้งวางอุปกรณ์ผิดตำแหน่ง',
+          fineAmount: 200 + (index % 3) * 100,
+          accessoriesFineAmount: index % 2 === 0 ? 100 : 0,
+          damageFineAmount: index % 4 === 0 ? 50 : 0,
+          finePaymentStatus: index % 3 === 0 ? 'paid' : 'pending',
+          checkedAt: `${seededBooking.bookingDate} 18:30:00`,
+        });
+      } else if (warningIndexes.has(index)) {
+        await upsertAuditCheck(connection, organizationId, market.id, seededBooking.bookingItemId, audit.id, {
+          result: 'warning',
+          note: 'มีการตักเตือนเรื่องการจัดวางสินค้า',
+          checkedAt: `${seededBooking.bookingDate} 18:00:00`,
+        });
+      } else {
+        await upsertAuditCheck(connection, organizationId, market.id, seededBooking.bookingItemId, audit.id, {
+          result: 'pass',
+          note: 'ผ่านการประเมิน',
+          checkedAt: `${seededBooking.bookingDate} 17:30:00`,
+        });
+      }
+    }
+
     await connection.commit();
 
     logger.info(
@@ -540,6 +740,8 @@ async function main() {
         mobileUserId: mobileUser.id,
         bookingId: demoBooking.bookingId,
         bookingItemId: demoBooking.bookingItemId,
+        seededCustomerCount: mobileUsers.length,
+        seededPaidBookings: seededBookings.length + 1,
       },
       'Demo seed completed',
     );
@@ -550,6 +752,8 @@ async function main() {
     console.log(`mobileUserId=${mobileUser.id}`);
     console.log(`bookingId=${demoBooking.bookingId}`);
     console.log(`bookingItemId=${demoBooking.bookingItemId}`);
+    console.log(`seededCustomerCount=${mobileUsers.length}`);
+    console.log(`seededPaidBookings=${seededBookings.length + 1}`);
     console.log('management users: admin / marketadmin / accounting / audit');
     console.log(`management password: ${DEFAULT_ADMIN_PASSWORD}`);
     console.log('mobile user: vendor001');
