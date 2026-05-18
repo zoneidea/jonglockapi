@@ -2575,6 +2575,7 @@ router.patch(
   '/markets/:marketId/audit-checks/:auditCheckId/fine-payment-status',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
   requireMarketAccess(),
+  imageUpload.single('proofImage'),
   validate(
     z.object({
       body: z.object({
@@ -2588,20 +2589,56 @@ router.patch(
     }),
   ),
   asyncHandler(async (req, res) => {
-    const result = await query(
-      `UPDATE audit_checks
-       SET fine_payment_status = :finePaymentStatus
-       WHERE id = :auditCheckId
-         AND market_id = :marketId
-         AND organization_id = :organizationId`,
-      {
-        organizationId: req.auth.organizationId,
-        marketId: req.validated.params.marketId,
-        auditCheckId: req.validated.params.auditCheckId,
-        finePaymentStatus: req.validated.body.finePaymentStatus,
-      },
-    );
-    if (!result.affectedRows) throw notFound('Audit check not found');
+    if (req.validated.body.finePaymentStatus === 'paid' && !req.file) {
+      throw badRequest('Payment proof image is required');
+    }
+    const result = await transaction(async (conn) => {
+      const [checks] = await conn.execute(
+        `SELECT id
+         FROM audit_checks
+         WHERE id = :auditCheckId
+           AND market_id = :marketId
+           AND organization_id = :organizationId
+         LIMIT 1
+         FOR UPDATE`,
+        {
+          organizationId: req.auth.organizationId,
+          marketId: req.validated.params.marketId,
+          auditCheckId: req.validated.params.auditCheckId,
+        },
+      );
+      if (!checks.length) throw notFound('Audit check not found');
+
+      await conn.execute(
+        `UPDATE audit_checks
+         SET fine_payment_status = :finePaymentStatus
+         WHERE id = :auditCheckId
+           AND market_id = :marketId
+           AND organization_id = :organizationId`,
+        {
+          organizationId: req.auth.organizationId,
+          marketId: req.validated.params.marketId,
+          auditCheckId: req.validated.params.auditCheckId,
+          finePaymentStatus: req.validated.body.finePaymentStatus,
+        },
+      );
+
+      if (req.file) {
+        await conn.execute(
+          `INSERT INTO audit_check_images (organization_id, audit_check_id, file_url, file_name, file_size)
+           VALUES (:organizationId, :auditCheckId, :fileUrl, :fileName, :fileSize)`,
+          {
+            organizationId: req.auth.organizationId,
+            auditCheckId: req.validated.params.auditCheckId,
+            fileUrl: publicUploadUrl(req, req.file.path),
+            fileName: req.file.originalname,
+            fileSize: req.file.size,
+          },
+        );
+      }
+
+      return { id: req.validated.params.auditCheckId };
+    });
     return ok(res, { id: req.validated.params.auditCheckId }, 'fine payment status updated');
   }),
 );
