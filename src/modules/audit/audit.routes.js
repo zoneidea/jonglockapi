@@ -8,7 +8,7 @@ const { ROLES } = require('../../constants/roles');
 const { asyncHandler } = require('../../utils/async-handler');
 const { ok, created } = require('../../utils/api-response');
 const { notFound } = require('../../utils/errors');
-const { applyVatToAmount, getOrganizationVatSettings } = require('../../utils/vat');
+const { calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
@@ -93,15 +93,16 @@ router.post(
       if (!items.length) throw notFound('Booking item not found');
 
       const vatSettings = await getOrganizationVatSettings(conn, req.auth.organizationId);
-      const totalFine = applyVatToAmount(body.fineAmount + body.accessoriesFineAmount + body.damageFineAmount, vatSettings);
+      const fineSubtotal = body.fineAmount + body.accessoriesFineAmount + body.damageFineAmount;
+      const fineTotals = calculateVatBreakdown(fineSubtotal, 0, vatSettings);
       const [check] = await conn.execute(
         `INSERT INTO audit_checks (
           organization_id, market_id, booking_item_id, checked_by_admin_id,
-          result, note, fine_amount, accessories_fine_amount, damage_fine_amount, total_fine_amount,
+          result, note, fine_amount, accessories_fine_amount, damage_fine_amount, vat_amount, total_fine_amount,
           fine_payment_status
         ) VALUES (
           :organizationId, :marketId, :bookingItemId, :checkedByAdminId,
-          :result, :note, :fineAmount, :accessoriesFineAmount, :damageFineAmount, :totalFineAmount,
+          :result, :note, :fineAmount, :accessoriesFineAmount, :damageFineAmount, :vatAmount, :totalFineAmount,
           :finePaymentStatus
         )`,
         {
@@ -114,8 +115,9 @@ router.post(
           fineAmount: body.fineAmount,
           accessoriesFineAmount: body.accessoriesFineAmount,
           damageFineAmount: body.damageFineAmount,
-          totalFineAmount: totalFine,
-          finePaymentStatus: totalFine > 0 ? 'pending' : 'none',
+          vatAmount: fineTotals.vatAmount,
+          totalFineAmount: fineTotals.totalAmount,
+          finePaymentStatus: fineTotals.totalAmount > 0 ? 'pending' : 'none',
         },
       );
 
@@ -126,7 +128,7 @@ router.post(
         { auditStatus: body.result, bookingItemId: body.bookingItemId, organizationId: req.auth.organizationId },
       );
 
-      return { id: check.insertId, totalFineAmount: totalFine };
+      return { id: check.insertId, vatAmount: fineTotals.vatAmount, totalFineAmount: fineTotals.totalAmount };
     });
 
     return created(res, result, 'audit check saved');

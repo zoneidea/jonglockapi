@@ -32,7 +32,7 @@ router.post(
     const result = await transaction(async (conn) => {
       await expireStaleBookings(conn, req.auth.organizationId);
       const [bookings] = await conn.execute(
-        `SELECT id, total_amount, status
+        `SELECT id, subtotal_amount, discount_amount, vat_amount, total_amount, status
          FROM bookings
          WHERE id = :bookingId
            AND organization_id = :organizationId
@@ -75,6 +75,9 @@ router.post(
         id: payment.insertId,
         publicId: publicPaymentId,
         provider: body.provider,
+        subtotalAmount: booking.subtotal_amount,
+        discountAmount: booking.discount_amount,
+        vatAmount: booking.vat_amount,
         amount: booking.total_amount,
         redirectUrl: null,
       };

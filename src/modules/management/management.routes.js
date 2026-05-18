@@ -16,7 +16,7 @@ const { encryptField, blindIndex, decryptField } = require('../../utils/crypto')
 const { publicId } = require('../../utils/id');
 const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/password-policy');
 const { expireStaleBookings } = require('../../utils/booking-status');
-const { applyVatToAmount, getOrganizationVatSettings } = require('../../utils/vat');
+const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
@@ -1823,7 +1823,7 @@ router.get(
   requireMarketAccess(),
   asyncHandler(async (req, res) => {
     const rows = await query(
-      `SELECT b.id, b.public_id, b.status, b.total_amount, b.source, b.created_at,
+      `SELECT b.id, b.public_id, b.status, b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount, b.source, b.created_at,
               COUNT(bi.id) AS item_count,
               GROUP_CONCAT(DISTINCT DATE_FORMAT(bi.booking_date, '%Y-%m-%d') ORDER BY bi.booking_date SEPARATOR ', ') AS booking_dates,
               GROUP_CONCAT(DISTINCT CONCAT(COALESCE(bo.code, ''), CASE WHEN bo.name IS NULL OR bo.name = '' THEN '' ELSE CONCAT(' ', bo.name) END) ORDER BY bo.sort_order, bo.code SEPARATOR ', ') AS booths
@@ -1962,7 +1962,7 @@ router.post(
       if (!users.length) throw notFound('Mobile user not found');
 
       const vatSettings = await getOrganizationVatSettings(conn, req.auth.organizationId);
-      let total = 0;
+      let subtotal = 0;
       const pricedItems = [];
       for (const item of items) {
         const [booths] = await conn.execute(
@@ -1987,19 +1987,20 @@ router.post(
           { boothId: item.boothId, bookingDate: item.bookingDate },
         );
         if (locked.length) throw conflict(`Booth ${item.boothId} has already been booked on ${item.bookingDate}`);
-        const unitPrice = applyVatToAmount(booths[0].price, vatSettings);
-        total += unitPrice;
+        const unitPrice = Number(booths[0].price || 0);
+        subtotal += unitPrice;
         pricedItems.push({ ...item, unitPrice });
       }
+      const totals = calculateVatBreakdown(subtotal, 0, vatSettings);
 
       const publicBookingId = publicId('BK');
       const [booking] = await conn.execute(
         `INSERT INTO bookings (
           organization_id, public_id, market_id, mobile_user_id, created_by_admin_id, source, status,
-          subtotal_amount, total_amount, expires_at
+          subtotal_amount, discount_amount, vat_amount, total_amount, expires_at
         ) VALUES (
           :organizationId, :publicId, :marketId, :mobileUserId, :createdByAdminId, 'management', 'pending_payment',
-          :subtotalAmount, :totalAmount, DATE_ADD(NOW(), INTERVAL 30 MINUTE)
+          :subtotalAmount, :discountAmount, :vatAmount, :totalAmount, DATE_ADD(NOW(), INTERVAL 30 MINUTE)
         )`,
         {
           organizationId: req.auth.organizationId,
@@ -2007,8 +2008,10 @@ router.post(
           marketId,
           mobileUserId,
           createdByAdminId: req.auth.sub,
-          subtotalAmount: total,
-          totalAmount: total,
+          subtotalAmount: totals.subtotalAmount,
+          discountAmount: totals.discountAmount,
+          vatAmount: totals.vatAmount,
+          totalAmount: totals.totalAmount,
         },
       );
 
@@ -2034,7 +2037,7 @@ router.post(
         }
       }
 
-      return { id: booking.insertId, publicId: publicBookingId, totalAmount: total, paymentRequiredInMobile: true };
+      return { id: booking.insertId, publicId: publicBookingId, ...totals, paymentRequiredInMobile: true };
     });
 
     return created(res, result, 'management booking created');
@@ -2150,7 +2153,7 @@ router.patch(
       const booth = booths[0];
       if (!booth) throw notFound('Booth not found');
       const vatSettings = await getOrganizationVatSettings(conn, req.auth.organizationId);
-      const unitPrice = applyVatToAmount(booth.price, vatSettings);
+      const unitPrice = Number(booth.price || 0);
 
       const [locked] = await conn.execute(
         `SELECT bi.id
@@ -2202,23 +2205,34 @@ router.patch(
       );
 
       const [totals] = await conn.execute(
-        `SELECT COALESCE(SUM(unit_price), 0) AS total_amount
-         FROM booking_items
-         WHERE booking_id = :bookingId
-           AND organization_id = :organizationId
-           AND status IN ('pending_payment', 'payment_processing', 'paid')`,
+        `SELECT COALESCE(SUM(bi.unit_price), 0) AS subtotal_amount,
+                COALESCE(MAX(b.discount_amount), 0) AS discount_amount
+         FROM booking_items bi
+         JOIN bookings b ON b.id = bi.booking_id
+         WHERE bi.booking_id = :bookingId
+           AND bi.organization_id = :organizationId
+           AND bi.status IN ('pending_payment', 'payment_processing', 'paid')`,
         { organizationId: req.auth.organizationId, bookingId: item.booking_id },
       );
-      const totalAmount = Number(totals[0]?.total_amount || 0);
+      const recalculated = calculateVatBreakdown(totals[0]?.subtotal_amount || 0, totals[0]?.discount_amount || 0, vatSettings);
       await conn.execute(
         `UPDATE bookings
-         SET subtotal_amount = :totalAmount,
-             total_amount = GREATEST(:totalAmount - discount_amount, 0)
+         SET subtotal_amount = :subtotalAmount,
+             discount_amount = :discountAmount,
+             vat_amount = :vatAmount,
+             total_amount = :totalAmount
          WHERE id = :bookingId AND organization_id = :organizationId`,
-        { organizationId: req.auth.organizationId, bookingId: item.booking_id, totalAmount },
+        {
+          organizationId: req.auth.organizationId,
+          bookingId: item.booking_id,
+          subtotalAmount: recalculated.subtotalAmount,
+          discountAmount: recalculated.discountAmount,
+          vatAmount: recalculated.vatAmount,
+          totalAmount: recalculated.totalAmount,
+        },
       );
 
-      return { id: bookingItemId, bookingId: item.booking_id, totalAmount };
+      return { id: bookingItemId, bookingId: item.booking_id, ...recalculated };
     });
     return ok(res, result, 'booking item updated');
   }),
@@ -2537,7 +2551,8 @@ router.get(
     const startDate = req.validated.query.startDate || null;
     const endDate = req.validated.query.endDate || null;
     const rows = await query(
-      `SELECT ac.id, ac.booking_item_id, ac.result, ac.total_fine_amount, ac.fine_payment_status,
+      `SELECT ac.id, ac.booking_item_id, ac.result, ac.fine_amount, ac.accessories_fine_amount,
+              ac.damage_fine_amount, ac.vat_amount, ac.total_fine_amount, ac.fine_payment_status,
               ac.checked_at, b.public_id AS booking_public_id, m.name AS market_name,
               mu.username_enc, mu.first_name_enc, mu.last_name_enc,
               bo.code AS booth_code, bo.name AS booth_name,
@@ -2555,7 +2570,8 @@ router.get(
          AND ac.market_id = :marketId
          AND (:startDate IS NULL OR bi.booking_date >= :startDate)
          AND (:endDate IS NULL OR bi.booking_date <= :endDate)
-       GROUP BY ac.id, ac.booking_item_id, ac.result, ac.total_fine_amount, ac.fine_payment_status, ac.checked_at,
+       GROUP BY ac.id, ac.booking_item_id, ac.result, ac.fine_amount, ac.accessories_fine_amount,
+                ac.damage_fine_amount, ac.vat_amount, ac.total_fine_amount, ac.fine_payment_status, ac.checked_at,
                 b.public_id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc,
                 bo.code, bo.name, bi.booking_date
        ORDER BY bi.booking_date DESC, ac.checked_at DESC
@@ -2596,7 +2612,8 @@ router.get(
     const endDate = req.validated.query.endDate || null;
     const paymentStatus = req.validated.query.paymentStatus || 'pending';
     const rows = await query(
-      `SELECT ac.id, ac.booking_item_id, ac.result, ac.total_fine_amount, ac.fine_payment_status,
+      `SELECT ac.id, ac.booking_item_id, ac.result, ac.fine_amount, ac.accessories_fine_amount,
+              ac.damage_fine_amount, ac.vat_amount, ac.total_fine_amount, ac.fine_payment_status,
               ac.checked_at, b.public_id AS booking_public_id, m.name AS market_name,
               mu.username_enc, mu.first_name_enc, mu.last_name_enc,
               bo.code AS booth_code, bo.name AS booth_name,
@@ -2620,7 +2637,8 @@ router.get(
            OR (:paymentStatus = 'paid' AND ac.fine_payment_status = 'paid')
            OR (:paymentStatus = 'waiting' AND ac.fine_payment_status = 'waiting')
          )
-       GROUP BY ac.id, ac.booking_item_id, ac.result, ac.total_fine_amount, ac.fine_payment_status, ac.checked_at,
+       GROUP BY ac.id, ac.booking_item_id, ac.result, ac.fine_amount, ac.accessories_fine_amount,
+                ac.damage_fine_amount, ac.vat_amount, ac.total_fine_amount, ac.fine_payment_status, ac.checked_at,
                 b.public_id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc,
                 bo.code, bo.name, bi.booking_date
        ORDER BY bi.booking_date DESC, ac.checked_at DESC
@@ -2844,7 +2862,8 @@ router.get(
     const rows = await query(
       `SELECT m.id AS market_id, m.name AS market_name, b.public_id AS booking_public_id, b.status,
               bi.booking_date, bo.code AS booth_code, bo.name AS booth_name,
-              b.source, b.created_at, 1 AS booking_count, COALESCE(bi.unit_price, 0) AS total_amount
+              b.source, b.created_at, 1 AS booking_count, COALESCE(bi.unit_price, 0) AS booth_amount,
+              b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount
        FROM bookings b
        JOIN markets m ON m.id = b.market_id
        JOIN booking_items bi ON bi.booking_id = b.id
@@ -2906,7 +2925,15 @@ router.get(
         bookingDate,
       },
     );
-    return ok(res, rows);
+    const vatSettings = await getOrganizationVatSettings({ execute: query }, req.auth.organizationId);
+    return ok(res, rows.map((row) => {
+      const priceBreakdown = calculateVatBreakdown(row.price, 0, vatSettings);
+      return {
+        ...row,
+        vat_amount: priceBreakdown.vatAmount,
+        gross_price: priceBreakdown.totalAmount,
+      };
+    }));
   }),
 );
 
@@ -2924,7 +2951,7 @@ router.get(
               mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc,
               bo.code AS booth_code, bo.name AS booth_name,
               GROUP_CONCAT(DISTINCT p.name ORDER BY p.name SEPARATOR ', ') AS product_names,
-              bi.booking_date
+              bi.booking_date, b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount
        FROM booking_items bi
        JOIN bookings b ON b.id = bi.booking_id
        JOIN markets m ON m.id = b.market_id
@@ -2942,7 +2969,8 @@ router.get(
          AND bi.status = 'paid'
          AND bi.booking_date >= :startDate
          AND bi.booking_date <= :endDate
-       GROUP BY bi.id, b.public_id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc, bo.code, bo.name, bi.booking_date
+       GROUP BY bi.id, b.public_id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc, bo.code, bo.name,
+                bi.booking_date, b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount
        ORDER BY bi.booking_date DESC, b.created_at DESC, m.name, bo.sort_order, bo.code, b.public_id`,
       {
         organizationId: req.auth.organizationId,
@@ -2989,7 +3017,7 @@ router.get(
               mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc,
               bo.code AS booth_code, bo.name AS booth_name,
               GROUP_CONCAT(DISTINCT p.name ORDER BY p.name SEPARATOR ', ') AS product_names,
-              bi.booking_date
+              bi.booking_date, b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount
        FROM booking_items bi
        JOIN bookings b ON b.id = bi.booking_id
        JOIN markets m ON m.id = b.market_id
@@ -3006,7 +3034,8 @@ router.get(
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          AND b.status = 'paid'
          AND bi.status = 'paid'
-       GROUP BY bi.id, b.public_id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc, bo.code, bo.name, bi.booking_date
+       GROUP BY bi.id, b.public_id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc, bo.code, bo.name,
+                bi.booking_date, b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount
        ORDER BY bi.booking_date DESC, b.created_at DESC, m.name, bo.sort_order, bo.code, b.public_id`,
       {
         organizationId: req.auth.organizationId,
@@ -3038,6 +3067,7 @@ router.get(
     const paidOnly = req.query.paidOnly === '1' || req.query.status === 'paid';
     const rows = await query(
       `SELECT p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at, b.public_id AS booking_public_id,
+              b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
               GROUP_CONCAT(DISTINCT DATE_FORMAT(bi.booking_date, '%Y-%m-%d') ORDER BY bi.booking_date SEPARATOR ', ') AS booking_dates,
               GROUP_CONCAT(DISTINCT CONCAT(COALESCE(bo.code, ''), CASE WHEN bo.name IS NULL OR bo.name = '' THEN '' ELSE CONCAT(' ', bo.name) END) ORDER BY bo.sort_order, bo.code SEPARATOR ', ') AS booths
        FROM payments p
@@ -3050,7 +3080,8 @@ router.get(
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          AND (:paidOnly = 0 OR p.status = 'paid')
          AND (:paidOnly = 0 OR b.status = 'paid')
-       GROUP BY p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at, b.public_id
+       GROUP BY p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at, b.public_id,
+                b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount
        ORDER BY p.created_at DESC
        LIMIT 500`,
       {

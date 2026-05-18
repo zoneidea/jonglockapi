@@ -20,6 +20,19 @@ function applyVatToAmount(amount, settings) {
   return roundMoney(baseAmount + (baseAmount * vatRate(settings)) / 100);
 }
 
+function calculateVatBreakdown(subtotalAmount, discountAmount, settings) {
+  const subtotal = roundMoney(subtotalAmount);
+  const discount = Math.min(roundMoney(discountAmount), subtotal);
+  const taxableAmount = roundMoney(Math.max(subtotal - discount, 0));
+  const vatAmount = isVatEnabled(settings) ? roundMoney((taxableAmount * vatRate(settings)) / 100) : 0;
+  return {
+    subtotalAmount: subtotal,
+    discountAmount: discount,
+    vatAmount,
+    totalAmount: roundMoney(taxableAmount + vatAmount),
+  };
+}
+
 async function getOrganizationVatSettings(executor, organizationId) {
   const result = await executor.execute(
     `SELECT vat_enabled, vat_rate
@@ -35,6 +48,7 @@ async function getOrganizationVatSettings(executor, organizationId) {
 module.exports = {
   DEFAULT_VAT_RATE,
   applyVatToAmount,
+  calculateVatBreakdown,
   getOrganizationVatSettings,
   isVatEnabled,
   roundMoney,

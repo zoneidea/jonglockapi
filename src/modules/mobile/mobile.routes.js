@@ -12,7 +12,7 @@ const { encryptField, blindIndex } = require('../../utils/crypto');
 const { publicId } = require('../../utils/id');
 const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/password-policy');
 const { expireStaleBookings } = require('../../utils/booking-status');
-const { applyVatToAmount, getOrganizationVatSettings } = require('../../utils/vat');
+const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
@@ -206,7 +206,7 @@ router.post(
       if (!marketRows.length) throw notFound('Market not found');
 
       const vatSettings = await getOrganizationVatSettings(conn, req.auth.organizationId);
-      let total = 0;
+      let subtotal = 0;
       const pricedItems = [];
       for (const item of items) {
         const [boothRows] = await conn.execute(
@@ -230,27 +230,30 @@ router.post(
           { boothId: item.boothId, bookingDate: item.bookingDate },
         );
         if (locked.length) throw conflict(`Booth ${item.boothId} has already been booked on ${item.bookingDate}`);
-        const unitPrice = applyVatToAmount(boothRows[0].price, vatSettings);
-        total += unitPrice;
+        const unitPrice = Number(boothRows[0].price || 0);
+        subtotal += unitPrice;
         pricedItems.push({ ...item, unitPrice });
       }
+      const totals = calculateVatBreakdown(subtotal, 0, vatSettings);
 
       const publicBookingId = publicId('BK');
       const [bookingResult] = await conn.execute(
         `INSERT INTO bookings (
           organization_id, public_id, market_id, mobile_user_id, source, status,
-          subtotal_amount, total_amount, expires_at
+          subtotal_amount, discount_amount, vat_amount, total_amount, expires_at
         ) VALUES (
           :organizationId, :publicId, :marketId, :mobileUserId, 'mobile', 'pending_payment',
-          :subtotalAmount, :totalAmount, DATE_ADD(NOW(), INTERVAL 30 MINUTE)
+          :subtotalAmount, :discountAmount, :vatAmount, :totalAmount, DATE_ADD(NOW(), INTERVAL 30 MINUTE)
         )`,
         {
           organizationId: req.auth.organizationId,
           publicId: publicBookingId,
           marketId,
           mobileUserId: req.auth.sub,
-          subtotalAmount: total,
-          totalAmount: total,
+          subtotalAmount: totals.subtotalAmount,
+          discountAmount: totals.discountAmount,
+          vatAmount: totals.vatAmount,
+          totalAmount: totals.totalAmount,
         },
       );
 
@@ -292,7 +295,7 @@ router.post(
         }
       }
 
-      return { id: bookingResult.insertId, publicId: publicBookingId, totalAmount: total };
+      return { id: bookingResult.insertId, publicId: publicBookingId, ...totals };
     });
 
     return created(res, result, 'booking created');
@@ -306,7 +309,7 @@ router.get(
     if (req.auth.userType !== 'customer') throw forbidden('Customer account is required');
 
     const rows = await query(
-      `SELECT id, public_id, market_id, status, total_amount, expires_at, created_at
+      `SELECT id, public_id, market_id, status, subtotal_amount, discount_amount, vat_amount, total_amount, expires_at, created_at
        FROM bookings
        WHERE organization_id = :organizationId AND mobile_user_id = :mobileUserId
        ORDER BY created_at DESC
