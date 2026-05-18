@@ -340,7 +340,6 @@ router.put(
         ['vatRate', body.vatRate],
         ['registeredName', body.registeredName],
         ['registeredTaxId', body.registeredTaxId],
-        ['registeredAddress', body.registeredAddress],
         ['registeredSubdistrict', body.registeredSubdistrict],
         ['registeredDistrict', body.registeredDistrict],
         ['registeredProvince', body.registeredProvince],
