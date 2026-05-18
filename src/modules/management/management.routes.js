@@ -3010,7 +3010,8 @@ router.get(
   asyncHandler(async (req, res) => {
     const rows = await query(
       `SELECT au.id, au.role, au.name_enc, au.email_enc, au.phone_enc, au.status, au.created_at,
-              GROUP_CONCAT(DISTINCT m.name ORDER BY m.name SEPARATOR ', ') AS assigned_markets
+              GROUP_CONCAT(DISTINCT m.name ORDER BY m.name SEPARATOR ', ') AS assigned_markets,
+              GROUP_CONCAT(DISTINCT ama.market_id ORDER BY ama.market_id SEPARATOR ',') AS assigned_market_ids
        FROM admin_users au
        LEFT JOIN admin_market_assignments ama
          ON ama.admin_user_id = au.id AND ama.organization_id = au.organization_id AND ama.status = 'active'
@@ -3018,7 +3019,7 @@ router.get(
          ON m.id = ama.market_id
        WHERE au.organization_id = :organizationId
        GROUP BY au.id, au.role, au.name_enc, au.email_enc, au.phone_enc, au.status, au.created_at
-       ORDER BY au.created_at DESC`,
+       ORDER BY au.id ASC`,
       { organizationId: req.auth.organizationId },
     );
     return ok(
@@ -3030,6 +3031,7 @@ router.get(
         email: decryptField(row.email_enc),
         phone: decryptField(row.phone_enc),
         assigned_markets: row.assigned_markets || '',
+        assigned_market_ids: row.assigned_market_ids ? row.assigned_market_ids.split(',').map((value) => Number(value)).filter(Boolean) : [],
         status: row.status,
         created_at: row.created_at,
       })),
@@ -3091,6 +3093,102 @@ router.post(
     }
 
     return created(res, { id: result.insertId }, 'admin created');
+  }),
+);
+
+router.patch(
+  '/admins/:adminUserId',
+  requireRoles(ROLES.SUPERVISOR),
+  validate(
+    z.object({
+      body: z.object({
+        password: z.string().min(10).refine(assertPasswordPolicy, PASSWORD_POLICY_MESSAGE).optional(),
+        role: z.enum([ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING, ROLES.AUDIT]),
+        name: z.string().min(1),
+        email: z.string().email().optional().or(z.literal('')).default(''),
+        phone: z.string().optional().default(''),
+        marketIds: z.array(z.coerce.number().int().positive()).default([]),
+        status: z.enum(['active', 'inactive']).default('active'),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({
+        adminUserId: z.coerce.number().int().positive(),
+      }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const body = req.validated.body;
+    const { adminUserId } = req.validated.params;
+    if (body.role !== ROLES.SUPERVISOR && body.marketIds.length === 0 && body.role !== ROLES.ACCOUNTING) {
+      throw badRequest('At least one market assignment is required for this role');
+    }
+
+    const result = await transaction(async (conn) => {
+      const [admins] = await conn.execute(
+        `SELECT id
+         FROM admin_users
+         WHERE id = :adminUserId
+           AND organization_id = :organizationId
+         LIMIT 1
+         FOR UPDATE`,
+        { adminUserId, organizationId: req.auth.organizationId },
+      );
+      if (!admins.length) throw notFound('Admin not found');
+
+      const updates = [
+        'role = :role',
+        'name_enc = :nameEnc',
+        'email_enc = :emailEnc',
+        'email_hash = :emailHash',
+        'phone_enc = :phoneEnc',
+        'phone_hash = :phoneHash',
+        'status = :status',
+      ];
+      const params = {
+        adminUserId,
+        organizationId: req.auth.organizationId,
+        role: body.role,
+        nameEnc: encryptField(body.name),
+        emailEnc: encryptField(body.email),
+        emailHash: blindIndex(body.email),
+        phoneEnc: encryptField(body.phone),
+        phoneHash: blindIndex(body.phone),
+        status: body.status,
+      };
+      if (body.password) {
+        updates.push('password_hash = :passwordHash');
+        params.passwordHash = await bcrypt.hash(body.password, 12);
+      }
+
+      await conn.execute(
+        `UPDATE admin_users
+         SET ${updates.join(', ')}
+         WHERE id = :adminUserId
+           AND organization_id = :organizationId`,
+        params,
+      );
+
+      await conn.execute(
+        `UPDATE admin_market_assignments
+         SET status = 'inactive'
+         WHERE organization_id = :organizationId
+           AND admin_user_id = :adminUserId`,
+        { organizationId: req.auth.organizationId, adminUserId },
+      );
+
+      for (const marketId of body.marketIds) {
+        await conn.execute(
+          `INSERT INTO admin_market_assignments (organization_id, admin_user_id, market_id, status)
+           VALUES (:organizationId, :adminUserId, :marketId, 'active')
+           ON DUPLICATE KEY UPDATE status = 'active'`,
+          { organizationId: req.auth.organizationId, adminUserId, marketId },
+        );
+      }
+
+      return { id: adminUserId };
+    });
+
+    return ok(res, result, 'admin updated');
   }),
 );
 
