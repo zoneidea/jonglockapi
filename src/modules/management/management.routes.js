@@ -2545,6 +2545,60 @@ router.get(
 );
 
 router.get(
+  '/reports/daily-sales',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  asyncHandler(async (req, res) => {
+    await expireStaleBookings({ execute: query }, req.auth.organizationId);
+    const bookingDate = req.query.bookingDate || req.query.startDate || new Date().toISOString().slice(0, 10);
+    const rows = await query(
+      `SELECT bi.id,
+              b.public_id AS booking_public_id,
+              m.name AS market_name,
+              mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc,
+              bo.code AS booth_code, bo.name AS booth_name,
+              GROUP_CONCAT(DISTINCT p.name ORDER BY p.name SEPARATOR ', ') AS product_names,
+              bi.booking_date
+       FROM booking_items bi
+       JOIN bookings b ON b.id = bi.booking_id
+       JOIN markets m ON m.id = b.market_id
+       JOIN mobile_users mu ON mu.id = b.mobile_user_id
+       JOIN booths bo ON bo.id = bi.booth_id
+       LEFT JOIN booking_products bp ON bp.booking_item_id = bi.id
+       LEFT JOIN products p ON p.id = bp.product_id
+       LEFT JOIN admin_market_assignments ama
+         ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+       WHERE bi.organization_id = :organizationId
+         AND b.organization_id = :organizationId
+         AND mu.organization_id = :organizationId
+         AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+         AND b.status = 'paid'
+         AND bi.status = 'paid'
+         AND bi.booking_date = :bookingDate
+       GROUP BY bi.id, b.public_id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc, bo.code, bo.name, bi.booking_date
+       ORDER BY m.name, bo.sort_order, bo.code, b.public_id`,
+      {
+        organizationId: req.auth.organizationId,
+        adminUserId: req.auth.sub,
+        hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
+        bookingDate,
+      },
+    );
+    return ok(
+      res,
+      rows.map((row) => ({
+        ...row,
+        customer_name: [decryptField(row.first_name_enc), decryptField(row.last_name_enc)].filter(Boolean).join(' ').trim() || decryptField(row.username_enc) || '-',
+        customer_phone: decryptField(row.phone_enc) || '-',
+        username_enc: undefined,
+        first_name_enc: undefined,
+        last_name_enc: undefined,
+        phone_enc: undefined,
+      })),
+    );
+  }),
+);
+
+router.get(
   '/accounting/payments',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
   asyncHandler(async (req, res) => {
