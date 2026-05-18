@@ -3060,6 +3060,133 @@ router.get(
 );
 
 router.get(
+  '/accounting/report-all',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({
+        startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        marketId: z.coerce.number().int().positive().optional(),
+        dateField: z.enum(['created_date', 'booking_date', 'payment_date']).optional().default('payment_date'),
+        sortBy: z.enum(['booking_public_id', 'booking_date', 'payment_date']).optional().default('payment_date'),
+      }),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    await expireStaleBookings({ execute: query }, req.auth.organizationId);
+    const { startDate, endDate, marketId, dateField, sortBy } = req.validated.query;
+    const orderBy = {
+      booking_public_id: 'b.public_id ASC',
+      booking_date: 'item_summary.first_booking_date DESC, b.public_id ASC',
+      payment_date: 'COALESCE(p.paid_at, p.created_at) DESC, b.public_id ASC',
+    }[sortBy];
+
+    const rows = await query(
+      `SELECT b.id,
+              b.public_id AS booking_public_id,
+              b.status AS booking_status,
+              b.subtotal_amount,
+              b.discount_amount,
+              b.vat_amount,
+              b.total_amount,
+              b.created_at,
+              b.comment AS reason,
+              m.id AS market_id,
+              m.name AS market_name,
+              mu.username_enc,
+              mu.first_name_enc,
+              mu.last_name_enc,
+              p.status AS payment_status,
+              p.paid_at,
+              p.created_at AS payment_created_at,
+              item_summary.first_booking_date AS booking_date,
+              item_summary.booking_dates,
+              COALESCE(item_summary.booth_service_amount, 0) AS booth_service_amount,
+              COALESCE(accessory_summary.other_service_amount, 0) AS other_service_amount,
+              0 AS withholding_tax_amount
+       FROM bookings b
+       JOIN markets m ON m.id = b.market_id
+       JOIN mobile_users mu ON mu.id = b.mobile_user_id
+       JOIN (
+         SELECT booking_id,
+                MIN(booking_date) AS first_booking_date,
+                GROUP_CONCAT(DISTINCT DATE_FORMAT(booking_date, '%Y-%m-%d') ORDER BY booking_date SEPARATOR ', ') AS booking_dates,
+                COALESCE(SUM(unit_price), 0) AS booth_service_amount
+         FROM booking_items
+         WHERE organization_id = :organizationId
+         GROUP BY booking_id
+       ) item_summary ON item_summary.booking_id = b.id
+       LEFT JOIN (
+         SELECT bi.booking_id,
+                COALESCE(SUM(a.price * ba.quantity), 0) AS other_service_amount
+         FROM booking_accessories ba
+         JOIN booking_items bi ON bi.id = ba.booking_item_id
+         JOIN accessories a ON a.id = ba.accessory_id
+         WHERE ba.organization_id = :organizationId
+         GROUP BY bi.booking_id
+       ) accessory_summary ON accessory_summary.booking_id = b.id
+       LEFT JOIN payments p
+         ON p.id = (
+           SELECT p2.id
+           FROM payments p2
+           WHERE p2.booking_id = b.id
+             AND p2.organization_id = b.organization_id
+           ORDER BY p2.created_at DESC, p2.id DESC
+           LIMIT 1
+         )
+       LEFT JOIN admin_market_assignments ama
+         ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+       WHERE b.organization_id = :organizationId
+         AND mu.organization_id = :organizationId
+         AND (:marketId IS NULL OR b.market_id = :marketId)
+         AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+         AND (
+           :startDate IS NULL
+           OR (
+             (:dateField = 'created_date' AND DATE(b.created_at) >= :startDate)
+             OR (:dateField = 'booking_date' AND item_summary.first_booking_date >= :startDate)
+             OR (:dateField = 'payment_date' AND DATE(COALESCE(p.paid_at, p.created_at)) >= :startDate)
+           )
+         )
+         AND (
+           :endDate IS NULL
+           OR (
+             (:dateField = 'created_date' AND DATE(b.created_at) <= :endDate)
+             OR (:dateField = 'booking_date' AND item_summary.first_booking_date <= :endDate)
+             OR (:dateField = 'payment_date' AND DATE(COALESCE(p.paid_at, p.created_at)) <= :endDate)
+           )
+         )
+       ORDER BY ${orderBy}
+       LIMIT 1000`,
+      {
+        organizationId: req.auth.organizationId,
+        adminUserId: req.auth.sub,
+        hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
+        marketId: marketId || null,
+        startDate: startDate || null,
+        endDate: endDate || null,
+        dateField,
+      },
+    );
+
+    return ok(
+      res,
+      rows.map((row) => ({
+        ...row,
+        customer_name: [decryptField(row.first_name_enc), decryptField(row.last_name_enc)].filter(Boolean).join(' ').trim() || decryptField(row.username_enc) || '-',
+        status: row.payment_status || row.booking_status,
+        username_enc: undefined,
+        first_name_enc: undefined,
+        last_name_enc: undefined,
+      })),
+    );
+  }),
+);
+
+router.get(
   '/accounting/payments',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
   asyncHandler(async (req, res) => {

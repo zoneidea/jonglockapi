@@ -231,7 +231,26 @@ router.post(
         );
         if (locked.length) throw conflict(`Booth ${item.boothId} has already been booked on ${item.bookingDate}`);
         const unitPrice = Number(boothRows[0].price || 0);
-        subtotal += unitPrice;
+        let accessoryAmount = 0;
+        for (const accessory of item.accessories) {
+          const [accessoryRows] = await conn.execute(
+            `SELECT id, price
+             FROM accessories
+             WHERE id = :accessoryId
+               AND organization_id = :organizationId
+               AND market_id = :marketId
+               AND status = 'active'
+             LIMIT 1`,
+            {
+              accessoryId: accessory.accessoryId,
+              organizationId: req.auth.organizationId,
+              marketId,
+            },
+          );
+          if (!accessoryRows.length) throw badRequest(`Accessory ${accessory.accessoryId} is not available`);
+          accessoryAmount += Number(accessoryRows[0].price || 0) * Number(accessory.quantity || 1);
+        }
+        subtotal += unitPrice + accessoryAmount;
         pricedItems.push({ ...item, unitPrice });
       }
       const totals = calculateVatBreakdown(subtotal, 0, vatSettings);
