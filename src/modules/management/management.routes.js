@@ -115,6 +115,15 @@ function removeUploadedFile(imageUrl) {
   fs.unlink(filePath, () => {});
 }
 
+function bangkokDateString() {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Bangkok',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date());
+}
+
 function copiedBoothCode(sourceCode, floorPlanId) {
   const suffix = `-C${floorPlanId}`;
   const base = String(sourceCode || 'BOOTH').replace(/[^A-Za-z0-9-_]/g, '').slice(0, 80);
@@ -2640,6 +2649,130 @@ router.patch(
       return { id: req.validated.params.auditCheckId };
     });
     return ok(res, { id: req.validated.params.auditCheckId }, 'fine payment status updated');
+  }),
+);
+
+router.get(
+  '/dashboard/summary',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  asyncHandler(async (req, res) => {
+    await expireStaleBookings({ execute: query }, req.auth.organizationId);
+    const today = bangkokDateString();
+    const scope = {
+      organizationId: req.auth.organizationId,
+      adminUserId: req.auth.sub,
+      hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
+      today,
+    };
+
+    const [
+      boothTotals,
+      bookedTotals,
+      dailyCustomers,
+      bookingPaidTodayRows,
+      finePaidTodayRows,
+      bookingOutstandingRows,
+      fineOutstandingRows,
+    ] = await Promise.all([
+      query(
+        `SELECT COUNT(*) AS total
+         FROM booths bo
+         JOIN markets m ON m.id = bo.market_id
+         LEFT JOIN admin_market_assignments ama
+           ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         WHERE bo.organization_id = :organizationId
+           AND bo.status = 'active'
+           AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)`,
+        scope,
+      ),
+      query(
+        `SELECT COUNT(DISTINCT bi.booth_id) AS total
+         FROM booking_items bi
+         JOIN bookings b ON b.id = bi.booking_id
+         JOIN markets m ON m.id = b.market_id
+         LEFT JOIN admin_market_assignments ama
+           ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         WHERE bi.organization_id = :organizationId
+           AND b.organization_id = :organizationId
+           AND bi.booking_date = :today
+           AND bi.status IN ('pending_payment', 'payment_processing', 'paid')
+           AND b.status IN ('pending_payment', 'payment_processing', 'paid')
+           AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)`,
+        scope,
+      ),
+      query(
+        `SELECT COUNT(DISTINCT b.mobile_user_id) AS total
+         FROM bookings b
+         JOIN markets m ON m.id = b.market_id
+         LEFT JOIN admin_market_assignments ama
+           ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         WHERE b.organization_id = :organizationId
+           AND DATE(b.created_at) = :today
+           AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)`,
+        scope,
+      ),
+      query(
+        `SELECT COALESCE(SUM(p.amount), 0) AS total
+         FROM payments p
+         JOIN bookings b ON b.id = p.booking_id
+         JOIN markets m ON m.id = b.market_id
+         LEFT JOIN admin_market_assignments ama
+           ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         WHERE p.organization_id = :organizationId
+           AND p.status = 'paid'
+           AND DATE(COALESCE(p.paid_at, p.created_at)) = :today
+           AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)`,
+        scope,
+      ),
+      query(
+        `SELECT COALESCE(SUM(ac.total_fine_amount), 0) AS total
+         FROM audit_checks ac
+         JOIN markets m ON m.id = ac.market_id
+         LEFT JOIN admin_market_assignments ama
+           ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         WHERE ac.organization_id = :organizationId
+           AND ac.fine_payment_status = 'paid'
+           AND DATE(ac.updated_at) = :today
+           AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)`,
+        scope,
+      ),
+      query(
+        `SELECT COALESCE(SUM(b.total_amount), 0) AS total
+         FROM bookings b
+         JOIN markets m ON m.id = b.market_id
+         LEFT JOIN admin_market_assignments ama
+           ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         WHERE b.organization_id = :organizationId
+           AND b.status IN ('pending_payment', 'payment_processing')
+           AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)`,
+        scope,
+      ),
+      query(
+        `SELECT COALESCE(SUM(ac.total_fine_amount), 0) AS total
+         FROM audit_checks ac
+         JOIN markets m ON m.id = ac.market_id
+         LEFT JOIN admin_market_assignments ama
+           ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         WHERE ac.organization_id = :organizationId
+           AND ac.fine_payment_status IN ('pending', 'waiting')
+           AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)`,
+        scope,
+      ),
+    ]);
+
+    const totalBooths = Number(boothTotals[0]?.total || 0);
+    const bookedBooths = Number(bookedTotals[0]?.total || 0);
+    return ok(res, {
+      today,
+      totalBooths,
+      bookedBooths,
+      availableBooths: Math.max(totalBooths - bookedBooths, 0),
+      dailyCustomers: Number(dailyCustomers[0]?.total || 0),
+      bookingPaidToday: Number(bookingPaidTodayRows[0]?.total || 0),
+      finePaidToday: Number(finePaidTodayRows[0]?.total || 0),
+      bookingOutstanding: Number(bookingOutstandingRows[0]?.total || 0),
+      fineOutstanding: Number(fineOutstandingRows[0]?.total || 0),
+    });
   }),
 );
 
