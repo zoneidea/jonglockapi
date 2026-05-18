@@ -2303,7 +2303,7 @@ router.delete(
 
 router.get(
   '/mobile-users',
-  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
   asyncHandler(async (req, res) => {
     const rows = await query(
       `SELECT id, public_id, username_enc, first_name_enc, last_name_enc, phone_enc, email_enc, status, created_at
@@ -2549,7 +2549,8 @@ router.get(
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
   asyncHandler(async (req, res) => {
     await expireStaleBookings({ execute: query }, req.auth.organizationId);
-    const bookingDate = req.query.bookingDate || req.query.startDate || new Date().toISOString().slice(0, 10);
+    const startDate = req.query.startDate || req.query.bookingDate || new Date().toISOString().slice(0, 10);
+    const endDate = req.query.endDate || startDate;
     const rows = await query(
       `SELECT bi.id,
               b.public_id AS booking_public_id,
@@ -2573,14 +2574,79 @@ router.get(
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          AND b.status = 'paid'
          AND bi.status = 'paid'
-         AND bi.booking_date = :bookingDate
+         AND bi.booking_date >= :startDate
+         AND bi.booking_date <= :endDate
        GROUP BY bi.id, b.public_id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc, bo.code, bo.name, bi.booking_date
-       ORDER BY m.name, bo.sort_order, bo.code, b.public_id`,
+       ORDER BY bi.booking_date DESC, b.created_at DESC, m.name, bo.sort_order, bo.code, b.public_id`,
       {
         organizationId: req.auth.organizationId,
         adminUserId: req.auth.sub,
         hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
-        bookingDate,
+        startDate,
+        endDate,
+      },
+    );
+    return ok(
+      res,
+      rows.map((row) => ({
+        ...row,
+        customer_name: [decryptField(row.first_name_enc), decryptField(row.last_name_enc)].filter(Boolean).join(' ').trim() || decryptField(row.username_enc) || '-',
+        customer_phone: decryptField(row.phone_enc) || '-',
+        username_enc: undefined,
+        first_name_enc: undefined,
+        last_name_enc: undefined,
+        phone_enc: undefined,
+      })),
+    );
+  }),
+);
+
+router.get(
+  '/reports/customer-bookings',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({
+        mobileUserId: z.coerce.number().int().positive(),
+      }),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    await expireStaleBookings({ execute: query }, req.auth.organizationId);
+    const { mobileUserId } = req.validated.query;
+    const rows = await query(
+      `SELECT bi.id,
+              b.public_id AS booking_public_id,
+              m.name AS market_name,
+              mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc,
+              bo.code AS booth_code, bo.name AS booth_name,
+              GROUP_CONCAT(DISTINCT p.name ORDER BY p.name SEPARATOR ', ') AS product_names,
+              bi.booking_date
+       FROM booking_items bi
+       JOIN bookings b ON b.id = bi.booking_id
+       JOIN markets m ON m.id = b.market_id
+       JOIN mobile_users mu ON mu.id = b.mobile_user_id
+       JOIN booths bo ON bo.id = bi.booth_id
+       LEFT JOIN booking_products bp ON bp.booking_item_id = bi.id
+       LEFT JOIN products p ON p.id = bp.product_id
+       LEFT JOIN admin_market_assignments ama
+         ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+       WHERE bi.organization_id = :organizationId
+         AND b.organization_id = :organizationId
+         AND mu.organization_id = :organizationId
+         AND b.mobile_user_id = :mobileUserId
+         AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+         AND b.status = 'paid'
+         AND bi.status = 'paid'
+       GROUP BY bi.id, b.public_id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc, bo.code, bo.name, bi.booking_date
+       ORDER BY bi.booking_date DESC, b.created_at DESC, m.name, bo.sort_order, bo.code, b.public_id`,
+      {
+        organizationId: req.auth.organizationId,
+        adminUserId: req.auth.sub,
+        mobileUserId,
+        hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
       },
     );
     return ok(
