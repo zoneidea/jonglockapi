@@ -2453,20 +2453,56 @@ router.get(
   '/markets/:marketId/audit-checks',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
   requireMarketAccess(),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({
+        startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      }),
+      params: z.object({ marketId: z.coerce.number().int().positive() }),
+    }),
+  ),
   asyncHandler(async (req, res) => {
+    const { marketId } = req.validated.params;
+    const startDate = req.validated.query.startDate || null;
+    const endDate = req.validated.query.endDate || null;
     const rows = await query(
       `SELECT ac.id, ac.booking_item_id, ac.result, ac.total_fine_amount, ac.fine_payment_status,
-              ac.checked_at, b.public_id AS booking_public_id, bo.name AS booth_name, bi.booking_date
+              ac.checked_at, b.public_id AS booking_public_id, m.name AS market_name,
+              mu.username_enc, mu.first_name_enc, mu.last_name_enc,
+              bo.code AS booth_code, bo.name AS booth_name,
+              GROUP_CONCAT(DISTINCT p.name ORDER BY p.name SEPARATOR ', ') AS product_names,
+              bi.booking_date
        FROM audit_checks ac
        JOIN booking_items bi ON bi.id = ac.booking_item_id
        JOIN bookings b ON b.id = bi.booking_id
+       JOIN markets m ON m.id = ac.market_id
+       JOIN mobile_users mu ON mu.id = b.mobile_user_id
        JOIN booths bo ON bo.id = bi.booth_id
-       WHERE ac.organization_id = :organizationId AND ac.market_id = :marketId
-       ORDER BY ac.checked_at DESC
+       LEFT JOIN booking_products bp ON bp.booking_item_id = bi.id
+       LEFT JOIN products p ON p.id = bp.product_id
+       WHERE ac.organization_id = :organizationId
+         AND ac.market_id = :marketId
+         AND (:startDate IS NULL OR bi.booking_date >= :startDate)
+         AND (:endDate IS NULL OR bi.booking_date <= :endDate)
+       GROUP BY ac.id, ac.booking_item_id, ac.result, ac.total_fine_amount, ac.fine_payment_status, ac.checked_at,
+                b.public_id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc,
+                bo.code, bo.name, bi.booking_date
+       ORDER BY bi.booking_date DESC, ac.checked_at DESC
        LIMIT 500`,
-      { organizationId: req.auth.organizationId, marketId: Number(req.params.marketId) },
+      { organizationId: req.auth.organizationId, marketId, startDate, endDate },
     );
-    return ok(res, rows);
+    return ok(
+      res,
+      rows.map((row) => ({
+        ...row,
+        customer_name: [decryptField(row.first_name_enc), decryptField(row.last_name_enc)].filter(Boolean).join(' ').trim() || decryptField(row.username_enc) || '-',
+        username_enc: undefined,
+        first_name_enc: undefined,
+        last_name_enc: undefined,
+      })),
+    );
   }),
 );
 
