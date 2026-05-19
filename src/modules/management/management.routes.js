@@ -3485,6 +3485,362 @@ router.get(
   }),
 );
 
+router.get(
+  '/accounting/documents',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({
+        startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        documentType: z.enum(['all', 'receipt', 'tax_invoice', 'credit_note']).optional().default('all'),
+        documentStatus: z.enum(['all', 'issued', 'cancelled', 'void']).optional().default('all'),
+        keyword: z.string().optional().default(''),
+      }),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { startDate, endDate, documentType, documentStatus, keyword } = req.validated.query;
+    const rows = await query(
+      `SELECT ad.id, ad.document_type, ad.document_no, ad.document_status, ad.issue_date,
+              ad.subtotal_amount, ad.discount_amount, ad.vat_amount, ad.withholding_tax_amount, ad.total_amount,
+              ad.customer_name, ad.cancel_reason, ad.cancelled_at,
+              p.public_id AS payment_public_id, b.public_id AS booking_public_id,
+              source.document_no AS source_document_no,
+              issuer.name_enc AS issued_by_name_enc,
+              canceller.name_enc AS cancelled_by_name_enc
+       FROM accounting_documents ad
+       LEFT JOIN payments p ON p.id = ad.payment_id
+       LEFT JOIN bookings b ON b.id = ad.booking_id
+       LEFT JOIN accounting_documents source ON source.id = ad.source_document_id
+       LEFT JOIN admin_users issuer ON issuer.id = ad.issued_by_admin_id
+       LEFT JOIN admin_users canceller ON canceller.id = ad.cancelled_by_admin_id
+       LEFT JOIN admin_market_assignments ama
+         ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+       WHERE ad.organization_id = :organizationId
+         AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+         AND (:startDate IS NULL OR ad.issue_date >= :startDate)
+         AND (:endDate IS NULL OR ad.issue_date <= :endDate)
+         AND (:documentType = 'all' OR ad.document_type = :documentType)
+         AND (:documentStatus = 'all' OR ad.document_status = :documentStatus)
+         AND (
+           :keyword = ''
+           OR ad.document_no LIKE :keywordLike
+           OR ad.customer_name LIKE :keywordLike
+           OR b.public_id LIKE :keywordLike
+           OR p.public_id LIKE :keywordLike
+         )
+       ORDER BY ad.issue_date DESC, ad.id DESC
+       LIMIT 1000`,
+      {
+        organizationId: req.auth.organizationId,
+        adminUserId: req.auth.sub,
+        hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
+        startDate: startDate || null,
+        endDate: endDate || null,
+        documentType,
+        documentStatus,
+        keyword,
+        keywordLike: `%${keyword}%`,
+      },
+    );
+    return ok(res, rows.map((row) => ({
+      ...row,
+      document_type_label: accountingDocumentTypeLabel(row.document_type),
+      issued_by_name: decryptField(row.issued_by_name_enc) || '-',
+      cancelled_by_name: decryptField(row.cancelled_by_name_enc) || '-',
+      issued_by_name_enc: undefined,
+      cancelled_by_name_enc: undefined,
+    })));
+  }),
+);
+
+router.get(
+  '/accounting/tax-sales',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({
+        startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      }),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { startDate, endDate } = req.validated.query;
+    const rows = await query(
+      `SELECT ad.id, ad.document_type, ad.document_no, ad.document_status, ad.issue_date,
+              ad.customer_name, ad.subtotal_amount, ad.discount_amount, ad.vat_amount, ad.total_amount,
+              source.document_no AS source_document_no,
+              b.public_id AS booking_public_id, p.public_id AS payment_public_id
+       FROM accounting_documents ad
+       LEFT JOIN accounting_documents source ON source.id = ad.source_document_id
+       LEFT JOIN bookings b ON b.id = ad.booking_id
+       LEFT JOIN payments p ON p.id = ad.payment_id
+       LEFT JOIN admin_market_assignments ama
+         ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+       WHERE ad.organization_id = :organizationId
+         AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+         AND ad.document_type IN ('tax_invoice', 'credit_note')
+         AND ad.document_status IN ('issued', 'cancelled')
+         AND (:startDate IS NULL OR ad.issue_date >= :startDate)
+         AND (:endDate IS NULL OR ad.issue_date <= :endDate)
+       ORDER BY ad.issue_date ASC, ad.document_no ASC
+       LIMIT 1000`,
+      {
+        organizationId: req.auth.organizationId,
+        adminUserId: req.auth.sub,
+        hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
+        startDate: startDate || null,
+        endDate: endDate || null,
+      },
+    );
+    return ok(res, rows.map((row) => {
+      const sign = row.document_type === 'credit_note' ? -1 : 1;
+      return {
+        ...row,
+        document_type_label: accountingDocumentTypeLabel(row.document_type),
+        taxable_amount: sign * Math.max(Number(row.subtotal_amount || 0) - Number(row.discount_amount || 0), 0),
+        vat_report_amount: sign * Number(row.vat_amount || 0),
+        total_report_amount: sign * Number(row.total_amount || 0),
+      };
+    }));
+  }),
+);
+
+router.get(
+  '/accounting/receivables-aging',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({
+        asOfDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        marketId: z.coerce.number().int().positive().optional(),
+      }),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    await expireStaleBookings({ execute: query }, req.auth.organizationId);
+    const asOfDate = req.validated.query.asOfDate || currentDateBangkok();
+    const marketId = req.validated.query.marketId || null;
+    const rows = await query(
+      `SELECT *
+       FROM (
+         SELECT 'booking' AS receivable_type,
+                b.id AS source_id,
+                b.public_id AS source_public_id,
+                m.name AS market_name,
+                mu.username_enc, mu.first_name_enc, mu.last_name_enc,
+                b.total_amount AS outstanding_amount,
+                b.status AS status,
+                DATE(COALESCE(b.expires_at, b.created_at)) AS due_date,
+                DATEDIFF(:asOfDate, DATE(COALESCE(b.expires_at, b.created_at))) AS aging_days,
+                GROUP_CONCAT(DISTINCT DATE_FORMAT(bi.booking_date, '%Y-%m-%d') ORDER BY bi.booking_date SEPARATOR ', ') AS booking_dates
+         FROM bookings b
+         JOIN markets m ON m.id = b.market_id
+         JOIN mobile_users mu ON mu.id = b.mobile_user_id
+         JOIN booking_items bi ON bi.booking_id = b.id
+         LEFT JOIN admin_market_assignments ama
+           ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         WHERE b.organization_id = :organizationId
+           AND b.status IN ('pending_payment', 'payment_processing', 'expired')
+           AND (:marketId IS NULL OR b.market_id = :marketId)
+           AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+         GROUP BY b.id, b.public_id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc, b.total_amount, b.status, b.expires_at, b.created_at
+         UNION ALL
+         SELECT 'fine' AS receivable_type,
+                ac.id AS source_id,
+                b.public_id AS source_public_id,
+                m.name AS market_name,
+                mu.username_enc, mu.first_name_enc, mu.last_name_enc,
+                ac.total_fine_amount AS outstanding_amount,
+                ac.fine_payment_status AS status,
+                DATE(ac.checked_at) AS due_date,
+                DATEDIFF(:asOfDate, DATE(ac.checked_at)) AS aging_days,
+                DATE_FORMAT(bi.booking_date, '%Y-%m-%d') AS booking_dates
+         FROM audit_checks ac
+         JOIN booking_items bi ON bi.id = ac.booking_item_id
+         JOIN bookings b ON b.id = bi.booking_id
+         JOIN markets m ON m.id = ac.market_id
+         JOIN mobile_users mu ON mu.id = b.mobile_user_id
+         LEFT JOIN admin_market_assignments ama
+           ON ama.market_id = ac.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         WHERE ac.organization_id = :organizationId
+           AND ac.total_fine_amount > 0
+           AND ac.fine_payment_status IN ('pending', 'waiting')
+           AND (:marketId IS NULL OR ac.market_id = :marketId)
+           AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+       ) receivables
+       ORDER BY aging_days DESC, due_date ASC
+       LIMIT 1000`,
+      {
+        organizationId: req.auth.organizationId,
+        adminUserId: req.auth.sub,
+        hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
+        marketId,
+        asOfDate,
+      },
+    );
+    return ok(res, rows.map((row) => ({
+      ...row,
+      customer_name: [decryptField(row.first_name_enc), decryptField(row.last_name_enc)].filter(Boolean).join(' ').trim() || decryptField(row.username_enc) || '-',
+      aging_bucket: Number(row.aging_days || 0) <= 7 ? '0-7 วัน' : Number(row.aging_days || 0) <= 15 ? '8-15 วัน' : Number(row.aging_days || 0) <= 30 ? '16-30 วัน' : 'มากกว่า 30 วัน',
+      username_enc: undefined,
+      first_name_enc: undefined,
+      last_name_enc: undefined,
+    })));
+  }),
+);
+
+router.get(
+  '/accounting/reconciliation',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({
+        startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        marketId: z.coerce.number().int().positive().optional(),
+      }),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { startDate, endDate, marketId } = req.validated.query;
+    const rows = await query(
+      `SELECT p.id, p.public_id AS payment_public_id, p.provider, p.provider_reference,
+              p.status AS payment_status, p.amount AS payment_amount, p.paid_at, p.created_at,
+              b.public_id AS booking_public_id, b.status AS booking_status, b.total_amount AS booking_amount,
+              m.name AS market_name,
+              ad.document_no, ad.document_type,
+              (
+                SELECT COUNT(*)
+                FROM payment_callbacks pc
+                WHERE pc.provider = p.provider
+                  AND DATE(pc.received_at) = DATE(COALESCE(p.paid_at, p.created_at))
+              ) AS callback_count
+       FROM payments p
+       LEFT JOIN bookings b ON b.id = p.booking_id
+       LEFT JOIN markets m ON m.id = b.market_id
+       LEFT JOIN accounting_documents ad
+         ON ad.id = (
+           SELECT ad2.id
+           FROM accounting_documents ad2
+           WHERE ad2.payment_id = p.id
+             AND ad2.organization_id = p.organization_id
+             AND ad2.document_status = 'issued'
+           ORDER BY ad2.id DESC
+           LIMIT 1
+         )
+       LEFT JOIN admin_market_assignments ama
+         ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+       WHERE p.organization_id = :organizationId
+         AND (:marketId IS NULL OR b.market_id = :marketId)
+         AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+         AND (:startDate IS NULL OR DATE(COALESCE(p.paid_at, p.created_at)) >= :startDate)
+         AND (:endDate IS NULL OR DATE(COALESCE(p.paid_at, p.created_at)) <= :endDate)
+       ORDER BY COALESCE(p.paid_at, p.created_at) DESC, p.id DESC
+       LIMIT 1000`,
+      {
+        organizationId: req.auth.organizationId,
+        adminUserId: req.auth.sub,
+        hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
+        marketId: marketId || null,
+        startDate: startDate || null,
+        endDate: endDate || null,
+      },
+    );
+    return ok(res, rows.map((row) => {
+      const amountMatched = Math.abs(Number(row.payment_amount || 0) - Number(row.booking_amount || 0)) < 0.01;
+      const statusMatched = row.payment_status === 'paid' ? row.booking_status === 'paid' : true;
+      return {
+        ...row,
+        amount_matched: amountMatched ? 1 : 0,
+        status_matched: statusMatched ? 1 : 0,
+        reconciliation_status: amountMatched && statusMatched && Number(row.callback_count || 0) > 0 ? 'matched' : 'review',
+      };
+    }));
+  }),
+);
+
+router.get(
+  '/accounting/refunds',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({
+        startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+      }),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { startDate, endDate } = req.validated.query;
+    const rows = await query(
+      `SELECT ad.id, 'credit_note' AS refund_type, ad.document_no, ad.document_status, ad.issue_date,
+              ad.customer_name, ad.total_amount, ad.cancel_reason AS reason,
+              source.document_no AS source_document_no,
+              b.public_id AS booking_public_id, p.public_id AS payment_public_id,
+              issuer.name_enc AS issued_by_name_enc
+       FROM accounting_documents ad
+       LEFT JOIN accounting_documents source ON source.id = ad.source_document_id
+       LEFT JOIN bookings b ON b.id = ad.booking_id
+       LEFT JOIN payments p ON p.id = ad.payment_id
+       LEFT JOIN admin_users issuer ON issuer.id = ad.issued_by_admin_id
+       LEFT JOIN admin_market_assignments ama
+         ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+       WHERE ad.organization_id = :organizationId
+         AND ad.document_type = 'credit_note'
+         AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+         AND (:startDate IS NULL OR ad.issue_date >= :startDate)
+         AND (:endDate IS NULL OR ad.issue_date <= :endDate)
+       UNION ALL
+       SELECT p.id, 'payment_refund' AS refund_type, p.public_id AS document_no, p.status AS document_status,
+              DATE(COALESCE(p.paid_at, p.created_at)) AS issue_date,
+              CONCAT(COALESCE(mu.first_name_enc, ''), ' ', COALESCE(mu.last_name_enc, '')) AS customer_name,
+              p.amount AS total_amount, b.comment AS reason,
+              NULL AS source_document_no, b.public_id AS booking_public_id, p.public_id AS payment_public_id,
+              NULL AS issued_by_name_enc
+       FROM payments p
+       LEFT JOIN bookings b ON b.id = p.booking_id
+       LEFT JOIN mobile_users mu ON mu.id = b.mobile_user_id
+       LEFT JOIN admin_market_assignments ama
+         ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+       WHERE p.organization_id = :organizationId
+         AND p.status IN ('refunded', 'cancelled')
+         AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+         AND (:startDate IS NULL OR DATE(COALESCE(p.paid_at, p.created_at)) >= :startDate)
+         AND (:endDate IS NULL OR DATE(COALESCE(p.paid_at, p.created_at)) <= :endDate)
+       ORDER BY issue_date DESC, id DESC
+       LIMIT 1000`,
+      {
+        organizationId: req.auth.organizationId,
+        adminUserId: req.auth.sub,
+        hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
+        startDate: startDate || null,
+        endDate: endDate || null,
+      },
+    );
+    return ok(res, rows.map((row) => ({
+      ...row,
+      customer_name: row.refund_type === 'payment_refund'
+        ? row.customer_name.split(' ').map((part) => decryptField(part)).filter(Boolean).join(' ').trim() || '-'
+        : row.customer_name || '-',
+      issued_by_name: decryptField(row.issued_by_name_enc) || '-',
+      issued_by_name_enc: undefined,
+    })));
+  }),
+);
+
 router.post(
   '/accounting/payments/:paymentId/document',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
