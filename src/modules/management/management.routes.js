@@ -1027,7 +1027,7 @@ router.post(
     z.object({
       body: z.object({
         username: z.string().min(4).max(60),
-        password: z.string().min(10).refine(assertPasswordPolicy, PASSWORD_POLICY_MESSAGE).default('Vendor@123456'),
+        password: z.string().min(10).refine(assertPasswordPolicy, PASSWORD_POLICY_MESSAGE),
         tenantTypeId: z.coerce.number().int().positive(),
         name: z.string().min(1).max(255),
         phone: z.string().min(8).max(20),

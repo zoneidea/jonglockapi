@@ -23,6 +23,14 @@ Server default: `http://localhost:3000`
 
 - Database schema อยู่ที่ `migrations/001_init.sql`
 - รายละเอียด requirement, legacy mapping, RBAC และ security rules อยู่ที่ `AGENT.md`
+- Deployment checklist สำหรับ MVP อยู่ที่ `docs/MVP_DEPLOYMENT_CHECKLIST.md`
+
+## Quality Gates
+
+```bash
+npm run lint
+npm test
+```
 
 ## Initial Supervisor
 

@@ -9,7 +9,8 @@
     "migrate": "node src/scripts/migrate.js",
     "seed:supervisor": "node src/scripts/create-supervisor.js",
     "seed:demo": "node src/scripts/seed-demo.js",
-    "lint": "eslint src/**/*.js"
+    "lint": "eslint src/**/*.js test/**/*.js",
+    "test": "node --test test"
   },
   "keywords": [],
   "author": "",
