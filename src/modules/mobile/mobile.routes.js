@@ -13,6 +13,7 @@ const { publicId } = require('../../utils/id');
 const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/password-policy');
 const { expireStaleBookings } = require('../../utils/booking-status');
 const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
+const { requireSubscriptionForMutations } = require('../../services/subscription.service');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
@@ -106,6 +107,9 @@ router.post(
 );
 
 router.use(authenticate, requireMobileAccount);
+router.use(requireSubscriptionForMutations({
+  resolveFeature: () => 'mobile_booking_app',
+}));
 
 router.get(
   '/markets',

@@ -54,12 +54,13 @@ router.get(
   '/subscription/plans',
   asyncHandler(async (req, res) => {
     const rows = await query(
-      `SELECT id, code, name, description, trial_days, billing_interval, billing_interval_count, currency_code,
-              base_price, setup_fee, included_markets, included_admin_users, included_active_booths,
+      `SELECT id, code, name, description, trial_days, grace_period_days, billing_interval, billing_interval_count, currency_code,
+              base_price, price_display_label, setup_fee, included_markets, included_admin_users, included_active_booths,
               included_monthly_bookings, overage_market_price, overage_admin_user_price, overage_booth_price,
-              overage_booking_price, vat_applicable, features_json, sort_order
+              overage_booking_price, vat_applicable, features_json, is_free_tier, is_full_function, sort_order
        FROM subscription_plans
        WHERE status = 'active'
+         AND public_visible = 1
        ORDER BY sort_order ASC, id ASC`,
     );
     return ok(res, rows.map((row) => ({
@@ -86,7 +87,7 @@ router.post(
         password: z.string().min(10).refine(assertPasswordPolicy, PASSWORD_POLICY_MESSAGE),
         marketCountEstimate: z.coerce.number().int().min(1).max(999).optional().default(1),
         expectedGoLiveDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().or(z.literal('')).default(''),
-        preferredPlanCode: z.string().min(1).max(50),
+        preferredPlanCode: z.string().min(1).max(50).optional().default('free_full_1y'),
         preferredBillingInterval: z.enum(['monthly', 'yearly']).optional().default('yearly'),
         notes: z.string().max(2000).optional().or(z.literal('')).default(''),
       }),

@@ -17,6 +17,7 @@ const { publicId } = require('../../utils/id');
 const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/password-policy');
 const { expireStaleBookings } = require('../../utils/booking-status');
 const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
+const { getCurrentSubscription, requireSubscriptionForMutations } = require('../../services/subscription.service');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
@@ -433,6 +434,16 @@ router.get('/me', (req, res) => {
     marketIds: req.auth.marketIds || [],
   });
 });
+
+router.get(
+  '/subscription/current',
+  asyncHandler(async (req, res) => {
+    const subscription = await getCurrentSubscription(req.auth.organizationId);
+    return ok(res, subscription);
+  }),
+);
+
+router.use(requireSubscriptionForMutations());
 
 router.get(
   '/event-logs',

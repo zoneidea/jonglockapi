@@ -1,0 +1,194 @@
+const { query } = require('../config/db');
+const { forbidden } = require('../utils/errors');
+
+const FEATURE_BY_PATH = [
+  [/^\/organization-settings/, 'organization_settings'],
+  [/^\/admins/, 'admin_management'],
+  [/^\/pdpa/, 'pdpa_management'],
+  [/^\/announcements/, 'announcements'],
+  [/^\/tenant/, 'tenant_management'],
+  [/^\/markets\/next-code/, 'market_management'],
+  [/^\/markets\/\d+\/booth-types/, 'booth_management'],
+  [/^\/markets\/\d+\/booths/, 'booth_management'],
+  [/^\/markets\/\d+\/holidays/, 'market_management'],
+  [/^\/markets\/\d+\/images/, 'market_management'],
+  [/^\/markets\/\d+\/accessories/, 'market_management'],
+  [/^\/markets\/\d+\/product-categories/, 'product_management'],
+  [/^\/markets\/\d+\/product-groups/, 'product_management'],
+  [/^\/markets\/\d+\/products/, 'product_management'],
+  [/^\/markets\/\d+\/audit/, 'market_audit'],
+  [/^\/markets/, 'market_management'],
+  [/^\/coupons/, 'coupon_management'],
+  [/^\/bookings/, 'booking_management'],
+  [/^\/booking-edit/, 'booking_management'],
+  [/^\/accounting/, 'accounting'],
+  [/^\/reports/, 'reports'],
+  [/^\/dashboard/, 'dashboard'],
+];
+
+function parseJson(value, fallback = {}) {
+  if (!value) return fallback;
+  if (typeof value === 'object') return value;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
+function normalizeDate(value) {
+  return value ? new Date(value) : null;
+}
+
+function isDateExpired(value, gracePeriodDays = 0) {
+  const date = normalizeDate(value);
+  if (!date) return false;
+  date.setDate(date.getDate() + Number(gracePeriodDays || 0));
+  return date.getTime() < Date.now();
+}
+
+function resolveFeatureFromPath(path = '') {
+  const matched = FEATURE_BY_PATH.find(([pattern]) => pattern.test(path));
+  return matched?.[1] || 'dashboard';
+}
+
+async function getCurrentSubscription(organizationId) {
+  const rows = await query(
+    `SELECT
+        os.id, os.subscription_code, os.organization_id, os.status, os.billing_interval,
+        os.trial_starts_at, os.trial_ends_at, os.current_period_start, os.current_period_end,
+        os.next_billing_at, os.activated_at, os.cancelled_at,
+        p.id AS plan_id, p.code AS plan_code, p.name AS plan_name, p.description AS plan_description,
+        p.trial_days, p.grace_period_days, p.currency_code, p.base_price, p.price_display_label,
+        p.included_markets, p.included_admin_users, p.included_active_booths, p.included_monthly_bookings,
+        p.is_free_tier, p.is_full_function, p.features_json
+     FROM organization_subscriptions os
+     JOIN subscription_plans p ON p.id = os.plan_id
+     WHERE os.organization_id = :organizationId
+     ORDER BY
+       CASE os.status
+         WHEN 'trialing' THEN 1
+         WHEN 'active' THEN 2
+         WHEN 'pending_activation' THEN 3
+         WHEN 'past_due' THEN 4
+         ELSE 9
+       END,
+       os.current_period_end DESC,
+       os.id DESC
+     LIMIT 1`,
+    { organizationId },
+  );
+
+  if (!rows.length) {
+    return {
+      exists: false,
+      status: 'missing',
+      accessStatus: 'missing',
+      active: false,
+      expired: true,
+      writeAllowed: false,
+      currentFeatureAllowed: false,
+      entitlements: {},
+      features: [],
+    };
+  }
+
+  const row = rows[0];
+  const entitlementRows = await query(
+    `SELECT feature_key, enabled, limit_quantity, metadata_json
+     FROM subscription_plan_entitlements
+     WHERE plan_id = :planId`,
+    { planId: row.plan_id },
+  );
+
+  const entitlements = {};
+  for (const entitlement of entitlementRows) {
+    entitlements[entitlement.feature_key] = {
+      enabled: Number(entitlement.enabled) === 1,
+      limit: entitlement.limit_quantity === null ? null : Number(entitlement.limit_quantity),
+      metadata: parseJson(entitlement.metadata_json, {}),
+    };
+  }
+
+  const gracePeriodDays = Number(row.grace_period_days || 0);
+  const effectiveEndAt = row.current_period_end || row.trial_ends_at || row.next_billing_at;
+  const terminalStatus = ['expired', 'cancelled', 'suspended'].includes(row.status);
+  const expired = terminalStatus || isDateExpired(effectiveEndAt, gracePeriodDays);
+  const fullFunction = Number(row.is_full_function) === 1;
+  const active = !expired && ['pending_activation', 'trialing', 'active'].includes(row.status);
+
+  return {
+    exists: true,
+    id: row.id,
+    subscriptionCode: row.subscription_code,
+    status: row.status,
+    accessStatus: expired ? 'expired' : active ? 'active' : 'read_only',
+    active,
+    expired,
+    writeAllowed: active,
+    effectiveEndAt,
+    gracePeriodDays,
+    fullFunction,
+    plan: {
+      id: row.plan_id,
+      code: row.plan_code,
+      name: row.plan_name,
+      description: row.plan_description,
+      trialDays: Number(row.trial_days || 0),
+      currencyCode: row.currency_code,
+      basePrice: Number(row.base_price || 0),
+      priceDisplayLabel: row.price_display_label || 'N/A',
+      includedMarkets: Number(row.included_markets || 0),
+      includedAdminUsers: Number(row.included_admin_users || 0),
+      includedActiveBooths: Number(row.included_active_booths || 0),
+      includedMonthlyBookings: Number(row.included_monthly_bookings || 0),
+      isFreeTier: Number(row.is_free_tier) === 1,
+      isFullFunction: fullFunction,
+      features: parseJson(row.features_json, []),
+    },
+    entitlements,
+  };
+}
+
+function canUseFeature(subscription, featureKey) {
+  if (!subscription?.writeAllowed) return false;
+  if (subscription.fullFunction) return true;
+  return Boolean(subscription.entitlements?.[featureKey]?.enabled);
+}
+
+async function assertFeatureAccess(organizationId, featureKey) {
+  const subscription = await getCurrentSubscription(organizationId);
+  if (!subscription.writeAllowed) {
+    throw forbidden('Subscription is expired or inactive');
+  }
+  if (!canUseFeature(subscription, featureKey)) {
+    throw forbidden(`Current subscription plan does not include ${featureKey}`);
+  }
+  return subscription;
+}
+
+function requireSubscriptionForMutations(options = {}) {
+  const resolveFeature = options.resolveFeature || resolveFeatureFromPath;
+  const excluded = options.excluded || [];
+
+  return async (req, res, next) => {
+    if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
+    if (excluded.some((pattern) => pattern.test(req.path))) return next();
+
+    try {
+      const featureKey = resolveFeature(req.path, req);
+      await assertFeatureAccess(req.auth.organizationId, featureKey);
+      return next();
+    } catch (error) {
+      return next(error);
+    }
+  };
+}
+
+module.exports = {
+  assertFeatureAccess,
+  canUseFeature,
+  getCurrentSubscription,
+  requireSubscriptionForMutations,
+  resolveFeatureFromPath,
+};
