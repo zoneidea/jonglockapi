@@ -13,6 +13,44 @@ const { conflict } = require('../../utils/errors');
 const router = express.Router();
 
 router.get(
+  '/subscription/overview',
+  asyncHandler(async (req, res) => {
+    const [summary] = await query(
+      `SELECT
+          (SELECT COUNT(*) FROM organizations WHERE status = 'active') AS active_organizations,
+          (SELECT COUNT(*) FROM markets WHERE status = 'active') AS active_markets,
+          (SELECT COUNT(*) FROM booths WHERE status = 'active') AS active_booths,
+          (SELECT COUNT(*) FROM organization_signup_requests WHERE status IN ('pending_review', 'contacted')) AS pending_signup_requests,
+          (SELECT COUNT(*) FROM organization_subscriptions WHERE status IN ('pending_activation', 'trialing', 'active', 'past_due')) AS active_subscriptions,
+          (SELECT COUNT(*) FROM bookings WHERE status = 'paid' AND DATE(COALESCE(paid_at, created_at)) = CURRENT_DATE()) AS paid_bookings_today,
+          (SELECT COALESCE(SUM(total_amount), 0) FROM bookings WHERE status = 'paid' AND DATE(COALESCE(paid_at, created_at)) = CURRENT_DATE()) AS paid_amount_today,
+          (SELECT COUNT(*)
+             FROM booking_items
+            WHERE status = 'paid'
+              AND booking_date = CURRENT_DATE()) AS occupied_booths_today`,
+    );
+
+    const activeBooths = Number(summary?.active_booths || 0);
+    const occupiedBoothsToday = Number(summary?.occupied_booths_today || 0);
+    const occupancyRateToday = activeBooths > 0
+      ? Math.min(100, Math.round((occupiedBoothsToday / activeBooths) * 100))
+      : 0;
+
+    return ok(res, {
+      activeOrganizations: Number(summary?.active_organizations || 0),
+      activeMarkets: Number(summary?.active_markets || 0),
+      activeBooths,
+      pendingSignupRequests: Number(summary?.pending_signup_requests || 0),
+      activeSubscriptions: Number(summary?.active_subscriptions || 0),
+      paidBookingsToday: Number(summary?.paid_bookings_today || 0),
+      paidAmountToday: Number(summary?.paid_amount_today || 0),
+      occupiedBoothsToday,
+      occupancyRateToday,
+    });
+  }),
+);
+
+router.get(
   '/subscription/plans',
   asyncHandler(async (req, res) => {
     const rows = await query(
