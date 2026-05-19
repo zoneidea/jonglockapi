@@ -11,6 +11,7 @@ const mobileRoutes = require('./modules/mobile/mobile.routes');
 const managementRoutes = require('./modules/management/management.routes');
 const auditRoutes = require('./modules/audit/audit.routes');
 const paymentRoutes = require('./modules/payments/payments.routes');
+const publicRoutes = require('./modules/public/public.routes');
 const { notFoundHandler, errorHandler } = require('./middlewares/error-handler');
 const { eventLogger } = require('./middlewares/event-logger');
 
@@ -58,7 +59,9 @@ app.get('/health', (req, res) => {
 app.use(`${env.API_PREFIX}/mobile/audit`, auditRoutes);
 app.use(`${env.API_PREFIX}/mobile/payments`, paymentRoutes);
 app.use(`${env.API_PREFIX}/mobile`, mobileRoutes);
+app.use(`${env.API_PREFIX}/public`, publicRoutes);
 app.use(`${env.API_PREFIX}/management`, managementRoutes);
+app.use('/public', publicRoutes);
 app.use('/management', managementRoutes);
 
 app.use(notFoundHandler);
