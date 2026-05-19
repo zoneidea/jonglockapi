@@ -3226,6 +3226,72 @@ router.get(
 );
 
 router.get(
+  '/accounting/product-types',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({
+        startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        marketId: z.coerce.number().int().positive().optional(),
+      }),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    await expireStaleBookings({ execute: query }, req.auth.organizationId);
+    const { startDate, endDate, marketId } = req.validated.query;
+    const rows = await query(
+      `SELECT bi.id,
+              b.public_id AS booking_public_id,
+              m.name AS market_name,
+              mu.username_enc, mu.first_name_enc, mu.last_name_enc,
+              DATE(COALESCE(p.paid_at, p.created_at)) AS paid_date,
+              GREATEST(COALESCE(b.subtotal_amount, 0) - COALESCE(b.discount_amount, 0), 0) AS amount_before_vat,
+              GROUP_CONCAT(DISTINCT pr.name ORDER BY pr.name SEPARATOR ', ') AS product_names
+       FROM booking_items bi
+       JOIN bookings b ON b.id = bi.booking_id
+       JOIN payments p ON p.booking_id = b.id AND p.organization_id = b.organization_id AND p.status = 'paid'
+       JOIN markets m ON m.id = b.market_id
+       JOIN mobile_users mu ON mu.id = b.mobile_user_id
+       LEFT JOIN booking_products bp ON bp.booking_item_id = bi.id
+       LEFT JOIN products pr ON pr.id = bp.product_id
+       LEFT JOIN admin_market_assignments ama
+         ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+       WHERE bi.organization_id = :organizationId
+         AND b.organization_id = :organizationId
+         AND p.organization_id = :organizationId
+         AND (:marketId IS NULL OR b.market_id = :marketId)
+         AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+         AND b.status = 'paid'
+         AND bi.status = 'paid'
+         AND (:startDate IS NULL OR DATE(COALESCE(p.paid_at, p.created_at)) >= :startDate)
+         AND (:endDate IS NULL OR DATE(COALESCE(p.paid_at, p.created_at)) <= :endDate)
+       GROUP BY bi.id, b.public_id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc,
+                DATE(COALESCE(p.paid_at, p.created_at)), b.subtotal_amount, b.discount_amount
+       ORDER BY DATE(COALESCE(p.paid_at, p.created_at)) ASC, b.public_id ASC
+       LIMIT 1000`,
+      {
+        organizationId: req.auth.organizationId,
+        adminUserId: req.auth.sub,
+        hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
+        marketId: marketId || null,
+        startDate: startDate || null,
+        endDate: endDate || null,
+      },
+    );
+    return ok(res, rows.map((row) => ({
+      ...row,
+      customer_name: [decryptField(row.first_name_enc), decryptField(row.last_name_enc)].filter(Boolean).join(' ').trim() || decryptField(row.username_enc) || '-',
+      username_enc: undefined,
+      first_name_enc: undefined,
+      last_name_enc: undefined,
+    })));
+  }),
+);
+
+router.get(
   '/accounting/report-all',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
   validate(

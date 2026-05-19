@@ -1,7 +1,8 @@
 const bcrypt = require('bcryptjs');
 const { pool } = require('../config/db');
 const { logger } = require('../config/logger');
-const { encryptField, blindIndex } = require('../utils/crypto');
+const { encryptField, blindIndex, decryptField } = require('../utils/crypto');
+const { calculateVatBreakdown } = require('../utils/vat');
 
 const DEFAULT_ADMIN_PASSWORD = 'Admin@123456';
 const DEFAULT_VENDOR_PASSWORD = 'Vendor@123456';
@@ -26,6 +27,24 @@ async function upsertOrganization(connection) {
   );
 
   return one(connection, `SELECT id FROM organizations WHERE code = 'ORG001' LIMIT 1`, {});
+}
+
+async function updateOrganizationSettings(connection, organizationId) {
+  await exec(
+    connection,
+    `UPDATE organizations
+     SET vat_enabled = 1,
+         vat_rate = 7.00,
+         registered_name = 'Zone Idea Demo Organization Co., Ltd.',
+         registered_tax_id = '0105559000001',
+         registered_address = '1 Demo Tower',
+         registered_subdistrict = 'จตุจักร',
+         registered_district = 'จตุจักร',
+         registered_province = 'กรุงเทพมหานคร',
+         registered_postcode = '10900'
+     WHERE id = :organizationId`,
+    { organizationId },
+  );
 }
 
 async function upsertAdmin(connection, organizationId, { username, role, name, email, phone }) {
@@ -300,25 +319,42 @@ async function upsertDemoBooking(connection, organizationId, marketId, mobileUse
   const bookingDate = options.bookingDate || '2026-05-14';
   const bookingStatus = options.bookingStatus || 'paid';
   const itemStatus = options.itemStatus || bookingStatus;
-  const amount = options.amount || 500;
-  const paidAt = bookingStatus === 'paid' ? new Date() : null;
+  const subtotalAmount = Number(options.subtotalAmount ?? options.amount ?? 500);
+  const discountAmount = Number(options.discountAmount || 0);
+  const totals = calculateVatBreakdown(subtotalAmount, discountAmount, { vat_enabled: 1, vat_rate: 7 });
+  const paidAt = bookingStatus === 'paid' ? (options.paidAt || new Date()) : null;
   await exec(
     connection,
     `INSERT INTO bookings (
       organization_id, public_id, market_id, mobile_user_id, source, status,
-      subtotal_amount, total_amount, paid_at
+      subtotal_amount, discount_amount, vat_amount, total_amount, paid_at, comment
     ) VALUES (
       :organizationId, :publicId, :marketId, :mobileUserId, 'mobile', :bookingStatus,
-      :amount, :amount, :paidAt
+      :subtotalAmount, :discountAmount, :vatAmount, :totalAmount, :paidAt, :comment
     )
     ON DUPLICATE KEY UPDATE
       market_id = VALUES(market_id),
       mobile_user_id = VALUES(mobile_user_id),
       status = VALUES(status),
       subtotal_amount = VALUES(subtotal_amount),
+      discount_amount = VALUES(discount_amount),
+      vat_amount = VALUES(vat_amount),
       total_amount = VALUES(total_amount),
-      paid_at = VALUES(paid_at)`,
-    { organizationId, publicId, marketId, mobileUserId, bookingStatus, amount, paidAt },
+      paid_at = VALUES(paid_at),
+      comment = VALUES(comment)`,
+    {
+      organizationId,
+      publicId,
+      marketId,
+      mobileUserId,
+      bookingStatus,
+      subtotalAmount: totals.subtotalAmount,
+      discountAmount: totals.discountAmount,
+      vatAmount: totals.vatAmount,
+      totalAmount: totals.totalAmount,
+      paidAt,
+      comment: options.comment || null,
+    },
   );
 
   const booking = await one(connection, `SELECT id FROM bookings WHERE public_id = :publicId LIMIT 1`, { publicId });
@@ -334,8 +370,8 @@ async function upsertDemoBooking(connection, organizationId, marketId, mobileUse
     const result = await exec(
       connection,
       `INSERT INTO booking_items (organization_id, booking_id, booth_id, booking_date, unit_price, status, audit_status)
-       VALUES (:organizationId, :bookingId, :boothId, :bookingDate, :amount, :itemStatus, 'pending')`,
-      { organizationId, bookingId: booking.id, boothId, bookingDate, amount, itemStatus },
+       VALUES (:organizationId, :bookingId, :boothId, :bookingDate, :unitPrice, :itemStatus, 'pending')`,
+      { organizationId, bookingId: booking.id, boothId, bookingDate, unitPrice: totals.subtotalAmount, itemStatus },
     );
     item = { id: result.insertId };
   } else {
@@ -343,10 +379,10 @@ async function upsertDemoBooking(connection, organizationId, marketId, mobileUse
       connection,
       `UPDATE booking_items
        SET booking_date = :bookingDate,
-           unit_price = :amount,
+           unit_price = :unitPrice,
            status = :itemStatus
        WHERE id = :bookingItemId AND organization_id = :organizationId`,
-      { organizationId, bookingItemId: item.id, bookingDate, amount, itemStatus },
+      { organizationId, bookingItemId: item.id, bookingDate, unitPrice: totals.subtotalAmount, itemStatus },
     );
   }
 
@@ -391,13 +427,147 @@ async function upsertDemoBooking(connection, organizationId, marketId, mobileUse
     await exec(
       connection,
       `INSERT INTO payments (organization_id, public_id, booking_id, provider, provider_reference, status, amount, paid_at)
-       VALUES (:organizationId, :paymentPublicId, :bookingId, 'mock', :providerReference, 'paid', :amount, NOW())
-       ON DUPLICATE KEY UPDATE status = 'paid', amount = VALUES(amount), paid_at = COALESCE(paid_at, NOW())`,
-      { organizationId, paymentPublicId, bookingId: booking.id, providerReference, amount },
+       VALUES (:organizationId, :paymentPublicId, :bookingId, 'mock', :providerReference, 'paid', :amount, :paidAt)
+       ON DUPLICATE KEY UPDATE
+         status = 'paid',
+         amount = VALUES(amount),
+         provider_reference = VALUES(provider_reference),
+         paid_at = VALUES(paid_at)`,
+      {
+        organizationId,
+        paymentPublicId,
+        bookingId: booking.id,
+        providerReference,
+        amount: totals.totalAmount,
+        paidAt,
+      },
     );
   }
 
   return { bookingId: booking.id, bookingItemId: item.id };
+}
+
+async function upsertPaymentCallback(connection, organizationId, provider, payload, receivedAt) {
+  await exec(
+    connection,
+    `INSERT INTO payment_callbacks (organization_id, provider, payload_json, received_at)
+     VALUES (:organizationId, :provider, :payloadJson, :receivedAt)`,
+    {
+      organizationId,
+      provider,
+      payloadJson: JSON.stringify(payload),
+      receivedAt,
+    },
+  );
+}
+
+async function nextAccountingSequence(connection, organizationId, documentType, issueDate) {
+  const periodYm = String(issueDate).replace(/-/g, '').slice(0, 6);
+  await exec(
+    connection,
+    `INSERT INTO accounting_document_sequences (organization_id, document_type, period_ym, sequence_no)
+     VALUES (:organizationId, :documentType, :periodYm, 1)
+     ON DUPLICATE KEY UPDATE sequence_no = sequence_no + 1`,
+    { organizationId, documentType, periodYm },
+  );
+  const sequence = await one(
+    connection,
+    `SELECT sequence_no
+     FROM accounting_document_sequences
+     WHERE organization_id = :organizationId
+       AND document_type = :documentType
+       AND period_ym = :periodYm
+     LIMIT 1`,
+    { organizationId, documentType, periodYm },
+  );
+  const prefix = { receipt: 'RC', tax_invoice: 'TAX', credit_note: 'CN' }[documentType];
+  return `${prefix}${periodYm}${String(sequence.sequence_no).padStart(5, '0')}`;
+}
+
+async function issueAccountingDocument(connection, organizationId, paymentId, issuedByAdminId, documentType, options = {}) {
+  const payment = await one(
+    connection,
+    `SELECT p.id, p.booking_id, p.amount, p.paid_at, b.public_id AS booking_public_id,
+            b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
+            mu.first_name_enc, mu.last_name_enc
+     FROM payments p
+     JOIN bookings b ON b.id = p.booking_id
+     JOIN mobile_users mu ON mu.id = b.mobile_user_id
+     WHERE p.id = :paymentId AND p.organization_id = :organizationId
+     LIMIT 1`,
+    { organizationId, paymentId },
+  );
+  if (!payment) return null;
+
+  const existing = await one(
+    connection,
+    `SELECT id, document_no
+     FROM accounting_documents
+     WHERE organization_id = :organizationId
+       AND payment_id = :paymentId
+       AND document_type = :documentType
+       AND document_status = :documentStatus
+     LIMIT 1`,
+    {
+      organizationId,
+      paymentId,
+      documentType,
+      documentStatus: options.documentStatus || 'issued',
+    },
+  );
+  if (existing) return existing;
+
+  const issueDate = options.issueDate || String(payment.paid_at || new Date()).slice(0, 10);
+  const documentNo = await nextAccountingSequence(connection, organizationId, documentType, issueDate);
+  await exec(
+    connection,
+    `INSERT INTO accounting_documents (
+      organization_id, document_type, document_no, document_status, payment_id, booking_id, source_document_id,
+      issue_date, subtotal_amount, discount_amount, vat_amount, withholding_tax_amount, total_amount,
+      customer_name, organization_snapshot_json, customer_snapshot_json, line_items_json, issued_by_admin_id,
+      cancelled_by_admin_id, cancelled_at, cancel_reason
+    ) VALUES (
+      :organizationId, :documentType, :documentNo, :documentStatus, :paymentId, :bookingId, :sourceDocumentId,
+      :issueDate, :subtotalAmount, :discountAmount, :vatAmount, 0, :totalAmount,
+      :customerName, :organizationSnapshotJson, :customerSnapshotJson, :lineItemsJson, :issuedByAdminId,
+      :cancelledByAdminId, :cancelledAt, :cancelReason
+    )`,
+    {
+      organizationId,
+      documentType,
+      documentNo,
+      documentStatus: options.documentStatus || 'issued',
+      paymentId: payment.id,
+      bookingId: payment.booking_id,
+      sourceDocumentId: options.sourceDocumentId || null,
+      issueDate,
+      subtotalAmount: options.subtotalAmount ?? payment.subtotal_amount,
+      discountAmount: options.discountAmount ?? payment.discount_amount,
+      vatAmount: options.vatAmount ?? payment.vat_amount,
+      totalAmount: options.totalAmount ?? payment.total_amount,
+      customerName: options.customerName || [decryptField(payment.first_name_enc), decryptField(payment.last_name_enc)].filter(Boolean).join(' ').trim() || 'ลูกค้าทดสอบ',
+      organizationSnapshotJson: JSON.stringify({
+        name: 'Zone Idea Demo Organization Co., Ltd.',
+        vatEnabled: true,
+        vatRate: 7,
+      }),
+      customerSnapshotJson: JSON.stringify({ bookingPublicId: payment.booking_public_id }),
+      lineItemsJson: JSON.stringify([{ description: 'ค่าจอง Booth', amount: options.subtotalAmount ?? payment.subtotal_amount }]),
+      issuedByAdminId,
+      cancelledByAdminId: options.cancelledByAdminId || null,
+      cancelledAt: options.cancelledAt || null,
+      cancelReason: options.cancelReason || null,
+    },
+  );
+
+  return one(
+    connection,
+    `SELECT id, document_no
+     FROM accounting_documents
+     WHERE organization_id = :organizationId AND payment_id = :paymentId AND document_no = :documentNo
+     LIMIT 1`,
+    { organizationId, paymentId, documentNo },
+  );
 }
 
 async function upsertAuditCheck(connection, organizationId, marketId, bookingItemId, checkedByAdminId, options = {}) {
@@ -493,6 +663,7 @@ async function main() {
 
     const organization = await upsertOrganization(connection);
     const organizationId = organization.id;
+    await updateOrganizationSettings(connection, organizationId);
 
     const supervisor = await upsertAdmin(connection, organizationId, {
       username: 'admin',
@@ -606,10 +777,11 @@ async function main() {
     const demoBooking = await upsertDemoBooking(connection, organizationId, market.id, mobileUser.id, booths[0].id, product.id, {
       publicId: 'BK-DEMO-PAID-001',
       paymentPublicId: 'PAY-DEMO-001',
-      bookingDate: '2026-05-14',
+      bookingDate: '2026-05-01',
       bookingStatus: 'paid',
       itemStatus: 'paid',
-      amount: 500,
+      subtotalAmount: 500,
+      paidAt: '2026-05-01 09:30:00',
     });
     await upsertDemoBooking(connection, organizationId, market.id, mobileUser.id, booths[1].id, product.id, {
       publicId: 'BK-DEMO-PENDING-001',
@@ -673,7 +845,8 @@ async function main() {
       const selectedUser = mobileUsers[index % mobileUsers.length];
       const publicId = `BK-DEMO-${String(index + 2).padStart(4, '0')}`;
       const paymentPublicId = `PAY-DEMO-${String(index + 2).padStart(4, '0')}`;
-      const amount = Number(index % 2 === 0 ? 500 : 650);
+      const subtotalAmount = Number(index % 2 === 0 ? 900 + (index % 4) * 100 : 1000 + (index % 5) * 100);
+      const discountAmount = index % 6 === 0 ? 100 : 0;
       const booking = await upsertDemoBooking(
         connection,
         organizationId,
@@ -688,10 +861,20 @@ async function main() {
           bookingDate,
           bookingStatus: 'paid',
           itemStatus: 'paid',
-          amount,
+          subtotalAmount,
+          discountAmount,
+          paidAt: `${bookingDate} 09:30:00`,
         },
       );
-      seededBookings.push({ ...booking, bookingDate, boothId: booth.id, publicId });
+      seededBookings.push({
+        ...booking,
+        bookingDate,
+        boothId: booth.id,
+        publicId,
+        paymentPublicId,
+        subtotalAmount,
+        discountAmount,
+      });
     }
 
     await upsertAuditCheck(connection, organizationId, market.id, demoBooking.bookingItemId, audit.id, {
@@ -724,6 +907,85 @@ async function main() {
           note: 'ผ่านการประเมิน',
           checkedAt: `${seededBooking.bookingDate} 17:30:00`,
         });
+      }
+    }
+
+    const issuedDocuments = [];
+    for (let index = 0; index < seededBookings.length; index += 1) {
+      const seededBooking = seededBookings[index];
+      const payment = await one(
+        connection,
+        `SELECT id, paid_at, amount
+         FROM payments
+         WHERE organization_id = :organizationId AND public_id = :publicId
+         LIMIT 1`,
+        { organizationId, publicId: seededBooking.paymentPublicId },
+      );
+      if (!payment) continue;
+
+      await upsertPaymentCallback(connection, organizationId, 'mock', {
+        paymentPublicId: seededBooking.paymentPublicId,
+        bookingPublicId: seededBooking.publicId,
+        status: 'paid',
+        amount: payment.amount,
+      }, payment.paid_at || `${seededBooking.bookingDate} 09:45:00`);
+
+      if (index < 20) {
+        const documentType = index < 4 ? 'receipt' : 'tax_invoice';
+        const document = await issueAccountingDocument(connection, organizationId, payment.id, accounting.id, documentType, {
+          issueDate: seededBooking.bookingDate,
+        });
+        if (document) issuedDocuments.push({ ...document, paymentId: payment.id, bookingDate: seededBooking.bookingDate });
+      }
+    }
+
+    const cancelledTarget = issuedDocuments.find((item) => String(item.document_no || '').startsWith('RC'));
+    if (cancelledTarget) {
+      await exec(
+        connection,
+        `UPDATE accounting_documents
+         SET document_status = 'cancelled',
+             cancelled_by_admin_id = :cancelledByAdminId,
+             cancelled_at = :cancelledAt,
+             cancel_reason = :cancelReason
+         WHERE id = :documentId`,
+        {
+          documentId: cancelledTarget.id,
+          cancelledByAdminId: accounting.id,
+          cancelledAt: `${cancelledTarget.bookingDate} 15:00:00`,
+          cancelReason: 'ยกเลิกรายการทดสอบเอกสาร',
+        },
+      );
+    }
+
+    const creditSource = issuedDocuments.find((item) => String(item.document_no || '').startsWith('TAX'));
+    if (creditSource) {
+      const sourceDoc = await one(
+        connection,
+        `SELECT id, payment_id, subtotal_amount, discount_amount, vat_amount, total_amount, customer_name
+         FROM accounting_documents
+         WHERE id = :documentId
+         LIMIT 1`,
+        { documentId: creditSource.id },
+      );
+      if (sourceDoc) {
+        await issueAccountingDocument(connection, organizationId, sourceDoc.payment_id, accounting.id, 'credit_note', {
+          issueDate: '2026-05-19',
+          sourceDocumentId: sourceDoc.id,
+          subtotalAmount: sourceDoc.subtotal_amount,
+          discountAmount: sourceDoc.discount_amount,
+          vatAmount: sourceDoc.vat_amount,
+          totalAmount: sourceDoc.total_amount,
+          customerName: sourceDoc.customer_name,
+          cancelReason: 'ออกใบลดหนี้สำหรับข้อมูลทดสอบ',
+        });
+        await exec(
+          connection,
+          `UPDATE payments
+           SET status = 'refunded'
+           WHERE id = :paymentId AND organization_id = :organizationId`,
+          { organizationId, paymentId: sourceDoc.payment_id },
+        );
       }
     }
 
