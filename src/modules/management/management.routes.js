@@ -239,6 +239,29 @@ async function syncAnnouncementCoverImage(organizationId, announcementId) {
   return nextImageUrl;
 }
 
+async function getAnnouncementMarketSnapshot(organizationId, marketId) {
+  if (!marketId) {
+    return { marketId: null, marketCode: null, marketName: '' };
+  }
+
+  const rows = await query(
+    `SELECT id, code, name
+     FROM markets
+     WHERE id = :marketId
+       AND organization_id = :organizationId
+     LIMIT 1`,
+    { organizationId, marketId },
+  );
+  const market = rows[0];
+  if (!market) throw notFound('Market not found');
+
+  return {
+    marketId: market.id,
+    marketCode: market.code || null,
+    marketName: market.name || '',
+  };
+}
+
 const ACCOUNTING_DOCUMENT_PREFIX = {
   receipt: 'RC',
   tax_invoice: 'TAX',
@@ -591,7 +614,8 @@ router.get(
   asyncHandler(async (req, res) => {
     const type = ['news', 'banner'].includes(req.query.type) ? req.query.type : null;
     const rows = await query(
-      `SELECT ai.id, ai.market_id, ai.type, ai.title, ai.description, ai.image_url, ai.start_date, ai.end_date, ai.status, ai.created_at,
+      `SELECT ai.id, ai.market_id, ai.market_code, ai.type, ai.title, ai.description, ai.image_url, ai.start_date, ai.end_date, ai.status, ai.created_at,
+              m.name AS market_name,
               (
                 SELECT COUNT(*)
                 FROM announcement_item_images aii
@@ -601,6 +625,9 @@ router.get(
               ) AS image_count
        FROM announcement_items
        ai
+       LEFT JOIN markets m
+         ON m.id = ai.market_id
+        AND m.organization_id = ai.organization_id
        WHERE ai.organization_id = :organizationId
          AND (:type IS NULL OR type = :type)
        ORDER BY ai.start_date DESC, ai.id DESC`,
@@ -616,9 +643,14 @@ router.get(
   asyncHandler(async (req, res) => {
     const announcementId = Number(req.params.announcementId);
     const rows = await query(
-      `SELECT id, market_id, type, title, description, image_url, start_date, end_date, status, created_at, updated_at
+      `SELECT ai.id, ai.market_id, ai.market_code, ai.type, ai.title, ai.description, ai.image_url, ai.start_date, ai.end_date, ai.status, ai.created_at, ai.updated_at,
+              m.name AS market_name
        FROM announcement_items
-       WHERE id = :announcementId AND organization_id = :organizationId
+       ai
+       LEFT JOIN markets m
+         ON m.id = ai.market_id
+        AND m.organization_id = ai.organization_id
+       WHERE ai.id = :announcementId AND ai.organization_id = :organizationId
        LIMIT 1`,
       { organizationId: req.auth.organizationId, announcementId },
     );
@@ -661,6 +693,8 @@ router.post(
       })
       .parse({ body: req.body });
     const body = parsed.body;
+    if (body.type === 'news' && !body.marketId) throw badRequest('Market is required for news announcements');
+    const market = await getAnnouncementMarketSnapshot(req.auth.organizationId, body.marketId || null);
     const bannerImage = req.files?.image?.[0] || null;
     const galleryImages = req.files?.images || [];
     const createdImageUrls = galleryImages.map((file) => publicUploadUrl(req, file.path));
@@ -669,13 +703,14 @@ router.post(
       : createdImageUrls[0] || null;
     const result = await query(
       `INSERT INTO announcement_items (
-        organization_id, market_id, type, title, description, image_url, start_date, end_date, status, created_by_admin_id
+        organization_id, market_id, market_code, type, title, description, image_url, start_date, end_date, status, created_by_admin_id
       ) VALUES (
-        :organizationId, :marketId, :type, :title, :description, :imageUrl, :startDate, :endDate, :status, :createdByAdminId
+        :organizationId, :marketId, :marketCode, :type, :title, :description, :imageUrl, :startDate, :endDate, :status, :createdByAdminId
       )`,
       {
         organizationId: req.auth.organizationId,
-        marketId: body.marketId || null,
+        marketId: market.marketId,
+        marketCode: market.marketCode,
         type: body.type,
         title: body.title,
         description: body.description,
@@ -721,6 +756,7 @@ router.patch(
       .object({
         params: z.object({ announcementId: z.coerce.number().int().positive() }),
         body: z.object({
+          marketId: z.coerce.number().int().positive().optional().nullable(),
           title: z.string().min(1),
           description: z.string().optional().default(''),
           startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().nullable(),
@@ -731,7 +767,7 @@ router.patch(
       })
       .parse({ params: req.params, body: req.body });
     const rows = await query(
-      `SELECT image_url, type
+      `SELECT image_url, type, market_id
        FROM announcement_items
        WHERE id = :announcementId AND organization_id = :organizationId
        LIMIT 1`,
@@ -739,12 +775,20 @@ router.patch(
     );
     const current = rows[0];
     if (!current) throw notFound('Announcement not found');
+    const nextMarketId = parsed.body.marketId === undefined ? current.market_id : (parsed.body.marketId || null);
+    if (current.type === 'news' && !nextMarketId) throw badRequest('Market is required for news announcements');
+    const market = await getAnnouncementMarketSnapshot(
+      req.auth.organizationId,
+      nextMarketId,
+    );
     const bannerImage = req.files?.image?.[0] || null;
     const galleryImages = req.files?.images || [];
     const imageUrl = bannerImage ? publicUploadUrl(req, bannerImage.path) : current.image_url;
     await query(
       `UPDATE announcement_items
-       SET title = :title,
+       SET market_id = :marketId,
+           market_code = :marketCode,
+           title = :title,
            description = :description,
            image_url = :imageUrl,
            start_date = :startDate,
@@ -754,6 +798,8 @@ router.patch(
       {
         organizationId: req.auth.organizationId,
         announcementId: parsed.params.announcementId,
+        marketId: market.marketId,
+        marketCode: market.marketCode,
         title: parsed.body.title,
         description: parsed.body.description,
         imageUrl,

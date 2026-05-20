@@ -41,6 +41,7 @@ function mapAnnouncement(row) {
     id: row.id,
     organizationId: row.organization_id,
     marketId: row.market_id,
+    marketCode: row.market_code || '',
     marketName: row.market_name || '',
     type: row.type,
     title: row.title,
@@ -120,7 +121,7 @@ router.get(
 
     const rows = await query(
       `SELECT
-          ai.id, ai.organization_id, ai.market_id, ai.type, ai.title, ai.description, ai.image_url,
+          ai.id, ai.organization_id, ai.market_id, ai.market_code, ai.type, ai.title, ai.description, ai.image_url,
           ai.start_date, ai.end_date, ai.created_at, m.name AS market_name
        FROM announcement_items ai
        LEFT JOIN markets m
