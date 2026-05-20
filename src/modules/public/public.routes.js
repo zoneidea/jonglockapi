@@ -36,6 +36,22 @@ function mapMarket(row) {
   };
 }
 
+function mapAnnouncement(row) {
+  return {
+    id: row.id,
+    organizationId: row.organization_id,
+    marketId: row.market_id,
+    marketName: row.market_name || '',
+    type: row.type,
+    title: row.title,
+    description: row.description || '',
+    imageUrl: row.image_url || '',
+    startDate: row.start_date,
+    endDate: row.end_date,
+    createdAt: row.created_at,
+  };
+}
+
 router.get(
   '/markets',
   asyncHandler(async (req, res) => {
@@ -93,6 +109,36 @@ router.get(
     );
 
     return ok(res, rows[0] ? mapMarket(rows[0]) : null);
+  }),
+);
+
+router.get(
+  '/announcements',
+  asyncHandler(async (req, res) => {
+    const type = ['news', 'banner'].includes(String(req.query.type || '')) ? String(req.query.type) : null;
+    const limit = Math.min(Math.max(Number(req.query.limit || 20), 1), 50);
+
+    const rows = await query(
+      `SELECT
+          ai.id, ai.organization_id, ai.market_id, ai.type, ai.title, ai.description, ai.image_url,
+          ai.start_date, ai.end_date, ai.created_at, m.name AS market_name
+       FROM announcement_items ai
+       LEFT JOIN markets m
+         ON m.id = ai.market_id
+        AND m.organization_id = ai.organization_id
+        AND m.status = 'active'
+       JOIN organizations o ON o.id = ai.organization_id
+       WHERE ai.status = 'active'
+         AND o.status = 'active'
+         AND (:type IS NULL OR ai.type = :type)
+         AND (ai.start_date IS NULL OR ai.start_date <= CURRENT_DATE())
+         AND (ai.end_date IS NULL OR ai.end_date >= CURRENT_DATE())
+       ORDER BY COALESCE(ai.start_date, DATE(ai.created_at)) DESC, ai.id DESC
+       LIMIT ${limit}`,
+      { type },
+    );
+
+    return ok(res, rows.map(mapAnnouncement));
   }),
 );
 
