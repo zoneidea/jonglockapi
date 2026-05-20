@@ -23,6 +23,7 @@ function mapMarket(row) {
     code: row.code,
     name: row.name,
     description: row.description || '',
+    terms: row.terms || '',
     mainImageUrl: row.main_image_url || galleryImages[0] || '',
     address: row.address || '',
     openingHours: row.opening_hours || '',
@@ -49,7 +50,7 @@ router.get(
 
     const rows = await query(
       `SELECT
-          m.id, m.organization_id, m.code, m.name, m.description, m.main_image_url,
+          m.id, m.organization_id, m.code, m.name, m.description, m.terms, m.main_image_url,
           m.address, m.opening_hours, m.phone, m.line_id, m.email, m.open_date, m.close_date,
           GROUP_CONCAT(mi.image_url ORDER BY mi.sort_order ASC, mi.id DESC SEPARATOR '||') AS gallery_images
        FROM markets m
@@ -74,7 +75,7 @@ router.get(
     const marketId = Number(req.params.marketId);
     const rows = await query(
       `SELECT
-          m.id, m.organization_id, m.code, m.name, m.description, m.main_image_url,
+          m.id, m.organization_id, m.code, m.name, m.description, m.terms, m.main_image_url,
           m.address, m.opening_hours, m.phone, m.line_id, m.email, m.open_date, m.close_date,
           GROUP_CONCAT(mi.image_url ORDER BY mi.sort_order ASC, mi.id DESC SEPARATOR '||') AS gallery_images
        FROM markets m
