@@ -53,6 +53,20 @@ function mapAnnouncement(row) {
   };
 }
 
+function mapFloorPlan(row) {
+  return {
+    id: row.id,
+    organizationId: row.organization_id,
+    marketId: row.market_id,
+    name: row.name,
+    planImageUrl: row.plan_image_url || '',
+    startDate: row.start_date,
+    endDate: row.end_date,
+    status: row.status,
+    boothCount: Number(row.booth_count || 0),
+  };
+}
+
 router.get(
   '/markets',
   asyncHandler(async (req, res) => {
@@ -110,6 +124,38 @@ router.get(
     );
 
     return ok(res, rows[0] ? mapMarket(rows[0]) : null);
+  }),
+);
+
+router.get(
+  '/markets/:marketId/floor-plans',
+  asyncHandler(async (req, res) => {
+    const marketId = Number(req.params.marketId);
+    const rows = await query(
+      `SELECT
+          fp.id, fp.organization_id, fp.market_id, fp.name, fp.plan_image_url,
+          fp.start_date, fp.end_date, fp.status,
+          COUNT(b.id) AS booth_count
+       FROM floor_plans fp
+       JOIN markets m
+         ON m.id = fp.market_id
+        AND m.organization_id = fp.organization_id
+       JOIN organizations o ON o.id = fp.organization_id
+       LEFT JOIN booths b
+         ON b.floor_plan_id = fp.id
+        AND b.organization_id = fp.organization_id
+        AND b.market_id = fp.market_id
+        AND b.status = 'active'
+       WHERE fp.market_id = :marketId
+         AND fp.status = 'active'
+         AND m.status = 'active'
+         AND o.status = 'active'
+       GROUP BY fp.id
+       ORDER BY fp.start_date DESC, fp.id DESC`,
+      { marketId },
+    );
+
+    return ok(res, rows.map(mapFloorPlan));
   }),
 );
 
