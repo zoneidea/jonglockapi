@@ -12,6 +12,89 @@ const { conflict } = require('../../utils/errors');
 
 const router = express.Router();
 
+function mapMarket(row) {
+  const galleryImages = row.gallery_images
+    ? String(row.gallery_images).split('||').filter(Boolean)
+    : [];
+
+  return {
+    id: row.id,
+    organizationId: row.organization_id,
+    code: row.code,
+    name: row.name,
+    description: row.description || '',
+    mainImageUrl: row.main_image_url || galleryImages[0] || '',
+    address: row.address || '',
+    openingHours: row.opening_hours || '',
+    phone: row.phone || '',
+    lineId: row.line_id || '',
+    email: row.email || '',
+    openDate: row.open_date,
+    closeDate: row.close_date,
+    galleryImages,
+  };
+}
+
+router.get(
+  '/markets',
+  asyncHandler(async (req, res) => {
+    const search = String(req.query.q || '').trim();
+    const params = {};
+    const where = [`m.status = 'active'`, `o.status = 'active'`];
+
+    if (search) {
+      where.push(`(m.name LIKE :search OR m.code LIKE :search OR o.name LIKE :search)`);
+      params.search = `%${search}%`;
+    }
+
+    const rows = await query(
+      `SELECT
+          m.id, m.organization_id, m.code, m.name, m.description, m.main_image_url,
+          m.address, m.opening_hours, m.phone, m.line_id, m.email, m.open_date, m.close_date,
+          GROUP_CONCAT(mi.image_url ORDER BY mi.sort_order ASC, mi.id DESC SEPARATOR '||') AS gallery_images
+       FROM markets m
+       JOIN organizations o ON o.id = m.organization_id
+       LEFT JOIN market_images mi
+         ON mi.market_id = m.id
+        AND mi.organization_id = m.organization_id
+        AND mi.status = 'active'
+       WHERE ${where.join(' AND ')}
+       GROUP BY m.id
+       ORDER BY m.name ASC`,
+      params,
+    );
+
+    return ok(res, rows.map(mapMarket));
+  }),
+);
+
+router.get(
+  '/markets/:marketId',
+  asyncHandler(async (req, res) => {
+    const marketId = Number(req.params.marketId);
+    const rows = await query(
+      `SELECT
+          m.id, m.organization_id, m.code, m.name, m.description, m.main_image_url,
+          m.address, m.opening_hours, m.phone, m.line_id, m.email, m.open_date, m.close_date,
+          GROUP_CONCAT(mi.image_url ORDER BY mi.sort_order ASC, mi.id DESC SEPARATOR '||') AS gallery_images
+       FROM markets m
+       JOIN organizations o ON o.id = m.organization_id
+       LEFT JOIN market_images mi
+         ON mi.market_id = m.id
+        AND mi.organization_id = m.organization_id
+        AND mi.status = 'active'
+       WHERE m.id = :marketId
+         AND m.status = 'active'
+         AND o.status = 'active'
+       GROUP BY m.id
+       LIMIT 1`,
+      { marketId },
+    );
+
+    return ok(res, rows[0] ? mapMarket(rows[0]) : null);
+  }),
+);
+
 router.get(
   '/subscription/overview',
   asyncHandler(async (req, res) => {
