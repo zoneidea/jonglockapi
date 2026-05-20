@@ -18,6 +18,19 @@ Server default: `http://localhost:3000`
 - Mobile: `/api/mobile/*`
 - Mobile audit app: `/api/mobile/audit/*`
 - Management: `/api/management/*`
+- Location master data: `/api/locations/*`, `/api/public/locations/*`, `/api/mobile/locations/*`, `/api/management/locations/*`
+
+## Location Master Data
+
+ข้อมูลจังหวัด อำเภอ/เขต ตำบล/แขวง และรหัสไปรษณีย์ seed จาก `parsilver/thailand-provinces` ผ่าน migration `019_thailand_location_master_data.sql`.
+
+```text
+GET /api/locations/geographies
+GET /api/locations/provinces?geographyId=2&q=กรุงเทพ
+GET /api/locations/amphures?provinceId=1&q=จตุจักร
+GET /api/locations/subdistricts?amphureId=30&q=จอมพล
+GET /api/locations/address/:districtId
+```
 
 ## Notes
 

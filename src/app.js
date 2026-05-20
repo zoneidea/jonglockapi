@@ -12,6 +12,7 @@ const managementRoutes = require('./modules/management/management.routes');
 const auditRoutes = require('./modules/audit/audit.routes');
 const paymentRoutes = require('./modules/payments/payments.routes');
 const publicRoutes = require('./modules/public/public.routes');
+const masterDataRoutes = require('./modules/master-data/master-data.routes');
 const { notFoundHandler, errorHandler } = require('./middlewares/error-handler');
 const { eventLogger } = require('./middlewares/event-logger');
 
@@ -56,6 +57,14 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', service: 'jonglock-backend' });
 });
 
+app.use(`${env.API_PREFIX}/locations`, masterDataRoutes);
+app.use(`${env.API_PREFIX}/public/locations`, masterDataRoutes);
+app.use(`${env.API_PREFIX}/mobile/locations`, masterDataRoutes);
+app.use(`${env.API_PREFIX}/management/locations`, masterDataRoutes);
+app.use('/locations', masterDataRoutes);
+app.use('/public/locations', masterDataRoutes);
+app.use('/mobile/locations', masterDataRoutes);
+app.use('/management/locations', masterDataRoutes);
 app.use(`${env.API_PREFIX}/mobile/audit`, auditRoutes);
 app.use(`${env.API_PREFIX}/mobile/payments`, paymentRoutes);
 app.use(`${env.API_PREFIX}/mobile`, mobileRoutes);
