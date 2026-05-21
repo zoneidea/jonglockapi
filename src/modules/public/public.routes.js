@@ -1265,6 +1265,97 @@ router.post(
 );
 
 router.post(
+  '/bookings/:bookingId/cancel',
+  validate(
+    z.object({
+      body: z.object({
+        user: z.object({
+          email: z.string().email(),
+        }),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({ bookingId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { bookingId } = req.validated.params;
+    const emailHash = blindIndex(String(req.validated.body.user.email || '').trim().toLowerCase());
+
+    const result = await transaction(async (conn) => {
+      const [bookingRows] = await conn.execute(
+        `SELECT
+            b.id, b.public_id, b.organization_id, b.market_id, b.status, b.total_amount,
+            mu.email_hash
+         FROM bookings b
+         JOIN mobile_users mu
+           ON mu.id = b.mobile_user_id
+          AND mu.organization_id = b.organization_id
+         WHERE b.id = :bookingId
+           AND b.source = 'mobile'
+         LIMIT 1
+         FOR UPDATE`,
+        { bookingId },
+      );
+      if (!bookingRows.length) {
+        throw badRequest('Booking not found');
+      }
+
+      const booking = bookingRows[0];
+      if (emailHash !== booking.email_hash) {
+        throw badRequest('Booking owner does not match');
+      }
+      if (booking.status !== 'pending_payment') {
+        throw badRequest('Only pending_payment bookings can be cancelled');
+      }
+
+      await conn.execute(
+        `UPDATE bookings
+         SET status = 'cancelled',
+             cart_visible = 0
+         WHERE id = :bookingId
+           AND organization_id = :organizationId`,
+        {
+          bookingId,
+          organizationId: booking.organization_id,
+        },
+      );
+      await conn.execute(
+        `UPDATE booking_items
+         SET status = 'cancelled'
+         WHERE booking_id = :bookingId
+           AND organization_id = :organizationId
+           AND status = 'pending_payment'`,
+        {
+          bookingId,
+          organizationId: booking.organization_id,
+        },
+      );
+      await conn.execute(
+        `DELETE FROM booth_date_locks
+         WHERE booking_id = :bookingId
+           AND organization_id = :organizationId
+           AND status IN ('held', 'processing')`,
+        {
+          bookingId,
+          organizationId: booking.organization_id,
+        },
+      );
+
+      return {
+        bookingId: booking.id,
+        publicId: booking.public_id,
+        organizationId: booking.organization_id,
+        marketId: booking.market_id,
+        status: 'cancelled',
+        totalAmount: Number(booking.total_amount || 0),
+      };
+    });
+
+    return ok(res, result, 'booking cancelled');
+  }),
+);
+
+router.post(
   '/bookings/history',
   validate(
     z.object({
