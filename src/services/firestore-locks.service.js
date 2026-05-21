@@ -1,11 +1,24 @@
-const admin = require('firebase-admin');
 const env = require('../config/env');
 
 const TEMP_LOCK_COLLECTION = 'booth_temp_locks';
 const MAX_DELETE_BATCH_SIZE = 450;
 
+let admin = null;
 let appInitialized = false;
 let initSkippedReason = '';
+
+function getFirebaseAdmin() {
+  if (admin) return admin;
+  try {
+    // Keep firebase-admin optional so the core API can start on shared hosting
+    // even before npm install has run for this dependency.
+    admin = require('firebase-admin');
+    return admin;
+  } catch {
+    initSkippedReason = 'firebase-admin module is not installed';
+    return null;
+  }
+}
 
 function parseServiceAccountJson() {
   if (!env.FIREBASE_SERVICE_ACCOUNT_JSON) return null;
@@ -34,19 +47,22 @@ function buildServiceAccount() {
 }
 
 function getFirestore() {
+  const firebaseAdmin = getFirebaseAdmin();
+  if (!firebaseAdmin) return null;
+
   if (!appInitialized) {
     const serviceAccount = buildServiceAccount();
     if (!serviceAccount) return null;
 
-    if (!admin.apps.length) {
-      admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
+    if (!firebaseAdmin.apps.length) {
+      firebaseAdmin.initializeApp({
+        credential: firebaseAdmin.credential.cert(serviceAccount),
       });
     }
     appInitialized = true;
   }
 
-  return admin.firestore();
+  return firebaseAdmin.firestore();
 }
 
 async function cleanupExpiredBoothTempLocks(nowMs = Date.now()) {
