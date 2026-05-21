@@ -600,11 +600,11 @@ router.post(
       const publicBookingId = publicId('BK');
       const [bookingResult] = await conn.execute(
         `INSERT INTO bookings (
-          organization_id, public_id, market_id, mobile_user_id, source, status,
+          organization_id, public_id, market_id, mobile_user_id, source, cart_visible, status,
           subtotal_amount, discount_amount, vat_amount, total_amount,
           expires_at
         ) VALUES (
-          :organizationId, :publicId, :marketId, :mobileUserId, 'mobile', 'pending_payment',
+          :organizationId, :publicId, :marketId, :mobileUserId, 'mobile', 0, 'pending_payment',
           :subtotalAmount, :discountAmount, :vatAmount, :totalAmount,
           DATE_ADD(NOW(), INTERVAL ${PAYMENT_EXPIRES_MINUTES} MINUTE)
         )`,
@@ -922,6 +922,88 @@ router.post(
 );
 
 router.post(
+  '/bookings/:bookingId/confirm',
+  validate(
+    z.object({
+      body: z.object({
+        user: z.object({
+          email: z.string().email(),
+        }),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({ bookingId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { bookingId } = req.validated.params;
+    const emailHash = blindIndex(String(req.validated.body.user.email || '').trim().toLowerCase());
+
+    const result = await transaction(async (conn) => {
+      const [bookingRows] = await conn.execute(
+        `SELECT
+            b.id, b.public_id, b.organization_id, b.market_id, b.status, b.expires_at, b.total_amount,
+            mu.email_hash
+         FROM bookings b
+         JOIN mobile_users mu
+           ON mu.id = b.mobile_user_id
+          AND mu.organization_id = b.organization_id
+         WHERE b.id = :bookingId
+           AND b.source = 'mobile'
+           AND b.status = 'pending_payment'
+         LIMIT 1
+         FOR UPDATE`,
+        { bookingId },
+      );
+      if (!bookingRows.length) {
+        throw badRequest('Booking is not available for confirmation');
+      }
+
+      const booking = bookingRows[0];
+      if (emailHash !== booking.email_hash) {
+        throw badRequest('Booking owner does not match');
+      }
+
+      await expireStaleBookings(conn, booking.organization_id);
+      if (!booking.expires_at || new Date(booking.expires_at).getTime() <= Date.now()) {
+        throw badRequest('Booking has expired');
+      }
+
+      const [itemRows] = await conn.execute(
+        `SELECT id
+         FROM booking_items
+         WHERE organization_id = :organizationId
+           AND booking_id = :bookingId
+           AND status = 'pending_payment'
+         LIMIT 1`,
+        { organizationId: booking.organization_id, bookingId },
+      );
+      if (!itemRows.length) {
+        throw badRequest('Booking has no active items');
+      }
+
+      await conn.execute(
+        `UPDATE bookings
+         SET cart_visible = 1
+         WHERE organization_id = :organizationId AND id = :bookingId`,
+        { organizationId: booking.organization_id, bookingId },
+      );
+
+      return {
+        bookingId: booking.id,
+        publicId: booking.public_id,
+        organizationId: booking.organization_id,
+        marketId: booking.market_id,
+        status: booking.status,
+        expiresAt: booking.expires_at,
+        totalAmount: Number(booking.total_amount || 0),
+      };
+    });
+
+    return ok(res, result, 'booking confirmed');
+  }),
+);
+
+router.post(
   '/bookings/cart',
   validate(
     z.object({
@@ -957,6 +1039,7 @@ router.post(
        JOIN organizations o ON o.id = b.organization_id
        WHERE mu.email_hash = :emailHash
          AND b.source = 'mobile'
+         AND b.cart_visible = 1
          AND b.status IN ('pending_payment', 'payment_processing')
          AND b.expires_at IS NOT NULL
          AND b.expires_at > NOW()

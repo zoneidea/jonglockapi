@@ -1,0 +1,2 @@
+ALTER TABLE bookings
+  ADD COLUMN cart_visible TINYINT(1) NOT NULL DEFAULT 1 AFTER source;
