@@ -447,19 +447,41 @@ async function upsertDemoBooking(connection, organizationId, marketId, mobileUse
   return { bookingId: booking.id, bookingItemId: item.id };
 }
 
-async function seedMobileAvailabilityBookings(connection, organizationId, marketId, booths, mobileUsers, products) {
+function addSeedDays(date, days) {
+  const nextDate = new Date(`${date}T00:00:00`);
+  nextDate.setDate(nextDate.getDate() + days);
+  return nextDate.toISOString().slice(0, 10);
+}
+
+function clampSeedDate(date, endDate) {
+  return endDate && date > endDate ? endDate : date;
+}
+
+function buildScenarioDates(offsets, startDate, endDate) {
+  const uniqueDates = new Set(offsets.map((offset) => clampSeedDate(addSeedDays(startDate, offset), endDate)));
+  return Array.from(uniqueDates).filter((date) => !endDate || date <= endDate);
+}
+
+async function seedMobileAvailabilityBookings(connection, organizationId, marketId, booths, mobileUsers, products, options = {}) {
+  const startDate = options.startDate && options.startDate > '2026-05-21' ? options.startDate : '2026-05-21';
+  const endDate = options.endDate || '';
+  const publicIdPrefix = options.publicIdPrefix || 'BK-MOBILE-AVAIL';
+  const paymentIdPrefix = options.paymentIdPrefix || 'PAY-MOBILE-AVAIL';
   const bookingScenarios = [
-    { boothIndex: 0, dates: ['2026-05-21', '2026-05-22', '2026-05-23', '2026-05-24'], status: 'paid' },
-    { boothIndex: 1, dates: ['2026-05-21', '2026-05-23', '2026-05-25'], status: 'payment_processing' },
-    { boothIndex: 2, dates: ['2026-05-22', '2026-05-24', '2026-05-26'], status: 'pending_payment' },
-    { boothIndex: 3, dates: ['2026-05-27', '2026-05-28', '2026-05-29'], status: 'paid' },
-    { boothIndex: 4, dates: ['2026-05-21', '2026-05-28', '2026-06-04'], status: 'payment_processing' },
-    { boothIndex: 5, dates: ['2026-05-30', '2026-05-31', '2026-06-01'], status: 'pending_payment' },
-    { boothIndex: 6, dates: ['2026-06-02', '2026-06-03', '2026-06-04'], status: 'paid' },
-    { boothIndex: 7, dates: ['2026-05-22', '2026-05-29', '2026-06-05'], status: 'payment_processing' },
-    { boothIndex: 8, dates: ['2026-06-06', '2026-06-07', '2026-06-08'], status: 'pending_payment' },
-    { boothIndex: 9, dates: ['2026-05-21', '2026-05-22', '2026-05-23'], status: 'paid' },
-  ];
+    { boothIndex: 0, offsets: [0, 1, 2, 3], status: 'paid' },
+    { boothIndex: 1, offsets: [0, 2, 4], status: 'payment_processing' },
+    { boothIndex: 2, offsets: [1, 3, 5], status: 'pending_payment' },
+    { boothIndex: 3, offsets: [6, 7, 8], status: 'paid' },
+    { boothIndex: 4, offsets: [0, 7, 14], status: 'payment_processing' },
+    { boothIndex: 5, offsets: [9, 10, 11], status: 'pending_payment' },
+    { boothIndex: 6, offsets: [12, 13, 14], status: 'paid' },
+    { boothIndex: 7, offsets: [1, 8, 15], status: 'payment_processing' },
+    { boothIndex: 8, offsets: [16, 17, 18], status: 'pending_payment' },
+    { boothIndex: 9, offsets: [0, 1, 2], status: 'paid' },
+  ].map((scenario) => ({
+    ...scenario,
+    dates: buildScenarioDates(scenario.offsets, startDate, endDate),
+  })).filter((scenario) => scenario.dates.length > 0);
 
   let sequence = 1;
   for (const scenario of bookingScenarios) {
@@ -468,7 +490,7 @@ async function seedMobileAvailabilityBookings(connection, organizationId, market
       const selectedUser = mobileUsers[sequence % mobileUsers.length];
       const selectedProduct = products[sequence % products.length];
       const normalizedDate = bookingDate.replace(/-/g, '');
-      const publicId = `BK-MOBILE-AVAIL-${String(scenario.boothIndex + 1).padStart(2, '0')}-${normalizedDate}`;
+      const publicId = `${publicIdPrefix}-${String(scenario.boothIndex + 1).padStart(2, '0')}-${normalizedDate}`;
       const isPaid = scenario.status === 'paid';
       await upsertDemoBooking(
         connection,
@@ -479,7 +501,7 @@ async function seedMobileAvailabilityBookings(connection, organizationId, market
         selectedProduct.id,
         {
           publicId,
-          paymentPublicId: isPaid ? `PAY-MOBILE-AVAIL-${String(scenario.boothIndex + 1).padStart(2, '0')}-${normalizedDate}` : undefined,
+          paymentPublicId: isPaid ? `${paymentIdPrefix}-${String(scenario.boothIndex + 1).padStart(2, '0')}-${normalizedDate}` : undefined,
           providerReference: `MOCK-${publicId}`,
           bookingDate,
           bookingStatus: scenario.status,
@@ -890,7 +912,53 @@ async function main() {
       booths,
       mobileUsers,
       products,
+      {
+        publicIdPrefix: 'BK-MOBILE-AVAIL',
+        paymentIdPrefix: 'PAY-MOBILE-AVAIL',
+        startDate: '2026-05-21',
+        endDate: '2026-12-31',
+      },
     );
+    const activeFloorPlans = await connection.execute(
+      `SELECT fp.id, DATE_FORMAT(fp.start_date, '%Y-%m-%d') AS start_date,
+              DATE_FORMAT(fp.end_date, '%Y-%m-%d') AS end_date
+       FROM floor_plans fp
+       WHERE fp.organization_id = :organizationId
+         AND fp.market_id = :marketId
+         AND fp.status = 'active'
+         AND fp.id <> :floorPlanId
+       ORDER BY fp.id`,
+      { organizationId, marketId: market.id, floorPlanId: floorPlan.id },
+    );
+    let seededExtraFloorPlanAvailabilityBookings = 0;
+    for (const activeFloorPlan of activeFloorPlans[0]) {
+      const [floorPlanBooths] = await connection.execute(
+        `SELECT id, price
+         FROM booths
+         WHERE organization_id = :organizationId
+           AND market_id = :marketId
+           AND floor_plan_id = :floorPlanId
+           AND status = 'active'
+         ORDER BY sort_order ASC, code ASC, name ASC`,
+        { organizationId, marketId: market.id, floorPlanId: activeFloorPlan.id },
+      );
+      if (!floorPlanBooths.length) continue;
+
+      seededExtraFloorPlanAvailabilityBookings += await seedMobileAvailabilityBookings(
+        connection,
+        organizationId,
+        market.id,
+        floorPlanBooths,
+        mobileUsers,
+        products,
+        {
+          publicIdPrefix: `BK-MOBILE-FP${activeFloorPlan.id}`,
+          paymentIdPrefix: `PAY-MOBILE-FP${activeFloorPlan.id}`,
+          startDate: activeFloorPlan.start_date || '2026-05-21',
+          endDate: activeFloorPlan.end_date || '',
+        },
+      );
+    }
     const failedIndexes = new Set([1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31, 34]);
     const warningIndexes = new Set([5, 11, 17, 23, 29]);
     const seededBookings = [];
@@ -1061,6 +1129,7 @@ async function main() {
         bookingItemId: demoBooking.bookingItemId,
         seededCustomerCount: mobileUsers.length,
         seededMobileAvailabilityBookings,
+        seededExtraFloorPlanAvailabilityBookings,
         seededPaidBookings: seededBookings.length + 1,
       },
       'Demo seed completed',
@@ -1074,6 +1143,7 @@ async function main() {
     console.log(`bookingItemId=${demoBooking.bookingItemId}`);
     console.log(`seededCustomerCount=${mobileUsers.length}`);
     console.log(`seededMobileAvailabilityBookings=${seededMobileAvailabilityBookings}`);
+    console.log(`seededExtraFloorPlanAvailabilityBookings=${seededExtraFloorPlanAvailabilityBookings}`);
     console.log(`seededPaidBookings=${seededBookings.length + 1}`);
     console.log('management users: admin / marketadmin / accounting / audit');
     console.log(`management password: ${DEFAULT_ADMIN_PASSWORD}`);

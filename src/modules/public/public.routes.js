@@ -353,6 +353,7 @@ router.post(
       {
         organizationId: floorPlan.organization_id,
         marketId: floorPlan.market_id,
+        floorPlanId,
         ...dateParams(dates),
       },
     );
