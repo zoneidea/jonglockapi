@@ -1,11 +1,14 @@
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 const bcrypt = require('bcryptjs');
+const multer = require('multer');
 const { z } = require('zod');
 const { query, transaction } = require('../../config/db');
 const { validate } = require('../../middlewares/validate');
 const { asyncHandler } = require('../../utils/async-handler');
 const { ok, created } = require('../../utils/api-response');
-const { blindIndex, encryptField } = require('../../utils/crypto');
+const { blindIndex, decryptField, encryptField } = require('../../utils/crypto');
 const { publicId } = require('../../utils/id');
 const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/password-policy');
 const { badRequest, conflict } = require('../../utils/errors');
@@ -13,8 +16,39 @@ const { expireStaleBookings } = require('../../utils/booking-status');
 const { attachBookingItemToLock, insertBoothDateLock } = require('../../utils/booth-locks');
 const { PAYMENT_EXPIRES_MINUTES } = require('../../constants/booking');
 const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
+const { getFirebaseAuth, getFirebaseInitReason } = require('../../services/firebase-admin.service');
 
 const router = express.Router();
+const uploadRoot = path.join(__dirname, '..', '..', '..', 'uploads');
+const allowedImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+const profileUpload = multer({
+  storage: multer.diskStorage({
+    destination(req, file, callback) {
+      const destination = path.join(uploadRoot, 'public-profiles');
+      fs.mkdirSync(destination, { recursive: true });
+      callback(null, destination);
+    },
+    filename(req, file, callback) {
+      const extension = path.extname(file.originalname || '').toLowerCase();
+      const safeName = path
+        .basename(file.originalname || 'profile-image', extension)
+        .replace(/[^a-zA-Z0-9-_]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 80) || 'profile-image';
+      callback(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}-${safeName}${extension}`);
+    },
+  }),
+  limits: { files: 1, fileSize: 5 * 1024 * 1024 },
+  fileFilter(req, file, callback) {
+    if (!allowedImageTypes.has(file.mimetype)) return callback(badRequest('Only JPG, PNG, WEBP, and GIF images are allowed'));
+    return callback(null, true);
+  },
+});
+
+function publicUploadUrl(req, filePath) {
+  const relativePath = path.relative(uploadRoot, filePath).split(path.sep).join('/');
+  return `${req.protocol}://${req.get('host')}/uploads/${relativePath}`;
+}
 
 function mapMarket(row) {
   const galleryImages = row.gallery_images
@@ -128,6 +162,12 @@ function normalizeNameParts(name, fallbackEmail) {
   };
 }
 
+function normalizeDisplayName(name, fallbackEmail) {
+  const cleanName = String(name || '').trim();
+  if (cleanName) return cleanName;
+  return String(fallbackEmail || '').split('@')[0] || 'Jonglock User';
+}
+
 async function findOrCreatePublicMobileUser(conn, organizationId, user) {
   const email = String(user.email || '').trim().toLowerCase();
   if (!email) {
@@ -173,6 +213,99 @@ async function findOrCreatePublicMobileUser(conn, organizationId, user) {
     },
   );
   return result.insertId;
+}
+
+async function findOrCreatePublicProfile(conn, user) {
+  const email = String(user.email || '').trim().toLowerCase();
+  if (!email) {
+    throw badRequest('user.email is required');
+  }
+
+  const emailHash = blindIndex(email);
+  const [existingRows] = await conn.execute(
+    `SELECT id,
+            public_id,
+            display_name_enc,
+            email_enc,
+            phone_enc,
+            phone_verified_at,
+            firebase_uid,
+            avatar_url,
+            address_enc,
+            province_id,
+            amphure_id,
+            subdistrict_id,
+            pdpa_terms_accepted_at,
+            pdpa_marketing_accepted_at,
+            notification_enabled
+     FROM public_user_profiles
+     WHERE email_hash = :emailHash
+     LIMIT 1`,
+    { emailHash },
+  );
+  if (existingRows.length) {
+    return existingRows[0];
+  }
+
+  const displayName = normalizeDisplayName(user.name, email);
+  const [result] = await conn.execute(
+    `INSERT INTO public_user_profiles (
+      public_id, display_name_enc, email_enc, email_hash
+    ) VALUES (
+      :publicId, :displayNameEnc, :emailEnc, :emailHash
+    )`,
+    {
+      publicId: publicId('PU'),
+      displayNameEnc: encryptField(displayName),
+      emailEnc: encryptField(email),
+      emailHash,
+    },
+  );
+  const [createdRows] = await conn.execute(
+    `SELECT id,
+            public_id,
+            display_name_enc,
+            email_enc,
+            phone_enc,
+            phone_verified_at,
+            firebase_uid,
+            avatar_url,
+            address_enc,
+            province_id,
+            amphure_id,
+            subdistrict_id,
+            pdpa_terms_accepted_at,
+            pdpa_marketing_accepted_at,
+            notification_enabled
+     FROM public_user_profiles
+     WHERE id = :id
+     LIMIT 1`,
+    { id: result.insertId },
+  );
+  return createdRows[0];
+}
+
+function mapPublicProfile(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    publicId: row.public_id,
+    name: decryptField(row.display_name_enc) || '',
+    email: decryptField(row.email_enc) || '',
+    phone: decryptField(row.phone_enc) || '',
+    phoneVerifiedAt: row.phone_verified_at,
+    firebaseUid: row.firebase_uid || '',
+    avatarUrl: row.avatar_url || '',
+    address: decryptField(row.address_enc) || '',
+    provinceId: row.province_id ? Number(row.province_id) : null,
+    amphureId: row.amphure_id ? Number(row.amphure_id) : null,
+    subdistrictId: row.subdistrict_id ? Number(row.subdistrict_id) : null,
+    pdpaTermsAccepted: Boolean(row.pdpa_terms_accepted_at),
+    pdpaTermsAcceptedAt: row.pdpa_terms_accepted_at,
+    pdpaMarketingAccepted: Boolean(row.pdpa_marketing_accepted_at),
+    pdpaMarketingAcceptedAt: row.pdpa_marketing_accepted_at,
+    notificationEnabled: Number(row.notification_enabled || 0) === 1,
+  };
 }
 
 function calculateCouponDiscount(coupon, subtotalAmount) {
@@ -1212,6 +1345,269 @@ router.post(
       bookingDates: booking.booking_dates ? String(booking.booking_dates).split('||').filter(Boolean) : [],
       boothNames: booking.booth_names ? String(booking.booth_names).split('||').filter(Boolean) : [],
     })));
+  }),
+);
+
+router.post(
+  '/profile/me',
+  validate(
+    z.object({
+      body: z.object({
+        user: z.object({
+          email: z.string().email(),
+          name: z.string().optional().default(''),
+        }),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const profile = await transaction(async (conn) => findOrCreatePublicProfile(conn, req.validated.body.user));
+    return ok(res, mapPublicProfile(profile));
+  }),
+);
+
+router.post(
+  '/profile/address',
+  validate(
+    z.object({
+      body: z.object({
+        user: z.object({
+          email: z.string().email(),
+          name: z.string().optional().default(''),
+        }),
+        address: z.string().optional().default(''),
+        provinceId: z.coerce.number().int().positive().nullable().optional(),
+        amphureId: z.coerce.number().int().positive().nullable().optional(),
+        subdistrictId: z.coerce.number().int().positive().nullable().optional(),
+        pdpaTermsAccepted: z.boolean(),
+        pdpaMarketingAccepted: z.boolean(),
+        notificationEnabled: z.boolean().optional().default(true),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const body = req.validated.body;
+    const profile = await transaction(async (conn) => {
+      const current = await findOrCreatePublicProfile(conn, body.user);
+      await conn.execute(
+        `UPDATE public_user_profiles
+         SET address_enc = :addressEnc,
+             province_id = :provinceId,
+             amphure_id = :amphureId,
+             subdistrict_id = :subdistrictId,
+             pdpa_terms_accepted_at = :pdpaTermsAcceptedAt,
+             pdpa_marketing_accepted_at = :pdpaMarketingAcceptedAt,
+             notification_enabled = :notificationEnabled
+         WHERE id = :id`,
+        {
+          id: current.id,
+          addressEnc: encryptField(body.address),
+          provinceId: body.provinceId || null,
+          amphureId: body.amphureId || null,
+          subdistrictId: body.subdistrictId || null,
+          pdpaTermsAcceptedAt: body.pdpaTermsAccepted ? new Date() : null,
+          pdpaMarketingAcceptedAt: body.pdpaMarketingAccepted ? new Date() : null,
+          notificationEnabled: body.notificationEnabled ? 1 : 0,
+        },
+      );
+      const [rows] = await conn.execute(
+        `SELECT id,
+                public_id,
+                display_name_enc,
+                email_enc,
+                phone_enc,
+                phone_verified_at,
+                firebase_uid,
+                avatar_url,
+                address_enc,
+                province_id,
+                amphure_id,
+                subdistrict_id,
+                pdpa_terms_accepted_at,
+                pdpa_marketing_accepted_at,
+                notification_enabled
+         FROM public_user_profiles
+         WHERE id = :id
+         LIMIT 1`,
+        { id: current.id },
+      );
+      return rows[0];
+    });
+    return ok(res, mapPublicProfile(profile), 'profile address updated');
+  }),
+);
+
+router.post(
+  '/profile/password',
+  validate(
+    z.object({
+      body: z.object({
+        user: z.object({
+          email: z.string().email(),
+          name: z.string().optional().default(''),
+        }),
+        currentPassword: z.string().optional().default(''),
+        newPassword: z.string().min(10).refine(assertPasswordPolicy, PASSWORD_POLICY_MESSAGE),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const body = req.validated.body;
+    await transaction(async (conn) => {
+      const current = await findOrCreatePublicProfile(conn, body.user);
+      const [rows] = await conn.execute(
+        `SELECT id, password_hash
+         FROM public_user_profiles
+         WHERE id = :id
+         LIMIT 1`,
+        { id: current.id },
+      );
+      const row = rows[0];
+      if (row?.password_hash && body.currentPassword) {
+        const valid = await bcrypt.compare(body.currentPassword, row.password_hash);
+        if (!valid) {
+          throw badRequest('Current password is incorrect');
+        }
+      }
+      await conn.execute(
+        `UPDATE public_user_profiles
+         SET password_hash = :passwordHash
+         WHERE id = :id`,
+        {
+          id: current.id,
+          passwordHash: await bcrypt.hash(body.newPassword, 12),
+        },
+      );
+    });
+    return ok(res, { updated: true }, 'password updated');
+  }),
+);
+
+router.post(
+  '/profile/phone/verify',
+  validate(
+    z.object({
+      body: z.object({
+        user: z.object({
+          email: z.string().email(),
+          name: z.string().optional().default(''),
+        }),
+        firebaseIdToken: z.string().min(1),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const auth = getFirebaseAuth();
+    if (!auth) {
+      throw badRequest(getFirebaseInitReason());
+    }
+    const decoded = await auth.verifyIdToken(req.validated.body.firebaseIdToken);
+    const phoneNumber = String(decoded.phone_number || '').trim();
+    if (!phoneNumber) {
+      throw badRequest('Firebase token does not contain a verified phone number');
+    }
+
+    const profile = await transaction(async (conn) => {
+      const current = await findOrCreatePublicProfile(conn, req.validated.body.user);
+      await conn.execute(
+        `UPDATE public_user_profiles
+         SET phone_enc = :phoneEnc,
+             phone_hash = :phoneHash,
+             phone_verified_at = NOW(),
+             firebase_uid = :firebaseUid
+         WHERE id = :id`,
+        {
+          id: current.id,
+          phoneEnc: encryptField(phoneNumber),
+          phoneHash: blindIndex(phoneNumber),
+          firebaseUid: decoded.uid || null,
+        },
+      );
+      const [rows] = await conn.execute(
+        `SELECT id,
+                public_id,
+                display_name_enc,
+                email_enc,
+                phone_enc,
+                phone_verified_at,
+                firebase_uid,
+                avatar_url,
+                address_enc,
+                province_id,
+                amphure_id,
+                subdistrict_id,
+                pdpa_terms_accepted_at,
+                pdpa_marketing_accepted_at,
+                notification_enabled
+         FROM public_user_profiles
+         WHERE id = :id
+         LIMIT 1`,
+        { id: current.id },
+      );
+      return rows[0];
+    });
+    return ok(res, mapPublicProfile(profile), 'phone verified');
+  }),
+);
+
+router.post(
+  '/profile/avatar',
+  profileUpload.single('image'),
+  asyncHandler(async (req, res) => {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const name = String(req.body?.name || '').trim();
+    if (!email) {
+      throw badRequest('email is required');
+    }
+    if (!req.file) {
+      throw badRequest('image is required');
+    }
+
+    const avatarUrl = publicUploadUrl(req, req.file.path);
+    const profile = await transaction(async (conn) => {
+      const current = await findOrCreatePublicProfile(conn, { email, name });
+      await conn.execute(
+        `UPDATE public_user_profiles
+         SET avatar_url = :avatarUrl
+         WHERE id = :id`,
+        {
+          id: current.id,
+          avatarUrl,
+        },
+      );
+      const [rows] = await conn.execute(
+        `SELECT id,
+                public_id,
+                display_name_enc,
+                email_enc,
+                phone_enc,
+                phone_verified_at,
+                firebase_uid,
+                avatar_url,
+                address_enc,
+                province_id,
+                amphure_id,
+                subdistrict_id,
+                pdpa_terms_accepted_at,
+                pdpa_marketing_accepted_at,
+                notification_enabled
+         FROM public_user_profiles
+         WHERE id = :id
+         LIMIT 1`,
+        { id: current.id },
+      );
+      return rows[0];
+    });
+
+    return ok(res, mapPublicProfile(profile), 'avatar uploaded');
   }),
 );
 
