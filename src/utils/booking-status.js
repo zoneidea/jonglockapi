@@ -29,6 +29,7 @@ async function expireStaleBookings(executor, organizationId) {
     ? queryResult[0]
     : queryResult;
 
+  let bookingLockDeleteResult = { affectedRows: 0 };
   if (expiredBookingIds.length) {
     const placeholders = expiredBookingIds.map((_, index) => `:bookingId${index}`).join(', ');
     const params = expiredBookingIds.reduce((values, id, index) => {
@@ -36,19 +37,35 @@ async function expireStaleBookings(executor, organizationId) {
       return values;
     }, { organizationId });
 
-    await executor.execute(
+    const deleteResult = await executor.execute(
       `DELETE FROM booth_date_locks
        WHERE organization_id = :organizationId
          AND booking_id IN (${placeholders})
          AND status IN ('held', 'processing')`,
       params,
     );
+    bookingLockDeleteResult = Array.isArray(deleteResult) && deleteResult[0]?.affectedRows !== undefined
+      ? deleteResult[0]
+      : deleteResult;
   }
+
+  const expiredLockDeleteResult = await executor.execute(
+    `DELETE FROM booth_date_locks
+     WHERE organization_id = :organizationId
+       AND status IN ('held', 'processing')
+       AND expires_at IS NOT NULL
+       AND expires_at <= NOW()`,
+    { organizationId },
+  );
+  const expiredLockResult = Array.isArray(expiredLockDeleteResult) && expiredLockDeleteResult[0]?.affectedRows !== undefined
+    ? expiredLockDeleteResult[0]
+    : expiredLockDeleteResult;
+  const releasedLocks = Number(bookingLockDeleteResult.affectedRows || 0) + Number(expiredLockResult.affectedRows || 0);
 
   return {
     expiredBookings: expiredBookingIds.length,
     affectedRows: result.affectedRows || 0,
-    releasedLocks: expiredBookingIds.length,
+    releasedLocks,
   };
 }
 

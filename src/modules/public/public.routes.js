@@ -922,6 +922,133 @@ router.post(
 );
 
 router.post(
+  '/bookings/cart',
+  validate(
+    z.object({
+      body: z.object({
+        user: z.object({
+          email: z.string().email(),
+        }),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const organizations = await query(`SELECT id FROM organizations WHERE status = 'active'`, {});
+    for (const organization of organizations) {
+      await expireStaleBookings({ execute: query }, organization.id);
+    }
+
+    const emailHash = blindIndex(String(req.validated.body.user.email || '').trim().toLowerCase());
+    const bookings = await query(
+      `SELECT
+          b.id, b.public_id, b.organization_id, b.market_id, b.status, b.expires_at,
+          b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
+          m.name AS market_name, m.main_image_url AS market_image_url,
+          o.vat_enabled, o.vat_rate
+       FROM bookings b
+       JOIN mobile_users mu
+         ON mu.id = b.mobile_user_id
+        AND mu.organization_id = b.organization_id
+       JOIN markets m
+         ON m.id = b.market_id
+        AND m.organization_id = b.organization_id
+       JOIN organizations o ON o.id = b.organization_id
+       WHERE mu.email_hash = :emailHash
+         AND b.source = 'mobile'
+         AND b.status IN ('pending_payment', 'payment_processing')
+         AND b.expires_at IS NOT NULL
+         AND b.expires_at > NOW()
+       ORDER BY b.expires_at ASC, b.created_at DESC
+       LIMIT 100`,
+      { emailHash },
+    );
+
+    if (!bookings.length) {
+      return ok(res, []);
+    }
+
+    const bookingIds = bookings.map((booking) => booking.id);
+    const bookingIdParams = dateParams(bookingIds);
+    const items = await query(
+      `SELECT
+          bi.id, bi.booking_id, bi.booth_id, DATE_FORMAT(bi.booking_date, '%Y-%m-%d') AS booking_date,
+          bi.unit_price, bo.code AS booth_code, bo.name AS booth_name
+       FROM booking_items bi
+       JOIN booths bo
+         ON bo.id = bi.booth_id
+        AND bo.organization_id = bi.organization_id
+       WHERE bi.booking_id IN (${datePlaceholders(bookingIds)})
+         AND bi.status IN ('pending_payment', 'payment_processing')
+       ORDER BY bi.booking_date ASC, bi.id ASC`,
+      bookingIdParams,
+    );
+    const accessories = await query(
+      `SELECT
+          bi.booking_id, a.id, a.name, a.image_url, a.price,
+          SUM(ba.quantity) AS quantity,
+          SUM(ba.quantity * a.price) AS line_total
+       FROM booking_accessories ba
+       JOIN booking_items bi
+         ON bi.id = ba.booking_item_id
+        AND bi.organization_id = ba.organization_id
+       JOIN accessories a
+         ON a.id = ba.accessory_id
+        AND a.organization_id = ba.organization_id
+       WHERE bi.booking_id IN (${datePlaceholders(bookingIds)})
+       GROUP BY bi.booking_id, a.id, a.name, a.image_url, a.price
+       ORDER BY a.name ASC`,
+      bookingIdParams,
+    );
+
+    const itemsByBookingId = new Map();
+    items.forEach((item) => {
+      const list = itemsByBookingId.get(item.booking_id) || [];
+      list.push({
+        id: item.id,
+        boothId: item.booth_id,
+        boothCode: item.booth_code,
+        boothName: item.booth_name,
+        bookingDate: item.booking_date,
+        unitPrice: Number(item.unit_price || 0),
+      });
+      itemsByBookingId.set(item.booking_id, list);
+    });
+
+    const accessoriesByBookingId = new Map();
+    accessories.forEach((accessory) => {
+      const list = accessoriesByBookingId.get(accessory.booking_id) || [];
+      list.push(mapAccessory({
+        ...accessory,
+        stock_quantity: 0,
+        gross_price: accessory.price,
+      }, Number(accessory.quantity || 0), Number(accessory.line_total || 0)));
+      accessoriesByBookingId.set(accessory.booking_id, list);
+    });
+
+    return ok(res, bookings.map((booking) => ({
+      bookingId: booking.id,
+      publicId: booking.public_id,
+      organizationId: booking.organization_id,
+      marketId: booking.market_id,
+      marketName: booking.market_name,
+      marketImageUrl: booking.market_image_url || '',
+      status: booking.status,
+      expiresAt: booking.expires_at,
+      subtotalAmount: Number(booking.subtotal_amount || 0),
+      discountAmount: Number(booking.discount_amount || 0),
+      vatAmount: Number(booking.vat_amount || 0),
+      totalAmount: Number(booking.total_amount || 0),
+      vatEnabled: Number(booking.vat_enabled || 0) === 1,
+      vatRate: Number(booking.vat_rate || 0),
+      items: itemsByBookingId.get(booking.id) || [],
+      accessories: accessoriesByBookingId.get(booking.id) || [],
+    })));
+  }),
+);
+
+router.post(
   '/booths/:boothId/availability',
   validate(
     z.object({

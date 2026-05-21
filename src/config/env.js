@@ -22,6 +22,10 @@ const envSchema = z.object({
   RATE_LIMIT_WINDOW_MS: z.coerce.number().default(15 * 60 * 1000),
   RATE_LIMIT_MAX: z.coerce.number().default(300),
   CRON_SECRET: z.string().default(''),
+  FIREBASE_SERVICE_ACCOUNT_JSON: z.string().default(''),
+  FIREBASE_PROJECT_ID: z.string().default(''),
+  FIREBASE_CLIENT_EMAIL: z.string().default(''),
+  FIREBASE_PRIVATE_KEY: z.string().default(''),
 });
 
 const parsed = envSchema.safeParse(process.env);

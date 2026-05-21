@@ -5,6 +5,7 @@ const { asyncHandler } = require('../../utils/async-handler');
 const { ok } = require('../../utils/api-response');
 const { forbidden } = require('../../utils/errors');
 const { expireStaleBookings } = require('../../utils/booking-status');
+const { cleanupExpiredBoothTempLocks } = require('../../services/firestore-locks.service');
 
 const router = express.Router();
 
@@ -26,11 +27,13 @@ const expireBookingsHandler = asyncHandler(async (req, res) => {
     const result = await expireStaleBookings({ execute: query }, organization.id);
     results.push({ organizationId: organization.id, ...result });
   }
+  const firestoreCleanup = await cleanupExpiredBoothTempLocks();
 
   return ok(res, {
     checkedOrganizations: results.length,
     expiredBookings: results.reduce((total, item) => total + Number(item.expiredBookings || 0), 0),
     releasedLocks: results.reduce((total, item) => total + Number(item.releasedLocks || 0), 0),
+    firestoreCleanup,
     results,
   });
 });
