@@ -88,6 +88,19 @@ function mapBooth(row) {
   };
 }
 
+function mapAccessory(row, quantity = 0, lineTotal = 0) {
+  return {
+    id: row.id,
+    name: row.name,
+    imageUrl: row.image_url || '',
+    price: Number(row.price || 0),
+    grossPrice: Number(row.gross_price || row.price || 0),
+    stockQuantity: Number(row.stock_quantity ?? row.quantity ?? 0),
+    quantity,
+    lineTotal: Number(lineTotal || 0),
+  };
+}
+
 function todayIso() {
   return new Date().toISOString().slice(0, 10);
 }
@@ -160,6 +173,16 @@ async function findOrCreatePublicMobileUser(conn, organizationId, user) {
     },
   );
   return result.insertId;
+}
+
+function calculateCouponDiscount(coupon, subtotalAmount) {
+  if (!coupon) return 0;
+  const subtotal = Number(subtotalAmount || 0);
+  const discountValue = Number(coupon.discount_value || 0);
+  if (coupon.discount_type === 'percent') {
+    return Math.min(Math.round((subtotal * discountValue) / 100 * 100) / 100, subtotal);
+  }
+  return Math.min(discountValue, subtotal);
 }
 
 router.get(
@@ -251,6 +274,43 @@ router.get(
     );
 
     return ok(res, rows.map(mapFloorPlan));
+  }),
+);
+
+router.get(
+  '/markets/:marketId/accessories',
+  validate(
+    z.object({
+      body: z.object({}).passthrough(),
+      query: z.object({}).passthrough(),
+      params: z.object({ marketId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { marketId } = req.validated.params;
+    const rows = await query(
+      `SELECT
+          a.id, a.name, a.image_url, a.price, a.stock_quantity,
+          a.organization_id, a.market_id
+       FROM accessories a
+       JOIN markets m
+         ON m.id = a.market_id
+        AND m.organization_id = a.organization_id
+       JOIN organizations o ON o.id = a.organization_id
+       WHERE a.market_id = :marketId
+         AND a.status = 'active'
+         AND m.status = 'active'
+         AND o.status = 'active'
+       ORDER BY a.name ASC`,
+      { marketId },
+    );
+    if (!rows.length) return ok(res, []);
+
+    const vatSettings = await getOrganizationVatSettings({ execute: query }, rows[0].organization_id);
+    return ok(res, rows.map((row) => mapAccessory({
+      ...row,
+      gross_price: applyVatToAmount(row.price, vatSettings),
+    })));
   }),
 );
 
@@ -618,6 +678,246 @@ router.post(
     });
 
     return created(res, result, 'booth held');
+  }),
+);
+
+router.post(
+  '/bookings/:bookingId/summary',
+  validate(
+    z.object({
+      body: z.object({
+        user: z.object({
+          email: z.string().email(),
+        }),
+        couponCode: z.string().optional().default(''),
+        accessories: z
+          .array(z.object({
+            accessoryId: z.coerce.number().int().positive(),
+            quantity: z.coerce.number().int().min(0).max(99),
+          }))
+          .default([]),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({ bookingId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { bookingId } = req.validated.params;
+    const { user, couponCode } = req.validated.body;
+    const requestedAccessories = req.validated.body.accessories
+      .filter((item) => Number(item.quantity || 0) > 0);
+
+    const result = await transaction(async (conn) => {
+      const [bookingRows] = await conn.execute(
+        `SELECT
+            b.id, b.public_id, b.organization_id, b.market_id, b.status, b.expires_at,
+            mu.email_hash,
+            o.vat_enabled, o.vat_rate
+         FROM bookings b
+         JOIN mobile_users mu
+           ON mu.id = b.mobile_user_id
+          AND mu.organization_id = b.organization_id
+         JOIN organizations o ON o.id = b.organization_id
+         WHERE b.id = :bookingId
+           AND b.source = 'mobile'
+           AND b.status = 'pending_payment'
+           AND b.expires_at IS NOT NULL
+           AND b.expires_at > NOW()
+         LIMIT 1
+         FOR UPDATE`,
+        { bookingId },
+      );
+      if (!bookingRows.length) {
+        throw badRequest('Booking is not available for summary');
+      }
+
+      const booking = bookingRows[0];
+      const emailHash = blindIndex(String(user.email || '').trim().toLowerCase());
+      if (emailHash !== booking.email_hash) {
+        throw badRequest('Booking owner does not match');
+      }
+
+      await expireStaleBookings(conn, booking.organization_id);
+
+      const [itemRows] = await conn.execute(
+        `SELECT
+            bi.id, bi.booth_id, DATE_FORMAT(bi.booking_date, '%Y-%m-%d') AS booking_date,
+            bi.unit_price, bo.code AS booth_code, bo.name AS booth_name
+         FROM booking_items bi
+         JOIN booths bo
+           ON bo.id = bi.booth_id
+          AND bo.organization_id = bi.organization_id
+         WHERE bi.organization_id = :organizationId
+           AND bi.booking_id = :bookingId
+           AND bi.status = 'pending_payment'
+         ORDER BY bi.booking_date ASC, bi.id ASC`,
+        { organizationId: booking.organization_id, bookingId },
+      );
+      if (!itemRows.length) {
+        throw badRequest('Booking has no active items');
+      }
+
+      const bookingItemIds = itemRows.map((item) => item.id);
+      await conn.execute(
+        `DELETE FROM booking_accessories
+         WHERE organization_id = :organizationId
+           AND booking_item_id IN (${datePlaceholders(bookingItemIds)})`,
+        {
+          organizationId: booking.organization_id,
+          ...dateParams(bookingItemIds),
+        },
+      );
+
+      const accessoryIds = Array.from(new Set(requestedAccessories.map((item) => item.accessoryId)));
+      let accessoryRows = [];
+      if (accessoryIds.length) {
+        const [rows] = await conn.execute(
+          `SELECT id, name, image_url, price, stock_quantity
+           FROM accessories
+           WHERE organization_id = :organizationId
+             AND market_id = :marketId
+             AND id IN (${datePlaceholders(accessoryIds)})
+             AND status = 'active'
+           FOR UPDATE`,
+          {
+            organizationId: booking.organization_id,
+            marketId: booking.market_id,
+            ...dateParams(accessoryIds),
+          },
+        );
+        accessoryRows = rows;
+      }
+      const accessoryById = new Map(accessoryRows.map((accessory) => [Number(accessory.id), accessory]));
+      const selectedAccessories = [];
+      for (const requested of requestedAccessories) {
+        const accessory = accessoryById.get(Number(requested.accessoryId));
+        if (!accessory) {
+          throw badRequest(`Accessory ${requested.accessoryId} is not available`);
+        }
+        const quantity = Number(requested.quantity || 0);
+        if (Number(accessory.stock_quantity || 0) > 0 && quantity > Number(accessory.stock_quantity || 0)) {
+          throw badRequest(`Accessory ${accessory.name} exceeds stock quantity`);
+        }
+        const lineTotal = Number(accessory.price || 0) * quantity * itemRows.length;
+        selectedAccessories.push({ ...accessory, quantity, lineTotal });
+
+        for (const item of itemRows) {
+          await conn.execute(
+            `INSERT INTO booking_accessories (organization_id, booking_item_id, accessory_id, quantity)
+             VALUES (:organizationId, :bookingItemId, :accessoryId, :quantity)`,
+            {
+              organizationId: booking.organization_id,
+              bookingItemId: item.id,
+              accessoryId: accessory.id,
+              quantity,
+            },
+          );
+        }
+      }
+
+      const boothSubtotal = itemRows.reduce((total, item) => total + Number(item.unit_price || 0), 0);
+      const accessorySubtotal = selectedAccessories.reduce((total, item) => total + Number(item.lineTotal || 0), 0);
+      const subtotal = boothSubtotal + accessorySubtotal;
+
+      const cleanCouponCode = String(couponCode || '').trim().toUpperCase();
+      let coupon = null;
+      let discountAmount = 0;
+      if (cleanCouponCode) {
+        const [couponRows] = await conn.execute(
+          `SELECT id, code, name, discount_type, discount_value, usage_limit
+           FROM coupons
+           WHERE organization_id = :organizationId
+             AND market_id = :marketId
+             AND UPPER(code) = :couponCode
+             AND status = 'active'
+             AND starts_at <= NOW()
+             AND ends_at >= NOW()
+           LIMIT 1`,
+          {
+            organizationId: booking.organization_id,
+            marketId: booking.market_id,
+            couponCode: cleanCouponCode,
+          },
+        );
+        if (!couponRows.length) {
+          throw badRequest('Coupon is invalid or expired');
+        }
+        coupon = couponRows[0];
+        if (coupon.usage_limit) {
+          const [usageRows] = await conn.execute(
+            `SELECT COUNT(*) AS used_count
+             FROM payments
+             WHERE organization_id = :organizationId
+               AND coupon_id = :couponId
+               AND status = 'paid'`,
+            { organizationId: booking.organization_id, couponId: coupon.id },
+          );
+          if (Number(usageRows[0]?.used_count || 0) >= Number(coupon.usage_limit || 0)) {
+            throw badRequest('Coupon usage limit reached');
+          }
+        }
+        discountAmount = calculateCouponDiscount(coupon, subtotal);
+      }
+
+      const totals = calculateVatBreakdown(subtotal, discountAmount, booking);
+      await conn.execute(
+        `UPDATE bookings
+         SET subtotal_amount = :subtotalAmount,
+             discount_amount = :discountAmount,
+             vat_amount = :vatAmount,
+             total_amount = :totalAmount
+         WHERE id = :bookingId AND organization_id = :organizationId`,
+        {
+          organizationId: booking.organization_id,
+          bookingId,
+          subtotalAmount: totals.subtotalAmount,
+          discountAmount: totals.discountAmount,
+          vatAmount: totals.vatAmount,
+          totalAmount: totals.totalAmount,
+        },
+      );
+
+      const vatSettings = { vat_enabled: booking.vat_enabled, vat_rate: booking.vat_rate };
+      return {
+        bookingId: booking.id,
+        publicId: booking.public_id,
+        status: booking.status,
+        marketId: booking.market_id,
+        expiresAt: booking.expires_at,
+        boothSubtotal,
+        accessorySubtotal,
+        subtotalAmount: totals.subtotalAmount,
+        discountAmount: totals.discountAmount,
+        vatAmount: totals.vatAmount,
+        totalAmount: totals.totalAmount,
+        vatEnabled: Number(booking.vat_enabled || 0) === 1,
+        vatRate: Number(booking.vat_rate || 0),
+        coupon: coupon
+          ? {
+              id: coupon.id,
+              code: coupon.code,
+              name: coupon.name,
+              discountType: coupon.discount_type,
+              discountValue: Number(coupon.discount_value || 0),
+              discountAmount,
+            }
+          : null,
+        items: itemRows.map((item) => ({
+          id: item.id,
+          boothId: item.booth_id,
+          boothCode: item.booth_code,
+          boothName: item.booth_name,
+          bookingDate: item.booking_date,
+          unitPrice: Number(item.unit_price || 0),
+        })),
+        accessories: selectedAccessories.map((accessory) => mapAccessory({
+          ...accessory,
+          gross_price: applyVatToAmount(accessory.price, vatSettings),
+        }, accessory.quantity, accessory.lineTotal)),
+      };
+    });
+
+    return ok(res, result, 'booking summary updated');
   }),
 );
 
