@@ -12,6 +12,8 @@ const { encryptField, blindIndex } = require('../../utils/crypto');
 const { publicId } = require('../../utils/id');
 const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/password-policy');
 const { expireStaleBookings } = require('../../utils/booking-status');
+const { PAYMENT_EXPIRES_MINUTES } = require('../../constants/booking');
+const { attachBookingItemToLock, insertBoothDateLock } = require('../../utils/booth-locks');
 const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
 const { requireSubscriptionForMutations } = require('../../services/subscription.service');
 const authService = require('../auth/auth.service');
@@ -154,15 +156,19 @@ router.get(
     const rows = await query(
       `SELECT
          b.id, b.code, b.name, b.price, b.category_id,
-         CASE WHEN bi.id IS NULL THEN 'available' ELSE bk.status END AS booking_status
+         CASE
+           WHEN bdl.id IS NULL THEN 'available'
+           WHEN bdl.status = 'paid' THEN 'paid'
+           WHEN bdl.status = 'processing' THEN 'payment_processing'
+           ELSE 'pending_payment'
+         END AS booking_status
        FROM booths b
-       LEFT JOIN booking_items bi
-         ON bi.booth_id = b.id
-        AND bi.booking_date = :bookingDate
-        AND bi.status IN ('pending_payment', 'paid', 'payment_processing')
-       LEFT JOIN bookings bk
-         ON bk.id = bi.booking_id
-        AND bk.status IN ('pending_payment', 'paid', 'payment_processing')
+       LEFT JOIN booth_date_locks bdl
+         ON bdl.booth_id = b.id
+        AND bdl.organization_id = b.organization_id
+        AND bdl.market_id = b.market_id
+        AND bdl.booking_date = :bookingDate
+        AND bdl.status IN ('held', 'processing', 'paid')
        WHERE b.organization_id = :organizationId
          AND b.market_id = :marketId
          AND b.status = 'active'
@@ -214,26 +220,13 @@ router.post(
       const pricedItems = [];
       for (const item of items) {
         const [boothRows] = await conn.execute(
-          `SELECT id, price FROM booths
+          `SELECT id, floor_plan_id, price FROM booths
            WHERE id = :boothId AND market_id = :marketId AND organization_id = :organizationId AND status = 'active'
            FOR UPDATE`,
           { boothId: item.boothId, marketId, organizationId: req.auth.organizationId },
         );
         if (!boothRows.length) throw badRequest(`Booth ${item.boothId} is not available`);
 
-        const [locked] = await conn.execute(
-          `SELECT bi.id
-           FROM booking_items bi
-           JOIN bookings bk ON bk.id = bi.booking_id
-           WHERE bi.booth_id = :boothId
-             AND bi.booking_date = :bookingDate
-             AND bi.status IN ('pending_payment', 'paid', 'payment_processing')
-             AND bk.status IN ('pending_payment', 'paid', 'payment_processing')
-           LIMIT 1
-           FOR UPDATE`,
-          { boothId: item.boothId, bookingDate: item.bookingDate },
-        );
-        if (locked.length) throw conflict(`Booth ${item.boothId} has already been booked on ${item.bookingDate}`);
         const unitPrice = Number(boothRows[0].price || 0);
         let accessoryAmount = 0;
         for (const accessory of item.accessories) {
@@ -255,7 +248,7 @@ router.post(
           accessoryAmount += Number(accessoryRows[0].price || 0) * Number(accessory.quantity || 1);
         }
         subtotal += unitPrice + accessoryAmount;
-        pricedItems.push({ ...item, unitPrice });
+        pricedItems.push({ ...item, floorPlanId: boothRows[0].floor_plan_id, unitPrice });
       }
       const totals = calculateVatBreakdown(subtotal, 0, vatSettings);
 
@@ -266,7 +259,7 @@ router.post(
           subtotal_amount, discount_amount, vat_amount, total_amount, expires_at
         ) VALUES (
           :organizationId, :publicId, :marketId, :mobileUserId, 'mobile', 'pending_payment',
-          :subtotalAmount, :discountAmount, :vatAmount, :totalAmount, DATE_ADD(NOW(), INTERVAL 30 MINUTE)
+          :subtotalAmount, :discountAmount, :vatAmount, :totalAmount, DATE_ADD(NOW(), INTERVAL ${PAYMENT_EXPIRES_MINUTES} MINUTE)
         )`,
         {
           organizationId: req.auth.organizationId,
@@ -279,8 +272,24 @@ router.post(
           totalAmount: totals.totalAmount,
         },
       );
+      const [createdBookings] = await conn.execute(
+        `SELECT expires_at FROM bookings WHERE id = :bookingId AND organization_id = :organizationId LIMIT 1`,
+        { organizationId: req.auth.organizationId, bookingId: bookingResult.insertId },
+      );
+      const expiresAt = createdBookings[0]?.expires_at || null;
 
       for (const item of pricedItems) {
+        await insertBoothDateLock(conn, {
+          organizationId: req.auth.organizationId,
+          marketId,
+          floorPlanId: item.floorPlanId,
+          boothId: item.boothId,
+          bookingId: bookingResult.insertId,
+          bookingDate: item.bookingDate,
+          status: 'held',
+          expiresAt,
+        });
+
         const [detailResult] = await conn.execute(
           `INSERT INTO booking_items (
             organization_id, booking_id, booth_id, booking_date, unit_price, status
@@ -295,6 +304,13 @@ router.post(
             unitPrice: item.unitPrice,
           },
         );
+        await attachBookingItemToLock(conn, {
+          organizationId: req.auth.organizationId,
+          bookingId: bookingResult.insertId,
+          boothId: item.boothId,
+          bookingDate: item.bookingDate,
+          bookingItemId: detailResult.insertId,
+        });
 
         for (const productId of item.productIds) {
           await conn.execute(

@@ -386,6 +386,43 @@ async function upsertDemoBooking(connection, organizationId, marketId, mobileUse
     );
   }
 
+  const booth = await one(
+    connection,
+    `SELECT floor_plan_id
+     FROM booths
+     WHERE id = :boothId AND organization_id = :organizationId AND market_id = :marketId
+     LIMIT 1`,
+    { organizationId, marketId, boothId },
+  );
+  if (booth) {
+    await exec(
+      connection,
+      `INSERT INTO booth_date_locks (
+        organization_id, market_id, floor_plan_id, booth_id, booking_id, booking_item_id,
+        booking_date, status, expires_at
+      ) VALUES (
+        :organizationId, :marketId, :floorPlanId, :boothId, :bookingId, :bookingItemId,
+        :bookingDate, :lockStatus, :expiresAt
+      )
+      ON DUPLICATE KEY UPDATE
+        booking_id = VALUES(booking_id),
+        booking_item_id = VALUES(booking_item_id),
+        status = VALUES(status),
+        expires_at = VALUES(expires_at)`,
+      {
+        organizationId,
+        marketId,
+        floorPlanId: booth.floor_plan_id,
+        boothId,
+        bookingId: booking.id,
+        bookingItemId: item.id,
+        bookingDate,
+        lockStatus: bookingStatus === 'paid' ? 'paid' : bookingStatus === 'payment_processing' ? 'processing' : 'held',
+        expiresAt: options.expiresAt || null,
+      },
+    );
+  }
+
   await exec(
     connection,
     `DELETE bp

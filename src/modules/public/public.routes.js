@@ -236,27 +236,19 @@ router.get(
        FROM booths b
        LEFT JOIN product_categories c ON c.id = b.category_id
        LEFT JOIN (
-         SELECT bi.booth_id,
+         SELECT bdl.booth_id,
                 MAX(CASE
-                  WHEN bi.status = 'paid' OR bk.status = 'paid' THEN 2
-                  WHEN bi.status IN ('pending_payment', 'payment_processing')
-                    OR bk.status IN ('pending_payment', 'payment_processing') THEN 1
+                  WHEN bdl.status = 'paid' THEN 2
+                  WHEN bdl.status IN ('held', 'processing') THEN 1
                   ELSE 0
                 END) AS availability_rank
-         FROM booking_items bi
-         JOIN bookings bk ON bk.id = bi.booking_id
-         JOIN booths locked_booth
-           ON locked_booth.id = bi.booth_id
-          AND locked_booth.organization_id = bi.organization_id
-          AND locked_booth.market_id = bk.market_id
-          AND locked_booth.floor_plan_id = :floorPlanId
-         WHERE bi.organization_id = :organizationId
-           AND bk.organization_id = :organizationId
-           AND bk.market_id = :marketId
-           AND bi.booking_date = :bookingDate
-           AND bi.status IN ('pending_payment', 'payment_processing', 'paid')
-           AND bk.status IN ('pending_payment', 'payment_processing', 'paid')
-         GROUP BY bi.booth_id
+         FROM booth_date_locks bdl
+         WHERE bdl.organization_id = :organizationId
+           AND bdl.market_id = :marketId
+           AND bdl.floor_plan_id = :floorPlanId
+           AND bdl.booking_date = :bookingDate
+           AND bdl.status IN ('held', 'processing', 'paid')
+         GROUP BY bdl.booth_id
        ) booking_state ON booking_state.booth_id = b.id
        WHERE b.organization_id = :organizationId
          AND b.market_id = :marketId
@@ -329,27 +321,19 @@ router.post(
     );
 
     const lockedRows = await query(
-      `SELECT bi.booth_id, DATE_FORMAT(bi.booking_date, '%Y-%m-%d') AS booking_date,
+      `SELECT bdl.booth_id, DATE_FORMAT(bdl.booking_date, '%Y-%m-%d') AS booking_date,
               MAX(CASE
-                WHEN bi.status = 'paid' OR bk.status = 'paid' THEN 2
-                WHEN bi.status IN ('pending_payment', 'payment_processing')
-                  OR bk.status IN ('pending_payment', 'payment_processing') THEN 1
+                WHEN bdl.status = 'paid' THEN 2
+                WHEN bdl.status IN ('held', 'processing') THEN 1
                 ELSE 0
               END) AS availability_rank
-       FROM booking_items bi
-       JOIN bookings bk ON bk.id = bi.booking_id
-       JOIN booths locked_booth
-         ON locked_booth.id = bi.booth_id
-        AND locked_booth.organization_id = bi.organization_id
-        AND locked_booth.market_id = bk.market_id
-        AND locked_booth.floor_plan_id = :floorPlanId
-       WHERE bi.organization_id = :organizationId
-         AND bk.organization_id = :organizationId
-         AND bk.market_id = :marketId
-         AND bi.booking_date IN (${datePlaceholders(dates)})
-         AND bi.status IN ('pending_payment', 'payment_processing', 'paid')
-         AND bk.status IN ('pending_payment', 'payment_processing', 'paid')
-       GROUP BY bi.booth_id, bi.booking_date`,
+       FROM booth_date_locks bdl
+       WHERE bdl.organization_id = :organizationId
+         AND bdl.market_id = :marketId
+         AND bdl.floor_plan_id = :floorPlanId
+         AND bdl.booking_date IN (${datePlaceholders(dates)})
+         AND bdl.status IN ('held', 'processing', 'paid')
+       GROUP BY bdl.booth_id, bdl.booking_date`,
       {
         organizationId: floorPlan.organization_id,
         marketId: floorPlan.market_id,
@@ -437,23 +421,19 @@ router.post(
     await expireStaleBookings({ execute: query }, booth.organization_id);
 
     const lockedRows = await query(
-      `SELECT DATE_FORMAT(bi.booking_date, '%Y-%m-%d') AS booking_date,
+      `SELECT DATE_FORMAT(bdl.booking_date, '%Y-%m-%d') AS booking_date,
               MAX(CASE
-                WHEN bi.status = 'paid' OR bk.status = 'paid' THEN 2
-                WHEN bi.status IN ('pending_payment', 'payment_processing')
-                  OR bk.status IN ('pending_payment', 'payment_processing') THEN 1
+                WHEN bdl.status = 'paid' THEN 2
+                WHEN bdl.status IN ('held', 'processing') THEN 1
                 ELSE 0
               END) AS availability_rank
-       FROM booking_items bi
-       JOIN bookings bk ON bk.id = bi.booking_id
-       WHERE bi.organization_id = :organizationId
-         AND bk.organization_id = :organizationId
-         AND bk.market_id = :marketId
-         AND bi.booth_id = :boothId
-         AND bi.booking_date IN (${datePlaceholders(dates)})
-         AND bi.status IN ('pending_payment', 'payment_processing', 'paid')
-         AND bk.status IN ('pending_payment', 'payment_processing', 'paid')
-       GROUP BY bi.booking_date`,
+       FROM booth_date_locks bdl
+       WHERE bdl.organization_id = :organizationId
+         AND bdl.market_id = :marketId
+         AND bdl.booth_id = :boothId
+         AND bdl.booking_date IN (${datePlaceholders(dates)})
+         AND bdl.status IN ('held', 'processing', 'paid')
+       GROUP BY bdl.booking_date`,
       {
         organizationId: booth.organization_id,
         marketId: booth.market_id,

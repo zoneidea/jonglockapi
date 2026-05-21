@@ -9,6 +9,7 @@ const { created, ok } = require('../../utils/api-response');
 const { badRequest, notFound } = require('../../utils/errors');
 const { publicId } = require('../../utils/id');
 const { expireStaleBookings } = require('../../utils/booking-status');
+const { updateBookingLocksStatus } = require('../../utils/booth-locks');
 
 const router = express.Router();
 
@@ -70,6 +71,11 @@ router.post(
         `UPDATE booking_items SET status = 'payment_processing' WHERE booking_id = :bookingId AND organization_id = :organizationId`,
         { bookingId: booking.id, organizationId: req.auth.organizationId },
       );
+      await updateBookingLocksStatus(conn, {
+        organizationId: req.auth.organizationId,
+        bookingId: booking.id,
+        status: 'payment_processing',
+      });
 
       return {
         id: payment.insertId,

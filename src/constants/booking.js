@@ -1,0 +1,6 @@
+const PAYMENT_EXPIRES_MINUTES = 10;
+
+module.exports = {
+  PAYMENT_EXPIRES_MINUTES,
+};
+

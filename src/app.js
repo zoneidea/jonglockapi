@@ -13,6 +13,7 @@ const auditRoutes = require('./modules/audit/audit.routes');
 const paymentRoutes = require('./modules/payments/payments.routes');
 const publicRoutes = require('./modules/public/public.routes');
 const masterDataRoutes = require('./modules/master-data/master-data.routes');
+const cronRoutes = require('./modules/cron/cron.routes');
 const { notFoundHandler, errorHandler } = require('./middlewares/error-handler');
 const { eventLogger } = require('./middlewares/event-logger');
 
@@ -70,8 +71,10 @@ app.use(`${env.API_PREFIX}/mobile/payments`, paymentRoutes);
 app.use(`${env.API_PREFIX}/mobile`, mobileRoutes);
 app.use(`${env.API_PREFIX}/public`, publicRoutes);
 app.use(`${env.API_PREFIX}/management`, managementRoutes);
+app.use(`${env.API_PREFIX}/cron`, cronRoutes);
 app.use('/public', publicRoutes);
 app.use('/management', managementRoutes);
+app.use('/cron', cronRoutes);
 
 app.use(notFoundHandler);
 app.use(errorHandler);

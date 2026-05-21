@@ -21,6 +21,7 @@ const envSchema = z.object({
   CORS_ORIGINS: z.string().default('*'),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().default(15 * 60 * 1000),
   RATE_LIMIT_MAX: z.coerce.number().default(300),
+  CRON_SECRET: z.string().default(''),
 });
 
 const parsed = envSchema.safeParse(process.env);
