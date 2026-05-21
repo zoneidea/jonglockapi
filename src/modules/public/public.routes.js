@@ -8,9 +8,11 @@ const { ok, created } = require('../../utils/api-response');
 const { blindIndex, encryptField } = require('../../utils/crypto');
 const { publicId } = require('../../utils/id');
 const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/password-policy');
-const { conflict } = require('../../utils/errors');
+const { badRequest, conflict } = require('../../utils/errors');
 const { expireStaleBookings } = require('../../utils/booking-status');
-const { applyVatToAmount, getOrganizationVatSettings } = require('../../utils/vat');
+const { attachBookingItemToLock, insertBoothDateLock } = require('../../utils/booth-locks');
+const { PAYMENT_EXPIRES_MINUTES } = require('../../constants/booking');
+const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
 
 const router = express.Router();
 
@@ -96,6 +98,68 @@ function datePlaceholders(dates) {
 
 function dateParams(dates) {
   return dates.reduce((params, date, index) => ({ ...params, [`date${index}`]: date }), {});
+}
+
+function normalizeNameParts(name, fallbackEmail) {
+  const cleanName = String(name || '').trim();
+  if (!cleanName) {
+    return {
+      firstName: fallbackEmail.split('@')[0] || 'Mobile',
+      lastName: '',
+    };
+  }
+  const [firstName, ...lastNameParts] = cleanName.split(/\s+/);
+  return {
+    firstName,
+    lastName: lastNameParts.join(' '),
+  };
+}
+
+async function findOrCreatePublicMobileUser(conn, organizationId, user) {
+  const email = String(user.email || '').trim().toLowerCase();
+  if (!email) {
+    throw badRequest('user.email is required');
+  }
+
+  const emailHash = blindIndex(email);
+  const [existingRows] = await conn.execute(
+    `SELECT id
+     FROM mobile_users
+     WHERE organization_id = :organizationId
+       AND email_hash = :emailHash
+       AND status <> 'deleted'
+     LIMIT 1`,
+    { organizationId, emailHash },
+  );
+  if (existingRows.length) {
+    return existingRows[0].id;
+  }
+
+  const usernameHash = blindIndex(`gmail:${email}`);
+  const { firstName, lastName } = normalizeNameParts(user.name, email);
+  const passwordHash = await bcrypt.hash(publicId('GM'), 12);
+  const [result] = await conn.execute(
+    `INSERT INTO mobile_users (
+      organization_id, public_id, username_hash, password_hash,
+      first_name_enc, last_name_enc, email_enc, email_hash,
+      accepted_consent_at, status
+    ) VALUES (
+      :organizationId, :publicId, :usernameHash, :passwordHash,
+      :firstNameEnc, :lastNameEnc, :emailEnc, :emailHash,
+      NOW(), 'active'
+    )`,
+    {
+      organizationId,
+      publicId: publicId('MB'),
+      usernameHash,
+      passwordHash,
+      firstNameEnc: encryptField(firstName),
+      lastNameEnc: encryptField(lastName),
+      emailEnc: encryptField(email),
+      emailHash,
+    },
+  );
+  return result.insertId;
 }
 
 router.get(
@@ -383,6 +447,177 @@ router.post(
     });
 
     return ok(res, rows);
+  }),
+);
+
+router.post(
+  '/booths/:boothId/hold',
+  validate(
+    z.object({
+      body: z.object({
+        dates: z.array(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).min(1).max(90),
+        user: z.object({
+          email: z.string().email(),
+          name: z.string().optional().default(''),
+        }),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({ boothId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { boothId } = req.validated.params;
+    const requestedDates = Array.from(new Set(req.validated.body.dates)).sort();
+    const result = await transaction(async (conn) => {
+      const [boothRows] = await conn.execute(
+        `SELECT
+            b.id, b.organization_id, b.market_id, b.floor_plan_id, b.price, b.status,
+            DATE_FORMAT(fp.start_date, '%Y-%m-%d') AS start_date,
+            DATE_FORMAT(fp.end_date, '%Y-%m-%d') AS end_date
+         FROM booths b
+         JOIN floor_plans fp
+           ON fp.id = b.floor_plan_id
+          AND fp.organization_id = b.organization_id
+          AND fp.market_id = b.market_id
+         JOIN markets m
+           ON m.id = b.market_id
+          AND m.organization_id = b.organization_id
+         JOIN organizations o ON o.id = b.organization_id
+         WHERE b.id = :boothId
+           AND b.status = 'active'
+           AND fp.status = 'active'
+           AND m.status = 'active'
+           AND o.status = 'active'
+         LIMIT 1
+         FOR UPDATE`,
+        { boothId },
+      );
+      if (!boothRows.length) {
+        throw badRequest('Booth is not available');
+      }
+
+      const booth = boothRows[0];
+      await expireStaleBookings(conn, booth.organization_id);
+
+      const startDate = booth.start_date ? String(booth.start_date).slice(0, 10) : '';
+      const endDate = booth.end_date ? String(booth.end_date).slice(0, 10) : '';
+      const today = todayIso();
+      const validDates = requestedDates.filter((date) => {
+        if (date < today) return false;
+        if (startDate && date < startDate) return false;
+        if (endDate && date > endDate) return false;
+        return true;
+      });
+      if (!validDates.length) {
+        throw badRequest('No valid booking dates');
+      }
+
+      const [lockedRows] = await conn.execute(
+        `SELECT DATE_FORMAT(booking_date, '%Y-%m-%d') AS booking_date
+         FROM booth_date_locks
+         WHERE organization_id = :organizationId
+           AND booth_id = :boothId
+           AND booking_date IN (${datePlaceholders(validDates)})
+           AND status IN ('held', 'processing', 'paid')
+         FOR UPDATE`,
+        {
+          organizationId: booth.organization_id,
+          boothId,
+          ...dateParams(validDates),
+        },
+      );
+      const unavailableDateSet = new Set(lockedRows.map((row) => String(row.booking_date).slice(0, 10)));
+      const lockedDates = validDates.filter((date) => !unavailableDateSet.has(date));
+      const unavailableDates = requestedDates.filter((date) => !lockedDates.includes(date));
+      if (!lockedDates.length) {
+        throw conflict('Selected booth dates are no longer available');
+      }
+
+      const mobileUserId = await findOrCreatePublicMobileUser(conn, booth.organization_id, req.validated.body.user);
+      const subtotal = Number(booth.price || 0) * lockedDates.length;
+      const vatSettings = await getOrganizationVatSettings(conn, booth.organization_id);
+      const totals = calculateVatBreakdown(subtotal, 0, vatSettings);
+      const publicBookingId = publicId('BK');
+      const [bookingResult] = await conn.execute(
+        `INSERT INTO bookings (
+          organization_id, public_id, market_id, mobile_user_id, source, status,
+          subtotal_amount, discount_amount, vat_amount, total_amount,
+          expires_at
+        ) VALUES (
+          :organizationId, :publicId, :marketId, :mobileUserId, 'mobile', 'pending_payment',
+          :subtotalAmount, :discountAmount, :vatAmount, :totalAmount,
+          DATE_ADD(NOW(), INTERVAL ${PAYMENT_EXPIRES_MINUTES} MINUTE)
+        )`,
+        {
+          organizationId: booth.organization_id,
+          publicId: publicBookingId,
+          marketId: booth.market_id,
+          mobileUserId,
+          subtotalAmount: totals.subtotalAmount,
+          discountAmount: totals.discountAmount,
+          vatAmount: totals.vatAmount,
+          totalAmount: totals.totalAmount,
+        },
+      );
+      const bookingId = bookingResult.insertId;
+      const [bookingRows] = await conn.execute(
+        `SELECT expires_at
+         FROM bookings
+         WHERE id = :bookingId AND organization_id = :organizationId
+         LIMIT 1`,
+        { bookingId, organizationId: booth.organization_id },
+      );
+      const expiresAt = bookingRows[0]?.expires_at || null;
+
+      for (const bookingDate of lockedDates) {
+        await insertBoothDateLock(conn, {
+          organizationId: booth.organization_id,
+          marketId: booth.market_id,
+          floorPlanId: booth.floor_plan_id,
+          boothId,
+          bookingId,
+          bookingDate,
+          status: 'held',
+          expiresAt,
+        });
+        const [bookingItemResult] = await conn.execute(
+          `INSERT INTO booking_items (
+            organization_id, booking_id, booth_id, booking_date, unit_price, status
+          ) VALUES (
+            :organizationId, :bookingId, :boothId, :bookingDate, :unitPrice, 'pending_payment'
+          )`,
+          {
+            organizationId: booth.organization_id,
+            bookingId,
+            boothId,
+            bookingDate,
+            unitPrice: booth.price,
+          },
+        );
+        await attachBookingItemToLock(conn, {
+          organizationId: booth.organization_id,
+          bookingId,
+          boothId,
+          bookingDate,
+          bookingItemId: bookingItemResult.insertId,
+        });
+      }
+
+      return {
+        bookingId,
+        publicId: publicBookingId,
+        organizationId: booth.organization_id,
+        marketId: booth.market_id,
+        floorPlanId: booth.floor_plan_id,
+        boothId,
+        lockedDates,
+        unavailableDates,
+        expiresAt,
+        ...totals,
+      };
+    });
+
+    return created(res, result, 'booth held');
   }),
 );
 
