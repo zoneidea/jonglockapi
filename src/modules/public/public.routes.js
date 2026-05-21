@@ -17,6 +17,7 @@ const { attachBookingItemToLock, insertBoothDateLock } = require('../../utils/bo
 const { PAYMENT_EXPIRES_MINUTES } = require('../../constants/booking');
 const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
 const { getFirebaseAuth, getFirebaseInitReason } = require('../../services/firebase-admin.service');
+const { deleteBoothTempLocksByBoothDates } = require('../../services/firestore-locks.service');
 
 const router = express.Router();
 const uploadRoot = path.join(__dirname, '..', '..', '..', 'uploads');
@@ -1308,6 +1309,18 @@ router.post(
         throw badRequest('Only pending_payment bookings can be cancelled');
       }
 
+      const [lockRows] = await conn.execute(
+        `SELECT booth_id, DATE_FORMAT(booking_date, '%Y-%m-%d') AS booking_date
+         FROM booth_date_locks
+         WHERE booking_id = :bookingId
+           AND organization_id = :organizationId
+           AND status IN ('held', 'processing')`,
+        {
+          bookingId,
+          organizationId: booking.organization_id,
+        },
+      );
+
       await conn.execute(
         `UPDATE bookings
          SET status = 'cancelled',
@@ -1346,12 +1359,25 @@ router.post(
         publicId: booking.public_id,
         organizationId: booking.organization_id,
         marketId: booking.market_id,
+        lockRows,
         status: 'cancelled',
         totalAmount: Number(booking.total_amount || 0),
       };
     });
 
-    return ok(res, result, 'booking cancelled');
+    const realtimeCleanup = await deleteBoothTempLocksByBoothDates(
+      (result.lockRows || []).map((row) => ({
+        organizationId: result.organizationId,
+        boothId: Number(row.booth_id),
+        date: String(row.booking_date).slice(0, 10),
+      })),
+    );
+
+    return ok(res, {
+      ...result,
+      lockRows: undefined,
+      realtimeCleanup,
+    }, 'booking cancelled');
   }),
 );
 

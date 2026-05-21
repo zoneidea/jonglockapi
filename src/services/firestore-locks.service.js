@@ -2,6 +2,7 @@ const env = require('../config/env');
 
 const TEMP_LOCK_COLLECTION = 'booth_temp_locks';
 const MAX_DELETE_BATCH_SIZE = 450;
+const MAX_CLEANUP_PASSES = 20;
 
 let admin = null;
 let appInitialized = false;
@@ -75,25 +76,83 @@ async function cleanupExpiredBoothTempLocks(nowMs = Date.now()) {
     };
   }
 
-  const snapshot = await db
-    .collection(TEMP_LOCK_COLLECTION)
-    .where('expiresAtMs', '<=', nowMs)
-    .limit(MAX_DELETE_BATCH_SIZE)
-    .get();
+  let deleted = 0;
+  let passes = 0;
+  let hasMore = false;
 
-  if (snapshot.empty) {
-    return { skipped: false, deleted: 0 };
+  while (passes < MAX_CLEANUP_PASSES) {
+    const snapshot = await db
+      .collection(TEMP_LOCK_COLLECTION)
+      .where('expiresAtMs', '<=', nowMs)
+      .limit(MAX_DELETE_BATCH_SIZE)
+      .get();
+
+    if (snapshot.empty) {
+      hasMore = false;
+      break;
+    }
+
+    const batch = db.batch();
+    snapshot.docs.forEach((doc) => batch.delete(doc.ref));
+    await batch.commit();
+
+    deleted += snapshot.size;
+    passes += 1;
+    hasMore = snapshot.size === MAX_DELETE_BATCH_SIZE;
+    if (!hasMore) {
+      break;
+    }
   }
-
-  const batch = db.batch();
-  snapshot.docs.forEach((doc) => batch.delete(doc.ref));
-  await batch.commit();
 
   return {
     skipped: false,
-    deleted: snapshot.size,
-    hasMore: snapshot.size === MAX_DELETE_BATCH_SIZE,
+    deleted,
+    passes,
+    hasMore,
   };
 }
 
-module.exports = { cleanupExpiredBoothTempLocks };
+async function deleteBoothTempLocksByDocIds(docIds = []) {
+  const db = getFirestore();
+  if (!db) {
+    return {
+      skipped: true,
+      deleted: 0,
+      reason: initSkippedReason || 'Firebase Admin is not initialized',
+    };
+  }
+
+  const uniqueDocIds = Array.from(new Set(docIds.filter(Boolean)));
+  if (!uniqueDocIds.length) {
+    return { skipped: false, deleted: 0 };
+  }
+
+  let deleted = 0;
+  for (let index = 0; index < uniqueDocIds.length; index += MAX_DELETE_BATCH_SIZE) {
+    const chunk = uniqueDocIds.slice(index, index + MAX_DELETE_BATCH_SIZE);
+    const batch = db.batch();
+    chunk.forEach((docId) => {
+      batch.delete(db.collection(TEMP_LOCK_COLLECTION).doc(docId));
+    });
+    await batch.commit();
+    deleted += chunk.length;
+  }
+
+  return { skipped: false, deleted };
+}
+
+function buildBoothTempLockDocId(organizationId, boothId, date) {
+  return `${organizationId}_${boothId}_${date}`;
+}
+
+async function deleteBoothTempLocksByBoothDates(entries = []) {
+  const docIds = entries.map((entry) => buildBoothTempLockDocId(entry.organizationId, entry.boothId, entry.date));
+  return deleteBoothTempLocksByDocIds(docIds);
+}
+
+module.exports = {
+  buildBoothTempLockDocId,
+  cleanupExpiredBoothTempLocks,
+  deleteBoothTempLocksByBoothDates,
+  deleteBoothTempLocksByDocIds,
+};
