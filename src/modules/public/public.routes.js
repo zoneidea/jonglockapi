@@ -274,6 +274,124 @@ router.get(
 );
 
 router.post(
+  '/floor-plans/:floorPlanId/booths/availability',
+  validate(
+    z.object({
+      body: z.object({
+        dates: z.array(z.string().regex(/^\d{4}-\d{2}-\d{2}$/)).min(1).max(90),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({ floorPlanId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { floorPlanId } = req.validated.params;
+    const dates = Array.from(new Set(req.validated.body.dates));
+    const [floorPlan] = await query(
+      `SELECT fp.id, fp.organization_id, fp.market_id
+       FROM floor_plans fp
+       JOIN markets m
+         ON m.id = fp.market_id
+        AND m.organization_id = fp.organization_id
+       JOIN organizations o ON o.id = fp.organization_id
+       WHERE fp.id = :floorPlanId
+         AND fp.status = 'active'
+         AND m.status = 'active'
+         AND o.status = 'active'
+       LIMIT 1`,
+      { floorPlanId },
+    );
+
+    if (!floorPlan) return ok(res, []);
+
+    await expireStaleBookings({ execute: query }, floorPlan.organization_id);
+
+    const boothRows = await query(
+      `SELECT
+          b.id, b.organization_id, b.market_id, b.floor_plan_id, b.category_id,
+          c.name AS category_name, b.code, b.name, b.price, b.status
+       FROM booths b
+       LEFT JOIN product_categories c ON c.id = b.category_id
+       WHERE b.organization_id = :organizationId
+         AND b.market_id = :marketId
+         AND b.floor_plan_id = :floorPlanId
+       ORDER BY b.sort_order ASC, b.code ASC, b.name ASC`,
+      {
+        organizationId: floorPlan.organization_id,
+        marketId: floorPlan.market_id,
+        floorPlanId,
+      },
+    );
+
+    const lockedRows = await query(
+      `SELECT bi.booth_id, DATE_FORMAT(bi.booking_date, '%Y-%m-%d') AS booking_date,
+              MAX(CASE
+                WHEN bi.status = 'paid' OR bk.status = 'paid' THEN 2
+                WHEN bi.status IN ('pending_payment', 'payment_processing')
+                  OR bk.status IN ('pending_payment', 'payment_processing') THEN 1
+                ELSE 0
+              END) AS availability_rank
+       FROM booking_items bi
+       JOIN bookings bk ON bk.id = bi.booking_id
+       WHERE bi.organization_id = :organizationId
+         AND bk.organization_id = :organizationId
+         AND bk.market_id = :marketId
+         AND bi.booking_date IN (${datePlaceholders(dates)})
+         AND bi.status IN ('pending_payment', 'payment_processing', 'paid')
+         AND bk.status IN ('pending_payment', 'payment_processing', 'paid')
+       GROUP BY bi.booth_id, bi.booking_date`,
+      {
+        organizationId: floorPlan.organization_id,
+        marketId: floorPlan.market_id,
+        ...dateParams(dates),
+      },
+    );
+
+    const lockedByBoothDate = new Map(
+      lockedRows.map((row) => [
+        `${row.booth_id}:${String(row.booking_date).slice(0, 10)}`,
+        Number(row.availability_rank || 0),
+      ]),
+    );
+    const vatSettings = await getOrganizationVatSettings({ execute: query }, floorPlan.organization_id);
+    const rows = boothRows.map((booth) => {
+      const dateAvailability = dates.map((date) => {
+        if (booth.status !== 'active') {
+          return { date, status: 'unavailable' };
+        }
+        const rank = lockedByBoothDate.get(`${booth.id}:${date}`) || 0;
+        if (rank === 2) return { date, status: 'booked' };
+        if (rank === 1) return { date, status: 'processing' };
+        return { date, status: 'available' };
+      });
+      const availableCount = dateAvailability.filter((item) => item.status === 'available').length;
+      let availabilityStatus = 'processing';
+      if (booth.status !== 'active') {
+        availabilityStatus = 'unavailable';
+      } else if (availableCount === dates.length) {
+        availabilityStatus = 'available';
+      } else if (availableCount === 0) {
+        availabilityStatus = 'booked';
+      }
+
+      return {
+        ...mapBooth({
+          ...booth,
+          availability_status: availabilityStatus,
+          gross_price: applyVatToAmount(booth.price, vatSettings),
+        }),
+        availabilityDates: dateAvailability,
+        availableDateCount: availableCount,
+        unavailableDateCount: dates.length - availableCount,
+        selectedDateCount: dates.length,
+      };
+    });
+
+    return ok(res, rows);
+  }),
+);
+
+router.post(
   '/booths/:boothId/availability',
   validate(
     z.object({
