@@ -1132,6 +1132,90 @@ router.post(
 );
 
 router.post(
+  '/bookings/history',
+  validate(
+    z.object({
+      body: z.object({
+        user: z.object({
+          email: z.string().email(),
+        }),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const emailHash = blindIndex(String(req.validated.body.user.email || '').trim().toLowerCase());
+    const bookings = await query(
+      `SELECT
+          b.id,
+          b.public_id,
+          b.organization_id,
+          b.market_id,
+          b.status,
+          b.total_amount,
+          b.discount_amount,
+          b.vat_amount,
+          b.created_at,
+          b.expires_at,
+          b.paid_at,
+          m.name AS market_name,
+          item_summary.first_booking_date,
+          item_summary.last_booking_date,
+          item_summary.booking_dates,
+          item_summary.booth_names
+       FROM bookings b
+       JOIN mobile_users mu
+         ON mu.id = b.mobile_user_id
+        AND mu.organization_id = b.organization_id
+       JOIN markets m
+         ON m.id = b.market_id
+        AND m.organization_id = b.organization_id
+       LEFT JOIN (
+         SELECT
+           bi.organization_id,
+           bi.booking_id,
+           MIN(DATE_FORMAT(bi.booking_date, '%Y-%m-%d')) AS first_booking_date,
+           MAX(DATE_FORMAT(bi.booking_date, '%Y-%m-%d')) AS last_booking_date,
+           GROUP_CONCAT(DISTINCT DATE_FORMAT(bi.booking_date, '%Y-%m-%d') ORDER BY bi.booking_date ASC SEPARATOR '||') AS booking_dates,
+           GROUP_CONCAT(DISTINCT COALESCE(bo.name, bo.code) ORDER BY bo.name ASC, bo.code ASC SEPARATOR '||') AS booth_names
+         FROM booking_items bi
+         JOIN booths bo
+           ON bo.id = bi.booth_id
+          AND bo.organization_id = bi.organization_id
+         GROUP BY bi.organization_id, bi.booking_id
+       ) item_summary
+         ON item_summary.booking_id = b.id
+        AND item_summary.organization_id = b.organization_id
+       WHERE mu.email_hash = :emailHash
+         AND b.source = 'mobile'
+       ORDER BY COALESCE(b.paid_at, b.created_at) DESC, b.id DESC
+       LIMIT 100`,
+      { emailHash },
+    );
+
+    return ok(res, bookings.map((booking) => ({
+      bookingId: booking.id,
+      publicId: booking.public_id,
+      organizationId: booking.organization_id,
+      marketId: booking.market_id,
+      marketName: booking.market_name,
+      status: booking.status,
+      totalAmount: Number(booking.total_amount || 0),
+      discountAmount: Number(booking.discount_amount || 0),
+      vatAmount: Number(booking.vat_amount || 0),
+      createdAt: booking.created_at,
+      expiresAt: booking.expires_at,
+      paidAt: booking.paid_at,
+      firstBookingDate: booking.first_booking_date,
+      lastBookingDate: booking.last_booking_date,
+      bookingDates: booking.booking_dates ? String(booking.booking_dates).split('||').filter(Boolean) : [],
+      boothNames: booking.booth_names ? String(booking.booth_names).split('||').filter(Boolean) : [],
+    })));
+  }),
+);
+
+router.post(
   '/booths/:boothId/availability',
   validate(
     z.object({
