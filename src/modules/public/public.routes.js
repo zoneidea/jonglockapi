@@ -245,6 +245,11 @@ router.get(
                 END) AS availability_rank
          FROM booking_items bi
          JOIN bookings bk ON bk.id = bi.booking_id
+         JOIN booths locked_booth
+           ON locked_booth.id = bi.booth_id
+          AND locked_booth.organization_id = bi.organization_id
+          AND locked_booth.market_id = bk.market_id
+          AND locked_booth.floor_plan_id = :floorPlanId
          WHERE bi.organization_id = :organizationId
            AND bk.organization_id = :organizationId
            AND bk.market_id = :marketId
@@ -333,6 +338,11 @@ router.post(
               END) AS availability_rank
        FROM booking_items bi
        JOIN bookings bk ON bk.id = bi.booking_id
+       JOIN booths locked_booth
+         ON locked_booth.id = bi.booth_id
+        AND locked_booth.organization_id = bi.organization_id
+        AND locked_booth.market_id = bk.market_id
+        AND locked_booth.floor_plan_id = :floorPlanId
        WHERE bi.organization_id = :organizationId
          AND bk.organization_id = :organizationId
          AND bk.market_id = :marketId

@@ -447,6 +447,55 @@ async function upsertDemoBooking(connection, organizationId, marketId, mobileUse
   return { bookingId: booking.id, bookingItemId: item.id };
 }
 
+async function seedMobileAvailabilityBookings(connection, organizationId, marketId, booths, mobileUsers, products) {
+  const bookingScenarios = [
+    { boothIndex: 0, dates: ['2026-05-21', '2026-05-22', '2026-05-23', '2026-05-24'], status: 'paid' },
+    { boothIndex: 1, dates: ['2026-05-21', '2026-05-23', '2026-05-25'], status: 'payment_processing' },
+    { boothIndex: 2, dates: ['2026-05-22', '2026-05-24', '2026-05-26'], status: 'pending_payment' },
+    { boothIndex: 3, dates: ['2026-05-27', '2026-05-28', '2026-05-29'], status: 'paid' },
+    { boothIndex: 4, dates: ['2026-05-21', '2026-05-28', '2026-06-04'], status: 'payment_processing' },
+    { boothIndex: 5, dates: ['2026-05-30', '2026-05-31', '2026-06-01'], status: 'pending_payment' },
+    { boothIndex: 6, dates: ['2026-06-02', '2026-06-03', '2026-06-04'], status: 'paid' },
+    { boothIndex: 7, dates: ['2026-05-22', '2026-05-29', '2026-06-05'], status: 'payment_processing' },
+    { boothIndex: 8, dates: ['2026-06-06', '2026-06-07', '2026-06-08'], status: 'pending_payment' },
+    { boothIndex: 9, dates: ['2026-05-21', '2026-05-22', '2026-05-23'], status: 'paid' },
+  ];
+
+  let sequence = 1;
+  for (const scenario of bookingScenarios) {
+    const booth = booths[scenario.boothIndex % booths.length];
+    for (const bookingDate of scenario.dates) {
+      const selectedUser = mobileUsers[sequence % mobileUsers.length];
+      const selectedProduct = products[sequence % products.length];
+      const normalizedDate = bookingDate.replace(/-/g, '');
+      const publicId = `BK-MOBILE-AVAIL-${String(scenario.boothIndex + 1).padStart(2, '0')}-${normalizedDate}`;
+      const isPaid = scenario.status === 'paid';
+      await upsertDemoBooking(
+        connection,
+        organizationId,
+        marketId,
+        selectedUser.id,
+        booth.id,
+        selectedProduct.id,
+        {
+          publicId,
+          paymentPublicId: isPaid ? `PAY-MOBILE-AVAIL-${String(scenario.boothIndex + 1).padStart(2, '0')}-${normalizedDate}` : undefined,
+          providerReference: `MOCK-${publicId}`,
+          bookingDate,
+          bookingStatus: scenario.status,
+          itemStatus: scenario.status,
+          subtotalAmount: booth.price || 500,
+          paidAt: isPaid ? `${bookingDate} 10:15:00` : null,
+          comment: 'ข้อมูลจำลองสำหรับทดสอบสถานะบูธบนแอปมือถือ',
+        },
+      );
+      sequence += 1;
+    }
+  }
+
+  return bookingScenarios.reduce((total, scenario) => total + scenario.dates.length, 0);
+}
+
 async function upsertPaymentCallback(connection, organizationId, provider, payload, receivedAt) {
   await exec(
     connection,
@@ -834,6 +883,14 @@ async function main() {
       '2026-05-13', '2026-05-14', '2026-05-15', '2026-05-16', '2026-05-17', '2026-05-18',
     ];
     const products = [product, productCoffee, productDessert, productClothes, productSnack];
+    const seededMobileAvailabilityBookings = await seedMobileAvailabilityBookings(
+      connection,
+      organizationId,
+      market.id,
+      booths,
+      mobileUsers,
+      products,
+    );
     const failedIndexes = new Set([1, 4, 7, 10, 13, 16, 19, 22, 25, 28, 31, 34]);
     const warningIndexes = new Set([5, 11, 17, 23, 29]);
     const seededBookings = [];
@@ -1003,6 +1060,7 @@ async function main() {
         bookingId: demoBooking.bookingId,
         bookingItemId: demoBooking.bookingItemId,
         seededCustomerCount: mobileUsers.length,
+        seededMobileAvailabilityBookings,
         seededPaidBookings: seededBookings.length + 1,
       },
       'Demo seed completed',
@@ -1015,6 +1073,7 @@ async function main() {
     console.log(`bookingId=${demoBooking.bookingId}`);
     console.log(`bookingItemId=${demoBooking.bookingItemId}`);
     console.log(`seededCustomerCount=${mobileUsers.length}`);
+    console.log(`seededMobileAvailabilityBookings=${seededMobileAvailabilityBookings}`);
     console.log(`seededPaidBookings=${seededBookings.length + 1}`);
     console.log('management users: admin / marketadmin / accounting / audit');
     console.log(`management password: ${DEFAULT_ADMIN_PASSWORD}`);
