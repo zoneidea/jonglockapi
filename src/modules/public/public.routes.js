@@ -1183,7 +1183,7 @@ router.post(
           b.id, b.public_id, b.organization_id, b.market_id, b.status, b.expires_at,
           b.total_amount, m.name AS market_name,
           o.name AS organization_name, o.payment_promptpay_id, o.payment_bank_name,
-          o.payment_bank_account_name, o.payment_bank_account_no, o.payment_instructions,
+          o.payment_bank_account_name, o.payment_bank_account_no, o.payment_qrcode_image_url, o.payment_instructions,
           p.id AS payment_id, p.public_id AS payment_public_id, p.status AS payment_status,
           p.provider_reference, p.proof_image_url, p.proof_uploaded_at, p.payer_note
        FROM bookings b
@@ -1234,6 +1234,7 @@ router.post(
         bankName: booking.payment_bank_name || '',
         bankAccountName: booking.payment_bank_account_name || '',
         bankAccountNo: booking.payment_bank_account_no || '',
+        qrCodeImageUrl: booking.payment_qrcode_image_url || '',
         instructions: booking.payment_instructions || '',
       },
     });
