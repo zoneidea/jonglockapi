@@ -1341,7 +1341,9 @@ router.post(
 
       await conn.execute(
         `UPDATE bookings
-         SET status = 'payment_processing'
+         SET status = 'payment_processing',
+             cart_visible = 0,
+             expires_at = NULL
          WHERE id = :bookingId
            AND organization_id = :organizationId`,
         { organizationId: booking.organization_id, bookingId: booking.id },
@@ -1359,6 +1361,13 @@ router.post(
         bookingId: booking.id,
         status: 'payment_processing',
       });
+      await conn.execute(
+        `UPDATE booth_date_locks
+         SET expires_at = NULL
+         WHERE booking_id = :bookingId
+           AND organization_id = :organizationId`,
+        { organizationId: booking.organization_id, bookingId: booking.id },
+      );
 
       return {
         bookingId: booking.id,
@@ -1418,7 +1427,7 @@ router.post(
        WHERE mu.email_hash = :emailHash
          AND b.source = 'mobile'
          AND b.cart_visible = 1
-         AND b.status IN ('pending_payment', 'payment_processing')
+         AND b.status = 'pending_payment'
          AND b.expires_at IS NOT NULL
          AND b.expires_at > NOW()
        ORDER BY b.expires_at ASC, b.created_at DESC
@@ -1441,7 +1450,7 @@ router.post(
          ON bo.id = bi.booth_id
         AND bo.organization_id = bi.organization_id
        WHERE bi.booking_id IN (${datePlaceholders(bookingIds)})
-         AND bi.status IN ('pending_payment', 'payment_processing')
+         AND bi.status = 'pending_payment'
        ORDER BY bi.booking_date ASC, bi.id ASC`,
       bookingIdParams,
     );

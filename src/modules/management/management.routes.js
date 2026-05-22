@@ -3145,10 +3145,11 @@ router.patch(
         );
         await conn.execute(
           `UPDATE bookings
-           SET status = 'pending_payment'
+           SET status = 'pending_payment',
+               cart_visible = 1,
+               expires_at = DATE_ADD(NOW(), INTERVAL ${PAYMENT_EXPIRES_MINUTES} MINUTE)
            WHERE id = :bookingId
-             AND organization_id = :organizationId
-             AND expires_at > NOW()`,
+             AND organization_id = :organizationId`,
           { organizationId: req.auth.organizationId, bookingId: payment.booking_id },
         );
         await conn.execute(
@@ -3164,6 +3165,13 @@ router.patch(
           bookingId: payment.booking_id,
           status: 'pending_payment',
         });
+        await conn.execute(
+          `UPDATE booth_date_locks
+           SET expires_at = DATE_ADD(NOW(), INTERVAL ${PAYMENT_EXPIRES_MINUTES} MINUTE)
+           WHERE booking_id = :bookingId
+             AND organization_id = :organizationId`,
+          { organizationId: req.auth.organizationId, bookingId: payment.booking_id },
+        );
       }
 
       return {

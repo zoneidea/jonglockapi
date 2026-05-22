@@ -3,7 +3,7 @@ async function expireStaleBookings(executor, organizationId) {
     `SELECT id
      FROM bookings
      WHERE organization_id = :organizationId
-       AND status IN ('pending_payment', 'payment_processing')
+       AND status = 'pending_payment'
        AND expires_at IS NOT NULL
        AND expires_at <= NOW()`,
     { organizationId },
@@ -19,8 +19,8 @@ async function expireStaleBookings(executor, organizationId) {
      SET b.status = 'expired',
          bi.status = 'expired'
      WHERE b.organization_id = :organizationId
-       AND b.status IN ('pending_payment', 'payment_processing')
-       AND bi.status IN ('pending_payment', 'payment_processing')
+       AND b.status = 'pending_payment'
+       AND bi.status = 'pending_payment'
        AND b.expires_at IS NOT NULL
        AND b.expires_at <= NOW()`,
     { organizationId },
@@ -52,7 +52,7 @@ async function expireStaleBookings(executor, organizationId) {
   const expiredLockDeleteResult = await executor.execute(
     `DELETE FROM booth_date_locks
      WHERE organization_id = :organizationId
-       AND status IN ('held', 'processing')
+       AND status = 'held'
        AND expires_at IS NOT NULL
        AND expires_at <= NOW()`,
     { organizationId },
