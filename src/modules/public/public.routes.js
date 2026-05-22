@@ -1199,7 +1199,7 @@ router.post(
         AND p.organization_id = b.organization_id
         AND p.status IN ('created', 'waiting', 'failed')
        WHERE b.id = :bookingId
-         AND b.source = 'mobile'
+         AND b.source IN ('mobile', 'management')
          AND mu.email_hash = :emailHash
        ORDER BY p.id DESC
        LIMIT 1`,
@@ -1269,7 +1269,7 @@ router.post(
            ON mu.id = b.mobile_user_id
           AND mu.organization_id = b.organization_id
          WHERE b.id = :bookingId
-           AND b.source = 'mobile'
+           AND b.source IN ('mobile', 'management')
          LIMIT 1
          FOR UPDATE`,
         { bookingId },
@@ -1425,7 +1425,7 @@ router.post(
         AND m.organization_id = b.organization_id
        JOIN organizations o ON o.id = b.organization_id
        WHERE mu.email_hash = :emailHash
-         AND b.source = 'mobile'
+         AND b.source IN ('mobile', 'management')
          AND b.cart_visible = 1
          AND b.status = 'pending_payment'
          AND b.expires_at IS NOT NULL
@@ -1545,7 +1545,7 @@ router.post(
            ON mu.id = b.mobile_user_id
           AND mu.organization_id = b.organization_id
          WHERE b.id = :bookingId
-           AND b.source = 'mobile'
+           AND b.source IN ('mobile', 'management')
          LIMIT 1
          FOR UPDATE`,
         { bookingId },
@@ -1691,7 +1691,7 @@ router.post(
          ON item_summary.booking_id = b.id
         AND item_summary.organization_id = b.organization_id
        WHERE mu.email_hash = :emailHash
-         AND b.source = 'mobile'
+         AND b.source IN ('mobile', 'management')
        ORDER BY COALESCE(b.paid_at, b.created_at) DESC, b.id DESC
        LIMIT 100`,
       { emailHash },
