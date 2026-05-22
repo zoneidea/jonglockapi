@@ -106,6 +106,31 @@ const announcementAssetUpload = multer({
   },
 });
 
+const paymentAssetUpload = multer({
+  storage: multer.diskStorage({
+    destination(req, file, callback) {
+      const organizationId = String(req.auth?.organizationId || 'org').replace(/[^\d]/g, '') || 'org';
+      const destination = path.join(uploadRoot, 'payments', organizationId);
+      fs.mkdirSync(destination, { recursive: true });
+      callback(null, destination);
+    },
+    filename(req, file, callback) {
+      const extension = path.extname(file.originalname || '').toLowerCase();
+      const safeName = path
+        .basename(file.originalname || 'payment-qrcode', extension)
+        .replace(/[^a-zA-Z0-9-_]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 80) || 'payment-qrcode';
+      callback(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}-${safeName}${extension}`);
+    },
+  }),
+  limits: { files: 1, fileSize: 5 * 1024 * 1024 },
+  fileFilter(req, file, callback) {
+    if (!allowedImageTypes.has(file.mimetype)) return callback(badRequest('Only JPG, PNG, WEBP, and GIF images are allowed'));
+    return callback(null, true);
+  },
+});
+
 function publicUploadUrl(req, filePath) {
   const relativePath = path.relative(uploadRoot, filePath).split(path.sep).join('/');
   return `${req.protocol}://${req.get('host')}/uploads/${relativePath}`;
@@ -505,7 +530,7 @@ router.get(
               vat_enabled, vat_rate, registered_name, registered_tax_id, registered_address,
               registered_subdistrict, registered_district, registered_province, registered_postcode,
               payment_promptpay_id, payment_bank_name, payment_bank_account_name,
-              payment_bank_account_no, payment_instructions,
+              payment_bank_account_no, payment_qrcode_image_url, payment_instructions,
               status, created_at, updated_at
        FROM organizations
        WHERE id = :organizationId
@@ -521,6 +546,7 @@ router.get(
 router.put(
   '/organization-settings',
   requireRoles(ROLES.SUPERVISOR),
+  paymentAssetUpload.single('paymentQrCodeImage'),
   validate(
     z.object({
       body: z.object({
@@ -529,7 +555,7 @@ router.put(
         email: z.string().email().optional().or(z.literal('')).default(''),
         phone: z.string().optional().default(''),
         lineId: z.string().optional().default(''),
-        vatEnabled: z.boolean().optional().default(false),
+        vatEnabled: z.preprocess((value) => value === true || value === 'true' || value === '1' || value === 1, z.boolean()).optional().default(false),
         vatRate: z.coerce.number().min(0).max(100).optional().default(7),
         registeredName: z.string().optional().default(''),
         registeredTaxId: z.string().optional().default(''),
@@ -550,6 +576,16 @@ router.put(
   ),
   asyncHandler(async (req, res) => {
     const body = req.validated.body;
+    const existingRows = await query(
+      `SELECT payment_qrcode_image_url
+       FROM organizations
+       WHERE id = :organizationId
+       LIMIT 1`,
+      { organizationId: req.auth.organizationId },
+    );
+    const paymentQrCodeImageUrl = req.file
+      ? publicUploadUrl(req, req.file.path)
+      : existingRows[0]?.payment_qrcode_image_url || null;
     if (body.vatEnabled) {
       const requiredFields = [
         ['vatRate', body.vatRate],
@@ -584,6 +620,7 @@ router.put(
            payment_bank_name = :paymentBankName,
            payment_bank_account_name = :paymentBankAccountName,
            payment_bank_account_no = :paymentBankAccountNo,
+           payment_qrcode_image_url = :paymentQrCodeImageUrl,
            payment_instructions = :paymentInstructions
        WHERE id = :organizationId`,
       {
@@ -606,9 +643,11 @@ router.put(
         paymentBankName: body.paymentBankName,
         paymentBankAccountName: body.paymentBankAccountName,
         paymentBankAccountNo: body.paymentBankAccountNo,
+        paymentQrCodeImageUrl,
         paymentInstructions: body.paymentInstructions,
       },
     );
+    if (req.file && existingRows[0]?.payment_qrcode_image_url) removeUploadedFile(existingRows[0].payment_qrcode_image_url);
     return ok(
       res,
       {
@@ -631,6 +670,7 @@ router.put(
         payment_bank_name: body.paymentBankName,
         payment_bank_account_name: body.paymentBankAccountName,
         payment_bank_account_no: body.paymentBankAccountNo,
+        payment_qrcode_image_url: paymentQrCodeImageUrl,
         payment_instructions: body.paymentInstructions,
       },
       'organization settings updated',
