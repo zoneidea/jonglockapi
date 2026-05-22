@@ -22,6 +22,7 @@ const {
   insertBoothDateLock,
   moveBookingItemLock,
   releaseBookingLocks,
+  updateBookingLocksStatus,
 } = require('../../utils/booth-locks');
 const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
 const { getCurrentSubscription, requireSubscriptionForMutations } = require('../../services/subscription.service');
@@ -503,6 +504,8 @@ router.get(
       `SELECT id, code, name, address, email, phone, line_id,
               vat_enabled, vat_rate, registered_name, registered_tax_id, registered_address,
               registered_subdistrict, registered_district, registered_province, registered_postcode,
+              payment_promptpay_id, payment_bank_name, payment_bank_account_name,
+              payment_bank_account_no, payment_instructions,
               status, created_at, updated_at
        FROM organizations
        WHERE id = :organizationId
@@ -535,6 +538,11 @@ router.put(
         registeredDistrict: z.string().optional().default(''),
         registeredProvince: z.string().optional().default(''),
         registeredPostcode: z.string().optional().default(''),
+        paymentPromptpayId: z.string().optional().default(''),
+        paymentBankName: z.string().optional().default(''),
+        paymentBankAccountName: z.string().optional().default(''),
+        paymentBankAccountNo: z.string().optional().default(''),
+        paymentInstructions: z.string().optional().default(''),
       }),
       query: z.object({}).passthrough(),
       params: z.object({}).passthrough(),
@@ -571,7 +579,12 @@ router.put(
            registered_subdistrict = :registeredSubdistrict,
            registered_district = :registeredDistrict,
            registered_province = :registeredProvince,
-           registered_postcode = :registeredPostcode
+           registered_postcode = :registeredPostcode,
+           payment_promptpay_id = :paymentPromptpayId,
+           payment_bank_name = :paymentBankName,
+           payment_bank_account_name = :paymentBankAccountName,
+           payment_bank_account_no = :paymentBankAccountNo,
+           payment_instructions = :paymentInstructions
        WHERE id = :organizationId`,
       {
         organizationId: req.auth.organizationId,
@@ -589,6 +602,11 @@ router.put(
         registeredDistrict: body.registeredDistrict,
         registeredProvince: body.registeredProvince,
         registeredPostcode: body.registeredPostcode,
+        paymentPromptpayId: body.paymentPromptpayId,
+        paymentBankName: body.paymentBankName,
+        paymentBankAccountName: body.paymentBankAccountName,
+        paymentBankAccountNo: body.paymentBankAccountNo,
+        paymentInstructions: body.paymentInstructions,
       },
     );
     return ok(
@@ -609,6 +627,11 @@ router.put(
         registered_district: body.registeredDistrict,
         registered_province: body.registeredProvince,
         registered_postcode: body.registeredPostcode,
+        payment_promptpay_id: body.paymentPromptpayId,
+        payment_bank_name: body.paymentBankName,
+        payment_bank_account_name: body.paymentBankAccountName,
+        payment_bank_account_no: body.paymentBankAccountNo,
+        payment_instructions: body.paymentInstructions,
       },
       'organization settings updated',
     );
@@ -2963,6 +2986,195 @@ router.patch(
       return { id: req.validated.params.auditCheckId };
     });
     return ok(res, { id: req.validated.params.auditCheckId }, 'fine payment status updated');
+  }),
+);
+
+router.get(
+  '/payment-proofs',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  validate(
+    z.object({
+      query: z.object({
+        status: z.enum(['waiting', 'failed', 'paid', 'all']).optional().default('waiting'),
+        marketId: z.coerce.number().int().positive().optional(),
+      }).passthrough(),
+      params: z.object({}).passthrough(),
+      body: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { status, marketId } = req.validated.query;
+    const rows = await query(
+      `SELECT
+          p.id, p.public_id, p.status, p.amount, p.provider_reference,
+          p.proof_image_url, p.proof_uploaded_at, p.payer_note, p.paid_at,
+          b.id AS booking_id, b.public_id AS booking_public_id, b.status AS booking_status,
+          b.expires_at, m.id AS market_id, m.name AS market_name,
+          mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.email_enc
+       FROM payments p
+       JOIN bookings b
+         ON b.id = p.booking_id
+        AND b.organization_id = p.organization_id
+       JOIN markets m
+         ON m.id = b.market_id
+        AND m.organization_id = b.organization_id
+       JOIN mobile_users mu
+         ON mu.id = b.mobile_user_id
+        AND mu.organization_id = b.organization_id
+       LEFT JOIN admin_market_assignments ama
+         ON ama.market_id = m.id
+        AND ama.admin_user_id = :adminUserId
+        AND ama.status = 'active'
+       WHERE p.organization_id = :organizationId
+         AND p.provider = 'manual'
+         AND p.proof_image_url IS NOT NULL
+         AND (:status = 'all' OR p.status = :status)
+         AND (:marketId IS NULL OR m.id = :marketId)
+         AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+       ORDER BY COALESCE(p.proof_uploaded_at, p.created_at) DESC, p.id DESC
+       LIMIT 300`,
+      {
+        organizationId: req.auth.organizationId,
+        adminUserId: req.auth.sub,
+        hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
+        status,
+        marketId: marketId || null,
+      },
+    );
+
+    return ok(res, rows.map((row) => ({
+      ...row,
+      customer_name: [decryptField(row.first_name_enc), decryptField(row.last_name_enc)].filter(Boolean).join(' ').trim()
+        || decryptField(row.username_enc)
+        || decryptField(row.email_enc)
+        || '-',
+      username_enc: undefined,
+      first_name_enc: undefined,
+      last_name_enc: undefined,
+      email_enc: undefined,
+    })));
+  }),
+);
+
+router.patch(
+  '/payments/:paymentId/proof-status',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  validate(
+    z.object({
+      body: z.object({
+        status: z.enum(['paid', 'failed']),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({ paymentId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const result = await transaction(async (conn) => {
+      await expireStaleBookings(conn, req.auth.organizationId);
+      const [rows] = await conn.execute(
+        `SELECT p.id, p.public_id, p.booking_id, p.amount, p.status,
+                b.status AS booking_status, b.market_id, b.expires_at
+         FROM payments p
+         JOIN bookings b
+           ON b.id = p.booking_id
+          AND b.organization_id = p.organization_id
+         LEFT JOIN admin_market_assignments ama
+           ON ama.market_id = b.market_id
+          AND ama.admin_user_id = :adminUserId
+          AND ama.status = 'active'
+         WHERE p.id = :paymentId
+           AND p.organization_id = :organizationId
+           AND p.provider = 'manual'
+           AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
+         LIMIT 1
+         FOR UPDATE`,
+        {
+          organizationId: req.auth.organizationId,
+          paymentId: req.validated.params.paymentId,
+          adminUserId: req.auth.sub,
+          hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
+        },
+      );
+      const payment = rows[0];
+      if (!payment) throw notFound('Payment proof not found');
+      if (!['waiting', 'failed'].includes(payment.status)) throw badRequest('Payment proof is not reviewable');
+      if (!['pending_payment', 'payment_processing'].includes(payment.booking_status)) {
+        throw badRequest('Booking is not waiting for payment review');
+      }
+
+      if (req.validated.body.status === 'paid') {
+        await conn.execute(
+          `UPDATE payments
+           SET status = 'paid',
+               paid_at = NOW(),
+               verified_by_admin_id = :adminUserId,
+               verified_at = NOW()
+           WHERE id = :paymentId
+             AND organization_id = :organizationId`,
+          { organizationId: req.auth.organizationId, paymentId: payment.id, adminUserId: req.auth.sub },
+        );
+        await conn.execute(
+          `UPDATE bookings
+           SET status = 'paid',
+               paid_at = NOW()
+           WHERE id = :bookingId
+             AND organization_id = :organizationId`,
+          { organizationId: req.auth.organizationId, bookingId: payment.booking_id },
+        );
+        await conn.execute(
+          `UPDATE booking_items
+           SET status = 'paid'
+           WHERE booking_id = :bookingId
+             AND organization_id = :organizationId`,
+          { organizationId: req.auth.organizationId, bookingId: payment.booking_id },
+        );
+        await updateBookingLocksStatus(conn, {
+          organizationId: req.auth.organizationId,
+          bookingId: payment.booking_id,
+          status: 'paid',
+        });
+      } else {
+        await conn.execute(
+          `UPDATE payments
+           SET status = 'failed',
+               verified_by_admin_id = :adminUserId,
+               verified_at = NOW()
+           WHERE id = :paymentId
+             AND organization_id = :organizationId`,
+          { organizationId: req.auth.organizationId, paymentId: payment.id, adminUserId: req.auth.sub },
+        );
+        await conn.execute(
+          `UPDATE bookings
+           SET status = 'pending_payment'
+           WHERE id = :bookingId
+             AND organization_id = :organizationId
+             AND expires_at > NOW()`,
+          { organizationId: req.auth.organizationId, bookingId: payment.booking_id },
+        );
+        await conn.execute(
+          `UPDATE booking_items
+           SET status = 'pending_payment'
+           WHERE booking_id = :bookingId
+             AND organization_id = :organizationId
+             AND status = 'payment_processing'`,
+          { organizationId: req.auth.organizationId, bookingId: payment.booking_id },
+        );
+        await updateBookingLocksStatus(conn, {
+          organizationId: req.auth.organizationId,
+          bookingId: payment.booking_id,
+          status: 'pending_payment',
+        });
+      }
+
+      return {
+        id: payment.id,
+        publicId: payment.public_id,
+        bookingId: payment.booking_id,
+        status: req.validated.body.status,
+      };
+    });
+
+    return ok(res, result, 'payment proof reviewed');
   }),
 );
 

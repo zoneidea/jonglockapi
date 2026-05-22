@@ -13,7 +13,7 @@ const { publicId } = require('../../utils/id');
 const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/password-policy');
 const { badRequest, conflict } = require('../../utils/errors');
 const { expireStaleBookings } = require('../../utils/booking-status');
-const { attachBookingItemToLock, insertBoothDateLock } = require('../../utils/booth-locks');
+const { attachBookingItemToLock, insertBoothDateLock, updateBookingLocksStatus } = require('../../utils/booth-locks');
 const { PAYMENT_EXPIRES_MINUTES } = require('../../constants/booking');
 const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
 const { getFirebaseAuth, getFirebaseInitReason } = require('../../services/firebase-admin.service');
@@ -36,6 +36,31 @@ const profileUpload = multer({
         .replace(/[^a-zA-Z0-9-_]+/g, '-')
         .replace(/^-+|-+$/g, '')
         .slice(0, 80) || 'profile-image';
+      callback(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}-${safeName}${extension}`);
+    },
+  }),
+  limits: { files: 1, fileSize: 5 * 1024 * 1024 },
+  fileFilter(req, file, callback) {
+    if (!allowedImageTypes.has(file.mimetype)) return callback(badRequest('Only JPG, PNG, WEBP, and GIF images are allowed'));
+    return callback(null, true);
+  },
+});
+
+const paymentProofUpload = multer({
+  storage: multer.diskStorage({
+    destination(req, file, callback) {
+      const bookingId = String(req.params.bookingId || 'booking').replace(/[^\d]/g, '') || 'booking';
+      const destination = path.join(uploadRoot, 'payment-proofs', bookingId);
+      fs.mkdirSync(destination, { recursive: true });
+      callback(null, destination);
+    },
+    filename(req, file, callback) {
+      const extension = path.extname(file.originalname || '').toLowerCase();
+      const safeName = path
+        .basename(file.originalname || 'payment-proof', extension)
+        .replace(/[^a-zA-Z0-9-_]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 80) || 'payment-proof';
       callback(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}-${safeName}${extension}`);
     },
   }),
@@ -1134,6 +1159,225 @@ router.post(
     });
 
     return ok(res, result, 'booking confirmed');
+  }),
+);
+
+router.post(
+  '/bookings/:bookingId/payment-info',
+  validate(
+    z.object({
+      body: z.object({
+        user: z.object({
+          email: z.string().email(),
+        }),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({ bookingId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { bookingId } = req.validated.params;
+    const emailHash = blindIndex(String(req.validated.body.user.email || '').trim().toLowerCase());
+    const bookings = await query(
+      `SELECT
+          b.id, b.public_id, b.organization_id, b.market_id, b.status, b.expires_at,
+          b.total_amount, m.name AS market_name,
+          o.name AS organization_name, o.payment_promptpay_id, o.payment_bank_name,
+          o.payment_bank_account_name, o.payment_bank_account_no, o.payment_instructions,
+          p.id AS payment_id, p.public_id AS payment_public_id, p.status AS payment_status,
+          p.provider_reference, p.proof_image_url, p.proof_uploaded_at, p.payer_note
+       FROM bookings b
+       JOIN mobile_users mu
+         ON mu.id = b.mobile_user_id
+        AND mu.organization_id = b.organization_id
+       JOIN markets m
+         ON m.id = b.market_id
+        AND m.organization_id = b.organization_id
+       JOIN organizations o ON o.id = b.organization_id
+       LEFT JOIN payments p
+         ON p.booking_id = b.id
+        AND p.organization_id = b.organization_id
+        AND p.status IN ('created', 'waiting', 'failed')
+       WHERE b.id = :bookingId
+         AND b.source = 'mobile'
+         AND mu.email_hash = :emailHash
+       ORDER BY p.id DESC
+       LIMIT 1`,
+      { bookingId, emailHash },
+    );
+    const booking = bookings[0];
+    if (!booking) throw badRequest('Booking not found');
+    if (!['pending_payment', 'payment_processing'].includes(booking.status)) throw badRequest('Booking is not payable');
+    if (!booking.expires_at || new Date(booking.expires_at).getTime() <= Date.now()) throw badRequest('Booking has expired');
+
+    return ok(res, {
+      bookingId: booking.id,
+      publicId: booking.public_id,
+      organizationId: booking.organization_id,
+      marketId: booking.market_id,
+      marketName: booking.market_name,
+      status: booking.status,
+      expiresAt: booking.expires_at,
+      amount: Number(booking.total_amount || 0),
+      payment: booking.payment_id ? {
+        id: booking.payment_id,
+        publicId: booking.payment_public_id,
+        status: booking.payment_status,
+        providerReference: booking.provider_reference || '',
+        proofImageUrl: booking.proof_image_url || '',
+        proofUploadedAt: booking.proof_uploaded_at,
+        payerNote: booking.payer_note || '',
+      } : null,
+      paymentMethod: {
+        organizationName: booking.organization_name,
+        promptpayId: booking.payment_promptpay_id || '',
+        bankName: booking.payment_bank_name || '',
+        bankAccountName: booking.payment_bank_account_name || '',
+        bankAccountNo: booking.payment_bank_account_no || '',
+        instructions: booking.payment_instructions || '',
+      },
+    });
+  }),
+);
+
+router.post(
+  '/bookings/:bookingId/payment-proof',
+  paymentProofUpload.single('proofImage'),
+  validate(
+    z.object({
+      body: z.object({
+        email: z.string().email(),
+        name: z.string().optional().default(''),
+        providerReference: z.string().max(255).optional().default(''),
+        payerNote: z.string().max(1000).optional().default(''),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({ bookingId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    if (!req.file) throw badRequest('Payment proof image is required');
+    const { bookingId } = req.validated.params;
+    const emailHash = blindIndex(String(req.validated.body.email || '').trim().toLowerCase());
+
+    const result = await transaction(async (conn) => {
+      const [bookingRows] = await conn.execute(
+        `SELECT b.id, b.public_id, b.organization_id, b.market_id, b.status, b.total_amount, b.expires_at,
+                mu.email_hash
+         FROM bookings b
+         JOIN mobile_users mu
+           ON mu.id = b.mobile_user_id
+          AND mu.organization_id = b.organization_id
+         WHERE b.id = :bookingId
+           AND b.source = 'mobile'
+         LIMIT 1
+         FOR UPDATE`,
+        { bookingId },
+      );
+      const booking = bookingRows[0];
+      if (!booking) throw badRequest('Booking not found');
+      if (emailHash !== booking.email_hash) throw badRequest('Booking owner does not match');
+      if (!['pending_payment', 'payment_processing'].includes(booking.status)) throw badRequest('Booking is not payable');
+      if (!booking.expires_at || new Date(booking.expires_at).getTime() <= Date.now()) throw badRequest('Booking has expired');
+
+      const proofImageUrl = publicUploadUrl(req, req.file.path);
+      const [paymentRows] = await conn.execute(
+        `SELECT id, public_id
+         FROM payments
+         WHERE organization_id = :organizationId
+           AND booking_id = :bookingId
+           AND status IN ('created', 'waiting', 'failed')
+         ORDER BY id DESC
+         LIMIT 1
+         FOR UPDATE`,
+        { organizationId: booking.organization_id, bookingId: booking.id },
+      );
+
+      let paymentId = paymentRows[0]?.id;
+      let paymentPublicId = paymentRows[0]?.public_id;
+      if (paymentId) {
+        await conn.execute(
+          `UPDATE payments
+           SET provider = 'manual',
+               provider_reference = :providerReference,
+               proof_image_url = :proofImageUrl,
+               proof_uploaded_at = NOW(),
+               payer_note = :payerNote,
+               status = 'waiting',
+               amount = :amount
+           WHERE id = :paymentId
+             AND organization_id = :organizationId`,
+          {
+            organizationId: booking.organization_id,
+            paymentId,
+            providerReference: req.validated.body.providerReference || null,
+            proofImageUrl,
+            payerNote: req.validated.body.payerNote || null,
+            amount: booking.total_amount,
+          },
+        );
+      } else {
+        paymentPublicId = publicId('PAY');
+        const [paymentResult] = await conn.execute(
+          `INSERT INTO payments (
+            organization_id, public_id, booking_id, provider, provider_reference,
+            proof_image_url, proof_uploaded_at, payer_note, status, amount
+          ) VALUES (
+            :organizationId, :publicId, :bookingId, 'manual', :providerReference,
+            :proofImageUrl, NOW(), :payerNote, 'waiting', :amount
+          )`,
+          {
+            organizationId: booking.organization_id,
+            publicId: paymentPublicId,
+            bookingId: booking.id,
+            providerReference: req.validated.body.providerReference || null,
+            proofImageUrl,
+            payerNote: req.validated.body.payerNote || null,
+            amount: booking.total_amount,
+          },
+        );
+        paymentId = paymentResult.insertId;
+      }
+
+      await conn.execute(
+        `UPDATE bookings
+         SET status = 'payment_processing'
+         WHERE id = :bookingId
+           AND organization_id = :organizationId`,
+        { organizationId: booking.organization_id, bookingId: booking.id },
+      );
+      await conn.execute(
+        `UPDATE booking_items
+         SET status = 'payment_processing'
+         WHERE booking_id = :bookingId
+           AND organization_id = :organizationId
+           AND status = 'pending_payment'`,
+        { organizationId: booking.organization_id, bookingId: booking.id },
+      );
+      await updateBookingLocksStatus(conn, {
+        organizationId: booking.organization_id,
+        bookingId: booking.id,
+        status: 'payment_processing',
+      });
+
+      return {
+        bookingId: booking.id,
+        publicId: booking.public_id,
+        organizationId: booking.organization_id,
+        marketId: booking.market_id,
+        status: 'payment_processing',
+        payment: {
+          id: paymentId,
+          publicId: paymentPublicId,
+          status: 'waiting',
+          amount: Number(booking.total_amount || 0),
+          proofImageUrl,
+          proofUploadedAt: new Date().toISOString(),
+        },
+      };
+    });
+
+    return ok(res, result, 'payment proof uploaded');
   }),
 );
 
