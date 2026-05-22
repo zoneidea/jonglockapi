@@ -2084,10 +2084,12 @@ router.get(
        LEFT JOIN booking_items bi ON bi.booking_id = b.id
        LEFT JOIN booths bo ON bo.id = bi.booth_id
        WHERE b.organization_id = :organizationId AND b.market_id = :marketId
+         AND b.source = 'management'
+         AND b.created_by_admin_id = :adminUserId
        GROUP BY b.id
        ORDER BY b.created_at DESC
        LIMIT 500`,
-      { organizationId: req.auth.organizationId, marketId: Number(req.params.marketId) },
+      { organizationId: req.auth.organizationId, marketId: Number(req.params.marketId), adminUserId: req.auth.sub },
     );
     return ok(res, rows);
   }),
@@ -2594,9 +2596,11 @@ router.delete(
          WHERE id = :bookingId
            AND organization_id = :organizationId
            AND market_id = :marketId
+           AND source = 'management'
+           AND created_by_admin_id = :adminUserId
          LIMIT 1
          FOR UPDATE`,
-        { organizationId: req.auth.organizationId, marketId, bookingId },
+        { organizationId: req.auth.organizationId, marketId, bookingId, adminUserId: req.auth.sub },
       );
       const booking = bookings[0];
       if (!booking) throw notFound('Booking not found');
@@ -3317,8 +3321,10 @@ router.get(
     await expireStaleBookings({ execute: query }, req.auth.organizationId);
     const rows = await query(
       `SELECT m.id AS market_id, m.name AS market_name, b.public_id AS booking_public_id, b.status,
-              bi.booking_date, bo.code AS booth_code, bo.name AS booth_name,
-              b.source, b.created_at, 1 AS booking_count, COALESCE(bi.unit_price, 0) AS booth_amount,
+              MIN(bi.booking_date) AS booking_date,
+              GROUP_CONCAT(DISTINCT DATE_FORMAT(bi.booking_date, '%Y-%m-%d') ORDER BY bi.booking_date SEPARATOR ', ') AS booking_dates,
+              GROUP_CONCAT(DISTINCT CONCAT(COALESCE(bo.code, ''), CASE WHEN bo.name IS NULL OR bo.name = '' THEN '' ELSE CONCAT(' ', bo.name) END) ORDER BY bo.sort_order, bo.code SEPARATOR ', ') AS booths,
+              b.source, b.created_at, COUNT(DISTINCT bi.id) AS booking_count, COALESCE(SUM(bi.unit_price), 0) AS booth_amount,
               b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
               mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc, mu.email_enc
        FROM bookings b
@@ -3334,7 +3340,10 @@ router.get(
          AND bi.status IN ('pending_payment', 'payment_processing', 'expired')
          AND (:startDate IS NULL OR DATE(b.created_at) >= :startDate)
          AND (:endDate IS NULL OR DATE(b.created_at) <= :endDate)
-       ORDER BY b.created_at DESC, m.name, bo.sort_order, bo.code`,
+       GROUP BY m.id, m.name, b.id, b.public_id, b.status, b.source, b.created_at,
+                b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
+                mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc, mu.email_enc
+       ORDER BY b.created_at DESC, m.name, b.public_id`,
       {
         organizationId: req.auth.organizationId,
         adminUserId: req.auth.sub,
