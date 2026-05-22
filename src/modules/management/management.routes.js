@@ -2999,7 +2999,7 @@ router.get(
         marketId: z.coerce.number().int().positive().optional(),
       }).passthrough(),
       params: z.object({}).passthrough(),
-      body: z.object({}).passthrough(),
+      body: z.object({}).passthrough().optional().default({}),
     }),
   ),
   asyncHandler(async (req, res) => {
@@ -3319,9 +3319,11 @@ router.get(
       `SELECT m.id AS market_id, m.name AS market_name, b.public_id AS booking_public_id, b.status,
               bi.booking_date, bo.code AS booth_code, bo.name AS booth_name,
               b.source, b.created_at, 1 AS booking_count, COALESCE(bi.unit_price, 0) AS booth_amount,
-              b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount
+              b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
+              mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc, mu.email_enc
        FROM bookings b
        JOIN markets m ON m.id = b.market_id
+       JOIN mobile_users mu ON mu.id = b.mobile_user_id AND mu.organization_id = b.organization_id
        JOIN booking_items bi ON bi.booking_id = b.id
        JOIN booths bo ON bo.id = bi.booth_id
        LEFT JOIN admin_market_assignments ama
@@ -3330,9 +3332,9 @@ router.get(
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          AND b.status IN ('pending_payment', 'payment_processing', 'expired')
          AND bi.status IN ('pending_payment', 'payment_processing', 'expired')
-         AND (:startDate IS NULL OR bi.booking_date >= :startDate)
-         AND (:endDate IS NULL OR bi.booking_date <= :endDate)
-       ORDER BY bi.booking_date DESC, m.name, bo.sort_order, bo.code`,
+         AND (:startDate IS NULL OR DATE(b.created_at) >= :startDate)
+         AND (:endDate IS NULL OR DATE(b.created_at) <= :endDate)
+       ORDER BY b.created_at DESC, m.name, bo.sort_order, bo.code`,
       {
         organizationId: req.auth.organizationId,
         adminUserId: req.auth.sub,
@@ -3341,7 +3343,22 @@ router.get(
         endDate: req.query.endDate || null,
       },
     );
-    return ok(res, rows);
+    return ok(
+      res,
+      rows.map((row) => ({
+        ...row,
+        customer_name: [decryptField(row.first_name_enc), decryptField(row.last_name_enc)].filter(Boolean).join(' ').trim()
+          || decryptField(row.username_enc)
+          || decryptField(row.email_enc)
+          || '-',
+        customer_phone: decryptField(row.phone_enc) || '-',
+        username_enc: undefined,
+        first_name_enc: undefined,
+        last_name_enc: undefined,
+        phone_enc: undefined,
+        email_enc: undefined,
+      })),
+    );
   }),
 );
 
