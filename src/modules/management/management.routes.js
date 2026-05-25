@@ -1051,7 +1051,7 @@ router.post(
           subject, message, status, related_event_log_id, metadata_json
         ) VALUES (
           :organizationId, :taggedOrganizationId, :createdByAdminId, :category, :topic, :priority,
-          :subject, :message, 'open', :relatedEventLogId, :metadataJson
+          :subject, :message, 'opened', :relatedEventLogId, :metadataJson
         )`,
         {
           organizationId: req.auth.organizationId,

@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS support_tickets (
   priority ENUM('low','normal','high','urgent') NULL,
   subject VARCHAR(255) NOT NULL,
   message TEXT NOT NULL,
-  status ENUM('open','in_progress','resolved','closed') NOT NULL DEFAULT 'open',
+  status ENUM('opened','processing','reply','closed') NOT NULL DEFAULT 'opened',
   related_event_log_id BIGINT UNSIGNED NULL,
   metadata_json JSON NULL,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
