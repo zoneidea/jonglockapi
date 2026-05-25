@@ -13,12 +13,44 @@ const { publicId } = require('../../utils/id');
 const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/password-policy');
 const { expireStaleBookings } = require('../../utils/booking-status');
 const { PAYMENT_EXPIRES_MINUTES } = require('../../constants/booking');
-const { attachBookingItemToLock, insertBoothDateLock } = require('../../utils/booth-locks');
 const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
 const { requireSubscriptionForMutations } = require('../../services/subscription.service');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
+
+function arrayPlaceholders(values, prefix) {
+  return values.map((_, index) => `:${prefix}${index}`).join(', ');
+}
+
+function arrayParams(values, prefix) {
+  return values.reduce((params, value, index) => {
+    params[`${prefix}${index}`] = value;
+    return params;
+  }, {});
+}
+
+function dateKey(value) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString().slice(0, 10);
+  return String(value || '').slice(0, 10);
+}
+
+function buildInsertRows(rows, columns, prefix) {
+  const params = {};
+  const valuesSql = rows.map((row, rowIndex) => {
+    const placeholders = columns.map((column) => {
+      const key = `${prefix}${rowIndex}_${column.key}`;
+      params[key] = row[column.key];
+      return `:${key}`;
+    });
+    return `(${placeholders.join(', ')})`;
+  });
+  return { sql: valuesSql.join(', '), params };
+}
+
+function isDuplicateKeyError(error) {
+  return error?.code === 'ER_DUP_ENTRY' || error?.errno === 1062;
+}
 
 const loginSchema = z.object({
   body: z.object({
@@ -207,48 +239,73 @@ router.post(
   ),
   asyncHandler(async (req, res) => {
     const { marketId, items } = req.validated.body;
+    await expireStaleBookings({ execute: query }, req.auth.organizationId);
+    const vatSettings = await getOrganizationVatSettings({ execute: query }, req.auth.organizationId);
     const result = await transaction(async (conn) => {
-      await expireStaleBookings(conn, req.auth.organizationId);
       const [marketRows] = await conn.execute(
-        `SELECT id FROM markets WHERE id = :marketId AND organization_id = :organizationId AND status = 'active' FOR UPDATE`,
+        `SELECT id FROM markets WHERE id = :marketId AND organization_id = :organizationId AND status = 'active' LIMIT 1`,
         { marketId, organizationId: req.auth.organizationId },
       );
       if (!marketRows.length) throw notFound('Market not found');
 
-      const vatSettings = await getOrganizationVatSettings(conn, req.auth.organizationId);
+      const boothIds = Array.from(new Set(items.map((item) => Number(item.boothId))));
+      const [boothRows] = await conn.execute(
+        `SELECT id, floor_plan_id, price
+         FROM booths
+         WHERE organization_id = :organizationId
+           AND market_id = :marketId
+           AND status = 'active'
+           AND id IN (${arrayPlaceholders(boothIds, 'boothId')})
+         ORDER BY id ASC`,
+        {
+          organizationId: req.auth.organizationId,
+          marketId,
+          ...arrayParams(boothIds, 'boothId'),
+        },
+      );
+      const boothById = new Map(boothRows.map((booth) => [Number(booth.id), booth]));
+
+      const requestedAccessories = items.flatMap((item) => item.accessories || []);
+      const accessoryIds = Array.from(new Set(requestedAccessories.map((accessory) => Number(accessory.accessoryId))));
+      let accessoryById = new Map();
+      if (accessoryIds.length) {
+        const [accessoryRows] = await conn.execute(
+          `SELECT id, price
+           FROM accessories
+           WHERE organization_id = :organizationId
+             AND market_id = :marketId
+             AND status = 'active'
+             AND id IN (${arrayPlaceholders(accessoryIds, 'accessoryId')})
+           ORDER BY id ASC`,
+          {
+            organizationId: req.auth.organizationId,
+            marketId,
+            ...arrayParams(accessoryIds, 'accessoryId'),
+          },
+        );
+        accessoryById = new Map(accessoryRows.map((accessory) => [Number(accessory.id), accessory]));
+      }
+
       let subtotal = 0;
       const pricedItems = [];
+      const itemKeys = new Set();
       for (const item of items) {
-        const [boothRows] = await conn.execute(
-          `SELECT id, floor_plan_id, price FROM booths
-           WHERE id = :boothId AND market_id = :marketId AND organization_id = :organizationId AND status = 'active'
-           FOR UPDATE`,
-          { boothId: item.boothId, marketId, organizationId: req.auth.organizationId },
-        );
-        if (!boothRows.length) throw badRequest(`Booth ${item.boothId} is not available`);
+        const duplicateKey = `${item.boothId}:${item.bookingDate}`;
+        if (itemKeys.has(duplicateKey)) throw badRequest(`Booth ${item.boothId} on ${item.bookingDate} is duplicated`);
+        itemKeys.add(duplicateKey);
 
-        const unitPrice = Number(boothRows[0].price || 0);
+        const booth = boothById.get(Number(item.boothId));
+        if (!booth) throw badRequest(`Booth ${item.boothId} is not available`);
+
+        const unitPrice = Number(booth.price || 0);
         let accessoryAmount = 0;
         for (const accessory of item.accessories) {
-          const [accessoryRows] = await conn.execute(
-            `SELECT id, price
-             FROM accessories
-             WHERE id = :accessoryId
-               AND organization_id = :organizationId
-               AND market_id = :marketId
-               AND status = 'active'
-             LIMIT 1`,
-            {
-              accessoryId: accessory.accessoryId,
-              organizationId: req.auth.organizationId,
-              marketId,
-            },
-          );
-          if (!accessoryRows.length) throw badRequest(`Accessory ${accessory.accessoryId} is not available`);
-          accessoryAmount += Number(accessoryRows[0].price || 0) * Number(accessory.quantity || 1);
+          const accessoryRow = accessoryById.get(Number(accessory.accessoryId));
+          if (!accessoryRow) throw badRequest(`Accessory ${accessory.accessoryId} is not available`);
+          accessoryAmount += Number(accessoryRow.price || 0) * Number(accessory.quantity || 1);
         }
         subtotal += unitPrice + accessoryAmount;
-        pricedItems.push({ ...item, floorPlanId: boothRows[0].floor_plan_id, unitPrice });
+        pricedItems.push({ ...item, floorPlanId: booth.floor_plan_id, unitPrice });
       }
       const totals = calculateVatBreakdown(subtotal, 0, vatSettings);
 
@@ -278,60 +335,134 @@ router.post(
       );
       const expiresAt = createdBookings[0]?.expires_at || null;
 
-      for (const item of pricedItems) {
-        await insertBoothDateLock(conn, {
-          organizationId: req.auth.organizationId,
-          marketId,
-          floorPlanId: item.floorPlanId,
-          boothId: item.boothId,
-          bookingId: bookingResult.insertId,
-          bookingDate: item.bookingDate,
-          status: 'held',
-          expiresAt,
-        });
-
-        const [detailResult] = await conn.execute(
-          `INSERT INTO booking_items (
-            organization_id, booking_id, booth_id, booking_date, unit_price, status
-          ) VALUES (
-            :organizationId, :bookingId, :boothId, :bookingDate, :unitPrice, 'pending_payment'
-          )`,
-          {
-            organizationId: req.auth.organizationId,
-            bookingId: bookingResult.insertId,
-            boothId: item.boothId,
-            bookingDate: item.bookingDate,
-            unitPrice: item.unitPrice,
-          },
+      const lockRows = pricedItems.map((item) => ({
+        organizationId: req.auth.organizationId,
+        marketId,
+        floorPlanId: item.floorPlanId,
+        boothId: item.boothId,
+        bookingId: bookingResult.insertId,
+        bookingItemId: null,
+        bookingDate: item.bookingDate,
+        status: 'held',
+        expiresAt,
+      }));
+      const lockInsert = buildInsertRows(lockRows, [
+        { key: 'organizationId' },
+        { key: 'marketId' },
+        { key: 'floorPlanId' },
+        { key: 'boothId' },
+        { key: 'bookingId' },
+        { key: 'bookingItemId' },
+        { key: 'bookingDate' },
+        { key: 'status' },
+        { key: 'expiresAt' },
+      ], 'lock');
+      try {
+        await conn.execute(
+          `INSERT INTO booth_date_locks (
+            organization_id, market_id, floor_plan_id, booth_id, booking_id, booking_item_id,
+            booking_date, status, expires_at
+          ) VALUES ${lockInsert.sql}`,
+          lockInsert.params,
         );
-        await attachBookingItemToLock(conn, {
-          organizationId: req.auth.organizationId,
-          bookingId: bookingResult.insertId,
-          boothId: item.boothId,
-          bookingDate: item.bookingDate,
-          bookingItemId: detailResult.insertId,
-        });
+      } catch (error) {
+        if (isDuplicateKeyError(error)) throw conflict('Some selected booth dates are no longer available');
+        throw error;
+      }
+
+      const itemRows = pricedItems.map((item) => ({
+        organizationId: req.auth.organizationId,
+        bookingId: bookingResult.insertId,
+        boothId: item.boothId,
+        bookingDate: item.bookingDate,
+        unitPrice: item.unitPrice,
+        status: 'pending_payment',
+      }));
+      const itemInsert = buildInsertRows(itemRows, [
+        { key: 'organizationId' },
+        { key: 'bookingId' },
+        { key: 'boothId' },
+        { key: 'bookingDate' },
+        { key: 'unitPrice' },
+        { key: 'status' },
+      ], 'item');
+      await conn.execute(
+        `INSERT INTO booking_items (
+          organization_id, booking_id, booth_id, booking_date, unit_price, status
+        ) VALUES ${itemInsert.sql}`,
+        itemInsert.params,
+      );
+
+      await conn.execute(
+        `UPDATE booth_date_locks bdl
+         JOIN booking_items bi
+           ON bi.organization_id = bdl.organization_id
+          AND bi.booking_id = bdl.booking_id
+          AND bi.booth_id = bdl.booth_id
+          AND bi.booking_date = bdl.booking_date
+         SET bdl.booking_item_id = bi.id
+         WHERE bdl.organization_id = :organizationId
+           AND bdl.booking_id = :bookingId`,
+        { organizationId: req.auth.organizationId, bookingId: bookingResult.insertId },
+      );
+
+      const [createdItems] = await conn.execute(
+        `SELECT id, booth_id, DATE_FORMAT(booking_date, '%Y-%m-%d') AS booking_date
+         FROM booking_items
+         WHERE organization_id = :organizationId AND booking_id = :bookingId`,
+        { organizationId: req.auth.organizationId, bookingId: bookingResult.insertId },
+      );
+      const bookingItemByBoothDate = new Map(createdItems.map((item) => [`${item.booth_id}:${dateKey(item.booking_date)}`, item.id]));
+
+      const bookingProductRows = [];
+      const bookingAccessoryRows = [];
+      for (const item of pricedItems) {
+        const bookingItemId = bookingItemByBoothDate.get(`${item.boothId}:${item.bookingDate}`);
+        if (!bookingItemId) throw badRequest(`Booking item for booth ${item.boothId} on ${item.bookingDate} was not created`);
 
         for (const productId of item.productIds) {
-          await conn.execute(
-            `INSERT INTO booking_products (organization_id, booking_item_id, product_id)
-             VALUES (:organizationId, :bookingItemId, :productId)`,
-            { organizationId: req.auth.organizationId, bookingItemId: detailResult.insertId, productId },
-          );
+          bookingProductRows.push({
+            organizationId: req.auth.organizationId,
+            bookingItemId,
+            productId,
+          });
         }
 
         for (const accessory of item.accessories) {
-          await conn.execute(
-            `INSERT INTO booking_accessories (organization_id, booking_item_id, accessory_id, quantity)
-             VALUES (:organizationId, :bookingItemId, :accessoryId, :quantity)`,
-            {
-              organizationId: req.auth.organizationId,
-              bookingItemId: detailResult.insertId,
-              accessoryId: accessory.accessoryId,
-              quantity: accessory.quantity,
-            },
-          );
+          bookingAccessoryRows.push({
+            organizationId: req.auth.organizationId,
+            bookingItemId,
+            accessoryId: accessory.accessoryId,
+            quantity: accessory.quantity,
+          });
         }
+      }
+
+      if (bookingProductRows.length) {
+        const productInsert = buildInsertRows(bookingProductRows, [
+          { key: 'organizationId' },
+          { key: 'bookingItemId' },
+          { key: 'productId' },
+        ], 'product');
+        await conn.execute(
+          `INSERT INTO booking_products (organization_id, booking_item_id, product_id)
+           VALUES ${productInsert.sql}`,
+          productInsert.params,
+        );
+      }
+
+      if (bookingAccessoryRows.length) {
+        const accessoryInsert = buildInsertRows(bookingAccessoryRows, [
+          { key: 'organizationId' },
+          { key: 'bookingItemId' },
+          { key: 'accessoryId' },
+          { key: 'quantity' },
+        ], 'bookingAccessory');
+        await conn.execute(
+          `INSERT INTO booking_accessories (organization_id, booking_item_id, accessory_id, quantity)
+           VALUES ${accessoryInsert.sql}`,
+          accessoryInsert.params,
+        );
       }
 
       return { id: bookingResult.insertId, publicId: publicBookingId, ...totals };
