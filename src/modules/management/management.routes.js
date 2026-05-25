@@ -3,6 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
+const XLSX = require('xlsx');
 const { z } = require('zod');
 const { query, transaction } = require('../../config/db');
 const { authenticate } = require('../../middlewares/auth');
@@ -127,6 +128,17 @@ const paymentAssetUpload = multer({
   limits: { files: 1, fileSize: 5 * 1024 * 1024 },
   fileFilter(req, file, callback) {
     if (!allowedImageTypes.has(file.mimetype)) return callback(badRequest('Only JPG, PNG, WEBP, and GIF images are allowed'));
+    return callback(null, true);
+  },
+});
+
+const bookingImportUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { files: 1, fileSize: 2 * 1024 * 1024 },
+  fileFilter(req, file, callback) {
+    const extension = path.extname(file.originalname || '').toLowerCase();
+    const allowed = new Set(['.xlsx', '.xls', '.csv']);
+    if (!allowed.has(extension)) return callback(badRequest('Only XLSX, XLS, or CSV files are allowed'));
     return callback(null, true);
   },
 });
@@ -303,6 +315,272 @@ const ACCOUNTING_DOCUMENT_PREFIX = {
 
 function toJson(value) {
   return JSON.stringify(value || null);
+}
+
+function normalizeCell(value) {
+  return String(value ?? '').trim();
+}
+
+function normalizeBookingDateCell(value) {
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return value.toISOString().slice(0, 10);
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const parsed = XLSX.SSF.parse_date_code(value);
+    if (parsed?.y && parsed?.m && parsed?.d) {
+      return `${parsed.y}-${String(parsed.m).padStart(2, '0')}-${String(parsed.d).padStart(2, '0')}`;
+    }
+  }
+  const raw = normalizeCell(value);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+  const slashMatch = raw.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (slashMatch) {
+    return `${slashMatch[3]}-${slashMatch[2].padStart(2, '0')}-${slashMatch[1].padStart(2, '0')}`;
+  }
+  return raw;
+}
+
+function dateOnly(value) {
+  if (!value) return '';
+  if (value instanceof Date && !Number.isNaN(value.getTime())) return value.toISOString().slice(0, 10);
+  return String(value).slice(0, 10);
+}
+
+function bookingImportRowsFromWorkbook(fileBuffer) {
+  const workbook = XLSX.read(fileBuffer, { type: 'buffer', cellDates: true });
+  const firstSheetName = workbook.SheetNames[0];
+  if (!firstSheetName) throw badRequest('Excel file has no sheet');
+  const worksheet = workbook.Sheets[firstSheetName];
+  const rows = XLSX.utils.sheet_to_json(worksheet, { defval: '', raw: false });
+  return rows
+    .map((row, index) => ({
+      rowNumber: index + 2,
+      customerIdentifier: normalizeCell(row.customer_identifier || row.customerIdentifier || row['รหัสลูกค้า/อีเมล/เบอร์โทร']),
+      bookingDate: normalizeBookingDateCell(row.booking_date || row.bookingDate || row['วันที่จอง']),
+      boothCode: normalizeCell(row.booth_code || row.boothCode || row['รหัสบูธ']),
+      productName: normalizeCell(row.product_name || row.productName || row['สินค้า']),
+      note: normalizeCell(row.note || row['หมายเหตุ']),
+    }))
+    .filter((row) => row.customerIdentifier || row.bookingDate || row.boothCode || row.productName);
+}
+
+async function resolveImportMobileUser(conn, organizationId, identifier) {
+  const raw = normalizeCell(identifier);
+  const lower = raw.toLowerCase();
+  const digits = raw.replace(/\D/g, '');
+  const candidates = [...new Set([raw, lower, digits].filter(Boolean))];
+  const hashCandidates = candidates.map((value) => blindIndex(value));
+  const [rows] = await conn.execute(
+    `SELECT id, public_id, first_name_enc, last_name_enc
+     FROM mobile_users
+     WHERE organization_id = :organizationId
+       AND status = 'active'
+       AND (
+         public_id = :rawIdentifier
+         OR username_hash IN (:hash0, :hash1, :hash2)
+         OR email_hash IN (:hash0, :hash1, :hash2)
+         OR phone_hash IN (:hash0, :hash1, :hash2)
+       )
+     LIMIT 1`,
+    {
+      organizationId,
+      rawIdentifier: raw,
+      hash0: hashCandidates[0] || '__no_hash_0__',
+      hash1: hashCandidates[1] || '__no_hash_1__',
+      hash2: hashCandidates[2] || '__no_hash_2__',
+    },
+  );
+  return rows[0] || null;
+}
+
+async function resolveImportBooth(conn, organizationId, marketId, boothCode) {
+  const [rows] = await conn.execute(
+    `SELECT b.id, b.floor_plan_id, b.category_id, b.code, b.name, b.price,
+            fp.start_date AS floor_plan_start_date,
+            fp.end_date AS floor_plan_end_date,
+            fp.status AS floor_plan_status
+     FROM booths b
+     LEFT JOIN floor_plans fp ON fp.id = b.floor_plan_id AND fp.organization_id = b.organization_id
+     WHERE b.organization_id = :organizationId
+       AND b.market_id = :marketId
+       AND b.code = :boothCode
+       AND b.status = 'active'
+     LIMIT 1
+     FOR UPDATE`,
+    { organizationId, marketId, boothCode },
+  );
+  return rows[0] || null;
+}
+
+async function resolveImportProduct(conn, organizationId, marketId, productName) {
+  const [rows] = await conn.execute(
+    `SELECT id, category_id, name
+     FROM products
+     WHERE organization_id = :organizationId
+       AND market_id = :marketId
+       AND name = :productName
+       AND status = 'active'
+     ORDER BY id ASC
+     LIMIT 1`,
+    { organizationId, marketId, productName },
+  );
+  return rows[0] || null;
+}
+
+async function createMobileNotification(conn, {
+  organizationId,
+  mobileUserId,
+  title,
+  body,
+  data,
+}) {
+  await conn.execute(
+    `INSERT INTO mobile_notifications (
+      organization_id, mobile_user_id, title, body, data_json, channel, status
+    ) VALUES (
+      :organizationId, :mobileUserId, :title, :body, :dataJson, 'in_app', 'unread'
+    )`,
+    {
+      organizationId,
+      mobileUserId,
+      title,
+      body,
+      dataJson: toJson(data),
+    },
+  );
+}
+
+async function createManagementBooking(conn, {
+  organizationId,
+  marketId,
+  mobileUserId,
+  items,
+  adminUserId,
+  notify = false,
+}) {
+  await expireStaleBookings(conn, organizationId);
+  const [users] = await conn.execute(
+    `SELECT id
+     FROM mobile_users
+     WHERE id = :mobileUserId AND organization_id = :organizationId AND status = 'active'
+     LIMIT 1`,
+    { mobileUserId, organizationId },
+  );
+  const mobileUser = users[0];
+  if (!mobileUser) throw notFound('Mobile user not found');
+
+  const vatSettings = await getOrganizationVatSettings(conn, organizationId);
+  let subtotal = 0;
+  const pricedItems = [];
+  for (const item of items) {
+    const [booths] = await conn.execute(
+      `SELECT id, floor_plan_id, category_id, price
+       FROM booths
+       WHERE id = :boothId AND market_id = :marketId AND organization_id = :organizationId AND status = 'active'
+       LIMIT 1
+       FOR UPDATE`,
+      { boothId: item.boothId, marketId, organizationId },
+    );
+    if (!booths.length) throw badRequest(`Booth ${item.boothId} is not available`);
+
+    const unitPrice = Number(booths[0].price || 0);
+    subtotal += unitPrice;
+    pricedItems.push({ ...item, floorPlanId: booths[0].floor_plan_id, unitPrice });
+  }
+  const totals = calculateVatBreakdown(subtotal, 0, vatSettings);
+
+  const publicBookingId = publicId('BK');
+  const [booking] = await conn.execute(
+    `INSERT INTO bookings (
+      organization_id, public_id, market_id, mobile_user_id, created_by_admin_id, source, cart_visible, status,
+      subtotal_amount, discount_amount, vat_amount, total_amount, expires_at
+    ) VALUES (
+      :organizationId, :publicId, :marketId, :mobileUserId, :createdByAdminId, 'management', 1, 'pending_payment',
+      :subtotalAmount, :discountAmount, :vatAmount, :totalAmount, DATE_ADD(NOW(), INTERVAL ${PAYMENT_EXPIRES_MINUTES} MINUTE)
+    )`,
+    {
+      organizationId,
+      publicId: publicBookingId,
+      marketId,
+      mobileUserId,
+      createdByAdminId: adminUserId,
+      subtotalAmount: totals.subtotalAmount,
+      discountAmount: totals.discountAmount,
+      vatAmount: totals.vatAmount,
+      totalAmount: totals.totalAmount,
+    },
+  );
+  const [createdBookings] = await conn.execute(
+    `SELECT expires_at FROM bookings WHERE id = :bookingId AND organization_id = :organizationId LIMIT 1`,
+    { organizationId, bookingId: booking.insertId },
+  );
+  const expiresAt = createdBookings[0]?.expires_at || null;
+
+  for (const item of pricedItems) {
+    await insertBoothDateLock(conn, {
+      organizationId,
+      marketId,
+      floorPlanId: item.floorPlanId,
+      boothId: item.boothId,
+      bookingId: booking.insertId,
+      bookingDate: item.bookingDate,
+      status: 'held',
+      expiresAt,
+    });
+
+    const [bookingItem] = await conn.execute(
+      `INSERT INTO booking_items (organization_id, booking_id, booth_id, booking_date, unit_price, status)
+       VALUES (:organizationId, :bookingId, :boothId, :bookingDate, :unitPrice, 'pending_payment')`,
+      {
+        organizationId,
+        bookingId: booking.insertId,
+        boothId: item.boothId,
+        bookingDate: item.bookingDate,
+        unitPrice: item.unitPrice,
+      },
+    );
+    await attachBookingItemToLock(conn, {
+      organizationId,
+      bookingId: booking.insertId,
+      boothId: item.boothId,
+      bookingDate: item.bookingDate,
+      bookingItemId: bookingItem.insertId,
+    });
+
+    for (const productId of item.productIds || []) {
+      await conn.execute(
+        `INSERT INTO booking_products (organization_id, booking_item_id, product_id)
+         VALUES (:organizationId, :bookingItemId, :productId)`,
+        { organizationId, bookingItemId: bookingItem.insertId, productId },
+      );
+    }
+  }
+
+  if (notify) {
+    await createMobileNotification(conn, {
+      organizationId,
+      mobileUserId,
+      title: 'มีรายการจองรอชำระเงิน',
+      body: `ใบจอง ${publicBookingId} พร้อมให้ชำระเงินผ่านแอปฯ แล้ว`,
+      data: {
+        type: 'management_booking_created',
+        bookingId: booking.insertId,
+        publicId: publicBookingId,
+        marketId,
+        totalAmount: totals.totalAmount,
+        expiresAt,
+      },
+    });
+  }
+
+  return {
+    id: booking.insertId,
+    publicId: publicBookingId,
+    expiresAt,
+    ...totals,
+    paymentRequiredInMobile: true,
+    notificationQueued: notify,
+  };
 }
 
 function normalizeJsonValue(value) {
@@ -2244,105 +2522,124 @@ router.post(
     const { mobileUserId, items } = req.validated.body;
 
     const result = await transaction(async (conn) => {
-      await expireStaleBookings(conn, req.auth.organizationId);
-      const [users] = await conn.execute(
-        `SELECT id FROM mobile_users
-         WHERE id = :mobileUserId AND organization_id = :organizationId AND status = 'active'
-         LIMIT 1`,
-        { mobileUserId, organizationId: req.auth.organizationId },
-      );
-      if (!users.length) throw notFound('Mobile user not found');
-
-      const vatSettings = await getOrganizationVatSettings(conn, req.auth.organizationId);
-      let subtotal = 0;
-      const pricedItems = [];
-      for (const item of items) {
-        const [booths] = await conn.execute(
-          `SELECT id, floor_plan_id, price FROM booths
-           WHERE id = :boothId AND market_id = :marketId AND organization_id = :organizationId AND status = 'active'
-           LIMIT 1
-           FOR UPDATE`,
-          { boothId: item.boothId, marketId, organizationId: req.auth.organizationId },
-        );
-        if (!booths.length) throw badRequest(`Booth ${item.boothId} is not available`);
-
-        const unitPrice = Number(booths[0].price || 0);
-        subtotal += unitPrice;
-        pricedItems.push({ ...item, floorPlanId: booths[0].floor_plan_id, unitPrice });
-      }
-      const totals = calculateVatBreakdown(subtotal, 0, vatSettings);
-
-      const publicBookingId = publicId('BK');
-      const [booking] = await conn.execute(
-        `INSERT INTO bookings (
-          organization_id, public_id, market_id, mobile_user_id, created_by_admin_id, source, status,
-          subtotal_amount, discount_amount, vat_amount, total_amount, expires_at
-        ) VALUES (
-          :organizationId, :publicId, :marketId, :mobileUserId, :createdByAdminId, 'management', 'pending_payment',
-          :subtotalAmount, :discountAmount, :vatAmount, :totalAmount, DATE_ADD(NOW(), INTERVAL ${PAYMENT_EXPIRES_MINUTES} MINUTE)
-        )`,
-        {
-          organizationId: req.auth.organizationId,
-          publicId: publicBookingId,
-          marketId,
-          mobileUserId,
-          createdByAdminId: req.auth.sub,
-          subtotalAmount: totals.subtotalAmount,
-          discountAmount: totals.discountAmount,
-          vatAmount: totals.vatAmount,
-          totalAmount: totals.totalAmount,
-        },
-      );
-      const [createdBookings] = await conn.execute(
-        `SELECT expires_at FROM bookings WHERE id = :bookingId AND organization_id = :organizationId LIMIT 1`,
-        { organizationId: req.auth.organizationId, bookingId: booking.insertId },
-      );
-      const expiresAt = createdBookings[0]?.expires_at || null;
-
-      for (const item of pricedItems) {
-        await insertBoothDateLock(conn, {
-          organizationId: req.auth.organizationId,
-          marketId,
-          floorPlanId: item.floorPlanId,
-          boothId: item.boothId,
-          bookingId: booking.insertId,
-          bookingDate: item.bookingDate,
-          status: 'held',
-          expiresAt,
-        });
-
-        const [bookingItem] = await conn.execute(
-          `INSERT INTO booking_items (organization_id, booking_id, booth_id, booking_date, unit_price, status)
-           VALUES (:organizationId, :bookingId, :boothId, :bookingDate, :unitPrice, 'pending_payment')`,
-          {
-            organizationId: req.auth.organizationId,
-            bookingId: booking.insertId,
-            boothId: item.boothId,
-            bookingDate: item.bookingDate,
-            unitPrice: item.unitPrice,
-          },
-        );
-        await attachBookingItemToLock(conn, {
-          organizationId: req.auth.organizationId,
-          bookingId: booking.insertId,
-          boothId: item.boothId,
-          bookingDate: item.bookingDate,
-          bookingItemId: bookingItem.insertId,
-        });
-
-        for (const productId of item.productIds) {
-          await conn.execute(
-            `INSERT INTO booking_products (organization_id, booking_item_id, product_id)
-             VALUES (:organizationId, :bookingItemId, :productId)`,
-            { organizationId: req.auth.organizationId, bookingItemId: bookingItem.insertId, productId },
-          );
-        }
-      }
-
-      return { id: booking.insertId, publicId: publicBookingId, ...totals, paymentRequiredInMobile: true };
+      return createManagementBooking(conn, {
+        organizationId: req.auth.organizationId,
+        marketId,
+        mobileUserId,
+        items,
+        adminUserId: req.auth.sub,
+        notify: true,
+      });
     });
 
     return created(res, result, 'management booking created');
+  }),
+);
+
+router.post(
+  '/markets/:marketId/bookings/import',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  bookingImportUpload.single('file'),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({}).passthrough(),
+      params: z.object({ marketId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    if (!req.file?.buffer) throw badRequest('Excel file is required');
+    const marketId = req.validated.params.marketId;
+    const rows = bookingImportRowsFromWorkbook(req.file.buffer);
+    if (!rows.length) throw badRequest('Excel file has no booking rows');
+    if (rows.length > 500) throw badRequest('Import supports up to 500 rows per file');
+
+    const groups = new Map();
+    for (const row of rows) {
+      if (!row.customerIdentifier) throw badRequest(`Row ${row.rowNumber}: customer_identifier is required`);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(row.bookingDate)) throw badRequest(`Row ${row.rowNumber}: booking_date must be YYYY-MM-DD`);
+      if (!row.boothCode) throw badRequest(`Row ${row.rowNumber}: booth_code is required`);
+      if (!row.productName) throw badRequest(`Row ${row.rowNumber}: product_name is required`);
+      const key = row.customerIdentifier.toLowerCase();
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key).push(row);
+    }
+
+    const successes = [];
+    const errors = [];
+    for (const groupRows of groups.values()) {
+      try {
+        const result = await transaction(async (conn) => {
+          const user = await resolveImportMobileUser(conn, req.auth.organizationId, groupRows[0].customerIdentifier);
+          if (!user) throw notFound(`Customer not found: ${groupRows[0].customerIdentifier}`);
+
+          const items = [];
+          for (const row of groupRows) {
+            const booth = await resolveImportBooth(conn, req.auth.organizationId, marketId, row.boothCode);
+            if (!booth) throw notFound(`Row ${row.rowNumber}: Booth ${row.boothCode} not found`);
+            if (booth.floor_plan_status && booth.floor_plan_status !== 'active') {
+              throw badRequest(`Row ${row.rowNumber}: Booth ${row.boothCode} floor plan is inactive`);
+            }
+            const startDate = dateOnly(booth.floor_plan_start_date);
+            const endDate = dateOnly(booth.floor_plan_end_date);
+            if ((startDate && row.bookingDate < startDate) || (endDate && row.bookingDate > endDate)) {
+              throw badRequest(`Row ${row.rowNumber}: booking date is outside booth floor plan date range`);
+            }
+
+            const product = await resolveImportProduct(conn, req.auth.organizationId, marketId, row.productName);
+            if (!product) throw notFound(`Row ${row.rowNumber}: Product ${row.productName} not found`);
+            if (Number(product.category_id || 0) !== Number(booth.category_id || 0)) {
+              throw badRequest(`Row ${row.rowNumber}: Product category does not match Booth category`);
+            }
+
+            items.push({
+              boothId: booth.id,
+              bookingDate: row.bookingDate,
+              productIds: [product.id],
+            });
+          }
+
+          const booking = await createManagementBooking(conn, {
+            organizationId: req.auth.organizationId,
+            marketId,
+            mobileUserId: user.id,
+            items,
+            adminUserId: req.auth.sub,
+            notify: true,
+          });
+          return {
+            customerIdentifier: groupRows[0].customerIdentifier,
+            mobileUserId: user.id,
+            rowNumbers: groupRows.map((row) => row.rowNumber),
+            itemCount: items.length,
+            ...booking,
+          };
+        });
+        successes.push(result);
+      } catch (error) {
+        for (const row of groupRows) {
+          errors.push({
+            rowNumber: row.rowNumber,
+            customerIdentifier: row.customerIdentifier,
+            message: error.message || 'Import failed',
+          });
+        }
+      }
+    }
+
+    return created(
+      res,
+      {
+        totalRows: rows.length,
+        totalGroups: groups.size,
+        successCount: successes.length,
+        errorCount: errors.length,
+        successes,
+        errors,
+      },
+      'booking import completed',
+    );
   }),
 );
 
