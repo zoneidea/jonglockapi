@@ -940,6 +940,7 @@ router.get(
   '/support/tickets',
   asyncHandler(async (req, res) => {
     const limit = Math.min(Number(req.query.limit || 100), 300);
+    const categoryFilter = String(req.query.category || '').trim();
     const rows = await query(
       `SELECT st.id, st.category, st.topic, st.priority, st.subject, st.message, st.status,
               st.related_event_log_id, st.tagged_organization_id, st.created_by_admin_id,
@@ -955,12 +956,17 @@ router.get(
          ON stm.support_ticket_id = st.id
         AND stm.organization_id = st.organization_id
        WHERE st.organization_id = :organizationId
+         AND (
+           :categoryFilter = ''
+           OR (:categoryFilter = 'ticket' AND st.category <> 'inquiry')
+           OR st.category = :categoryFilter
+         )
        GROUP BY st.id, st.category, st.topic, st.priority, st.subject, st.message, st.status,
                 st.related_event_log_id, st.tagged_organization_id, st.created_by_admin_id,
                 st.created_at, st.updated_at
        ORDER BY st.updated_at DESC, st.id DESC
        LIMIT :limit`,
-      { organizationId: req.auth.organizationId, limit },
+      { organizationId: req.auth.organizationId, categoryFilter, limit },
     );
     return ok(res, rows);
   }),
@@ -976,6 +982,9 @@ router.post(
     const priorityValues = new Set(supportCategories().priorities.map((item) => item.value));
     if (!categoryValues.has(body.category)) throw badRequest('Invalid support category');
     if (!topicValues.has(body.topic)) throw badRequest('Invalid support topic');
+    if (body.category === 'inquiry' && body.topic === 'feature_request') {
+      throw badRequest('Feature requests must be submitted as a ticket');
+    }
     if (body.category === 'issue' && !priorityValues.has(body.priority)) throw badRequest('Invalid support priority');
     if (!body.subject) throw badRequest('Subject is required');
     if (!body.message) throw badRequest('Message is required');
