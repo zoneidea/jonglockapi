@@ -429,6 +429,40 @@ async function insertSupportAttachments(conn, req, { organizationId, ticketId, m
   }
 }
 
+async function ensureSupportChatAccess(conn, organizationId, chatId) {
+  const [rows] = await conn.execute(
+    `SELECT id, organization_id, created_by_admin_id, subject, status, created_at, updated_at
+     FROM support_chats
+     WHERE id = :chatId AND organization_id = :organizationId
+     LIMIT 1`,
+    { organizationId, chatId },
+  );
+  if (!rows.length) throw notFound('Support chat not found');
+  return rows[0];
+}
+
+async function insertSupportChatAttachments(conn, req, { organizationId, chatId, messageId = null }) {
+  const files = req.files || [];
+  for (const file of files) {
+    await conn.execute(
+      `INSERT INTO support_chat_attachments (
+        organization_id, support_chat_id, support_chat_message_id, file_url, file_name, file_size, mime_type
+      ) VALUES (
+        :organizationId, :chatId, :messageId, :fileUrl, :fileName, :fileSize, :mimeType
+      )`,
+      {
+        organizationId,
+        chatId,
+        messageId,
+        fileUrl: publicUploadUrl(req, file.path),
+        fileName: file.originalname || file.filename,
+        fileSize: file.size || 0,
+        mimeType: file.mimetype || null,
+      },
+    );
+  }
+}
+
 async function linkSupportEventLogs(conn, { organizationId, ticketId, eventLogIds }) {
   if (!eventLogIds.length) return [];
   const placeholders = eventLogIds.map((_, index) => `:eventLogId${index}`).join(', ');
@@ -1205,6 +1239,159 @@ router.post(
       return { id: message.insertId };
     });
     return created(res, result, 'support message created');
+  }),
+);
+
+router.get(
+  '/support/chats',
+  asyncHandler(async (req, res) => {
+    const limit = Math.min(Number(req.query.limit || 100), 300);
+    const rows = await query(
+      `SELECT sc.id, sc.subject, sc.status, sc.created_by_admin_id, sc.created_at, sc.updated_at,
+              COUNT(DISTINCT scm.id) AS message_count,
+              COUNT(DISTINCT sca.id) AS attachment_count,
+              MAX(scm.created_at) AS last_message_at
+       FROM support_chats sc
+       LEFT JOIN support_chat_messages scm
+         ON scm.support_chat_id = sc.id
+        AND scm.organization_id = sc.organization_id
+       LEFT JOIN support_chat_attachments sca
+         ON sca.support_chat_id = sc.id
+        AND sca.organization_id = sc.organization_id
+       WHERE sc.organization_id = :organizationId
+       GROUP BY sc.id, sc.subject, sc.status, sc.created_by_admin_id, sc.created_at, sc.updated_at
+       ORDER BY sc.updated_at DESC, sc.id DESC
+       LIMIT :limit`,
+      { organizationId: req.auth.organizationId, limit },
+    );
+    return ok(res, rows);
+  }),
+);
+
+router.post(
+  '/support/chats',
+  supportAttachmentUpload.array('attachments', 10),
+  asyncHandler(async (req, res) => {
+    const subject = normalizeCell(req.body?.subject || 'สอบถามทั่วไป');
+    const messageText = normalizeCell(req.body?.message);
+    if (!messageText) throw badRequest('Message is required');
+    const result = await transaction(async (conn) => {
+      const [chat] = await conn.execute(
+        `INSERT INTO support_chats (organization_id, created_by_admin_id, subject, status)
+         VALUES (:organizationId, :createdByAdminId, :subject, 'open')`,
+        { organizationId: req.auth.organizationId, createdByAdminId: req.auth.sub, subject },
+      );
+      const [message] = await conn.execute(
+        `INSERT INTO support_chat_messages (
+          organization_id, support_chat_id, sender_type, sender_admin_user_id, message
+        ) VALUES (
+          :organizationId, :chatId, 'management', :senderAdminUserId, :message
+        )`,
+        {
+          organizationId: req.auth.organizationId,
+          chatId: chat.insertId,
+          senderAdminUserId: req.auth.sub,
+          message: messageText,
+        },
+      );
+      await insertSupportChatAttachments(conn, req, {
+        organizationId: req.auth.organizationId,
+        chatId: chat.insertId,
+        messageId: message.insertId,
+      });
+      return { id: chat.insertId, messageId: message.insertId };
+    });
+    return created(res, result, 'support chat created');
+  }),
+);
+
+router.get(
+  '/support/chats/:chatId',
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({}).passthrough(),
+      params: z.object({ chatId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const chatId = req.validated.params.chatId;
+    const chat = await transaction(async (conn) => ensureSupportChatAccess(conn, req.auth.organizationId, chatId));
+    const attachments = await query(
+      `SELECT id, support_chat_message_id, file_url, file_name, file_size, mime_type, created_at
+       FROM support_chat_attachments
+       WHERE organization_id = :organizationId AND support_chat_id = :chatId
+       ORDER BY created_at ASC, id ASC`,
+      { organizationId: req.auth.organizationId, chatId },
+    );
+    return ok(res, { ...chat, attachments });
+  }),
+);
+
+router.get(
+  '/support/chats/:chatId/messages',
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({ afterId: z.coerce.number().int().min(0).optional().default(0) }).passthrough(),
+      params: z.object({ chatId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const chatId = req.validated.params.chatId;
+    await transaction(async (conn) => ensureSupportChatAccess(conn, req.auth.organizationId, chatId));
+    const rows = await query(
+      `SELECT id, sender_type, sender_admin_user_id, message, created_at
+       FROM support_chat_messages
+       WHERE organization_id = :organizationId
+         AND support_chat_id = :chatId
+         AND id > :afterId
+       ORDER BY id ASC`,
+      { organizationId: req.auth.organizationId, chatId, afterId: req.validated.query.afterId },
+    );
+    return ok(res, rows);
+  }),
+);
+
+router.post(
+  '/support/chats/:chatId/messages',
+  supportAttachmentUpload.array('attachments', 10),
+  validate(
+    z.object({
+      body: z.object({ message: z.string().min(1) }).passthrough(),
+      query: z.object({}).passthrough(),
+      params: z.object({ chatId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const chatId = req.validated.params.chatId;
+    const result = await transaction(async (conn) => {
+      await ensureSupportChatAccess(conn, req.auth.organizationId, chatId);
+      const [message] = await conn.execute(
+        `INSERT INTO support_chat_messages (
+          organization_id, support_chat_id, sender_type, sender_admin_user_id, message
+        ) VALUES (
+          :organizationId, :chatId, 'management', :senderAdminUserId, :message
+        )`,
+        {
+          organizationId: req.auth.organizationId,
+          chatId,
+          senderAdminUserId: req.auth.sub,
+          message: req.validated.body.message,
+        },
+      );
+      await conn.execute(
+        `UPDATE support_chats SET updated_at = CURRENT_TIMESTAMP WHERE id = :chatId AND organization_id = :organizationId`,
+        { organizationId: req.auth.organizationId, chatId },
+      );
+      await insertSupportChatAttachments(conn, req, {
+        organizationId: req.auth.organizationId,
+        chatId,
+        messageId: message.insertId,
+      });
+      return { id: message.insertId };
+    });
+    return created(res, result, 'support chat message created');
   }),
 );
 
