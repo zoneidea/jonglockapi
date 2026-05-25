@@ -143,6 +143,31 @@ const bookingImportUpload = multer({
   },
 });
 
+const supportAttachmentUpload = multer({
+  storage: multer.diskStorage({
+    destination(req, file, callback) {
+      const organizationId = String(req.auth?.organizationId || 'org').replace(/[^\d]/g, '') || 'org';
+      const destination = path.join(uploadRoot, 'support', organizationId);
+      fs.mkdirSync(destination, { recursive: true });
+      callback(null, destination);
+    },
+    filename(req, file, callback) {
+      const extension = path.extname(file.originalname || '').toLowerCase();
+      const safeName = path
+        .basename(file.originalname || 'support-attachment', extension)
+        .replace(/[^a-zA-Z0-9-_]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 80) || 'support-attachment';
+      callback(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}-${safeName}${extension}`);
+    },
+  }),
+  limits: { files: 10, fileSize: 5 * 1024 * 1024 },
+  fileFilter(req, file, callback) {
+    if (!allowedImageTypes.has(file.mimetype)) return callback(badRequest('Only JPG, PNG, WEBP, and GIF images are allowed'));
+    return callback(null, true);
+  },
+});
+
 function publicUploadUrl(req, filePath) {
   const relativePath = path.relative(uploadRoot, filePath).split(path.sep).join('/');
   return `${req.protocol}://${req.get('host')}/uploads/${relativePath}`;
@@ -315,6 +340,118 @@ const ACCOUNTING_DOCUMENT_PREFIX = {
 
 function toJson(value) {
   return JSON.stringify(value || null);
+}
+
+function parseJsonArray(value) {
+  if (Array.isArray(value)) return value;
+  if (value == null || value === '') return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return String(value)
+      .split(',')
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+}
+
+function supportCategories() {
+  return {
+    categories: [
+      { value: 'issue', label: 'แจ้งปัญหา' },
+      { value: 'suggestion', label: 'ข้อเสนอแนะ' },
+      { value: 'inquiry', label: 'สอบถาม' },
+    ],
+    topics: [
+      { value: 'booking', label: 'การจอง' },
+      { value: 'payment', label: 'การชำระเงิน' },
+      { value: 'market_setup', label: 'ตั้งค่าตลาด/บูธ' },
+      { value: 'report', label: 'รายงาน' },
+      { value: 'account', label: 'บัญชีผู้ใช้งาน' },
+      { value: 'integration', label: 'การเชื่อมต่อระบบ' },
+      { value: 'feature_request', label: 'ขอฟีเจอร์เพิ่มเติม' },
+      { value: 'other', label: 'อื่น ๆ' },
+    ],
+    priorities: [
+      { value: 'low', label: 'ต่ำ' },
+      { value: 'normal', label: 'ปกติ' },
+      { value: 'high', label: 'สูง' },
+      { value: 'urgent', label: 'เร่งด่วน' },
+    ],
+  };
+}
+
+function normalizeSupportBody(body = {}) {
+  const category = normalizeCell(body.category || 'issue');
+  const topic = normalizeCell(body.topic || 'other');
+  const subject = normalizeCell(body.subject);
+  const message = normalizeCell(body.message);
+  const priority = category === 'issue' ? normalizeCell(body.priority || 'normal') : null;
+  const tagOrganization = body.tagOrganization === true || body.tagOrganization === 'true' || body.tagOrganization === '1';
+  const taggedOrganizationId = body.taggedOrganizationId ? Number(body.taggedOrganizationId) : null;
+  const eventLogIds = parseJsonArray(body.eventLogIds).map(Number).filter((id) => Number.isInteger(id) && id > 0);
+  return { category, topic, subject, message, priority, tagOrganization, taggedOrganizationId, eventLogIds };
+}
+
+async function ensureSupportTicketAccess(conn, organizationId, ticketId) {
+  const [rows] = await conn.execute(
+    `SELECT id, organization_id, category, topic, priority, subject, message, status, related_event_log_id,
+            tagged_organization_id, created_by_admin_id, created_at, updated_at
+     FROM support_tickets
+     WHERE id = :ticketId AND organization_id = :organizationId
+     LIMIT 1`,
+    { organizationId, ticketId },
+  );
+  if (!rows.length) throw notFound('Support ticket not found');
+  return rows[0];
+}
+
+async function insertSupportAttachments(conn, req, { organizationId, ticketId, messageId = null }) {
+  const files = req.files || [];
+  for (const file of files) {
+    await conn.execute(
+      `INSERT INTO support_ticket_attachments (
+        organization_id, support_ticket_id, support_ticket_message_id, file_url, file_name, file_size, mime_type
+      ) VALUES (
+        :organizationId, :ticketId, :messageId, :fileUrl, :fileName, :fileSize, :mimeType
+      )`,
+      {
+        organizationId,
+        ticketId,
+        messageId,
+        fileUrl: publicUploadUrl(req, file.path),
+        fileName: file.originalname || file.filename,
+        fileSize: file.size || 0,
+        mimeType: file.mimetype || null,
+      },
+    );
+  }
+}
+
+async function linkSupportEventLogs(conn, { organizationId, ticketId, eventLogIds }) {
+  if (!eventLogIds.length) return [];
+  const placeholders = eventLogIds.map((_, index) => `:eventLogId${index}`).join(', ');
+  const params = eventLogIds.reduce((values, id, index) => {
+    values[`eventLogId${index}`] = id;
+    return values;
+  }, { organizationId });
+  const [eventLogs] = await conn.execute(
+    `SELECT id
+     FROM event_logs
+     WHERE organization_id = :organizationId
+       AND id IN (${placeholders})
+     ORDER BY created_at DESC`,
+    params,
+  );
+  for (const eventLog of eventLogs) {
+    await conn.execute(
+      `INSERT IGNORE INTO support_ticket_event_logs (organization_id, support_ticket_id, event_log_id)
+       VALUES (:organizationId, :ticketId, :eventLogId)`,
+      { organizationId, ticketId, eventLogId: eventLog.id },
+    );
+  }
+  return eventLogs.map((eventLog) => eventLog.id);
 }
 
 function normalizeCell(value) {
@@ -774,6 +911,291 @@ router.get(
   asyncHandler(async (req, res) => {
     const subscription = await getCurrentSubscription(req.auth.organizationId);
     return ok(res, subscription);
+  }),
+);
+
+router.get(
+  '/support/categories',
+  asyncHandler(async (req, res) => ok(res, supportCategories())),
+);
+
+router.get(
+  '/support/event-logs/recent',
+  asyncHandler(async (req, res) => {
+    const limit = Math.min(Number(req.query.limit || 30), 100);
+    const rows = await query(
+      `SELECT id, actor_type, actor_id, actor_role, channel, action, entity_type, entity_id,
+              method, path, status_code, success, created_at
+       FROM event_logs
+       WHERE organization_id = :organizationId
+       ORDER BY created_at DESC, id DESC
+       LIMIT :limit`,
+      { organizationId: req.auth.organizationId, limit },
+    );
+    return ok(res, rows);
+  }),
+);
+
+router.get(
+  '/support/tickets',
+  asyncHandler(async (req, res) => {
+    const limit = Math.min(Number(req.query.limit || 100), 300);
+    const rows = await query(
+      `SELECT st.id, st.category, st.topic, st.priority, st.subject, st.message, st.status,
+              st.related_event_log_id, st.tagged_organization_id, st.created_by_admin_id,
+              st.created_at, st.updated_at,
+              COUNT(DISTINCT sta.id) AS attachment_count,
+              COUNT(DISTINCT stm.id) AS message_count,
+              MAX(stm.created_at) AS last_message_at
+       FROM support_tickets st
+       LEFT JOIN support_ticket_attachments sta
+         ON sta.support_ticket_id = st.id
+        AND sta.organization_id = st.organization_id
+       LEFT JOIN support_ticket_messages stm
+         ON stm.support_ticket_id = st.id
+        AND stm.organization_id = st.organization_id
+       WHERE st.organization_id = :organizationId
+       GROUP BY st.id, st.category, st.topic, st.priority, st.subject, st.message, st.status,
+                st.related_event_log_id, st.tagged_organization_id, st.created_by_admin_id,
+                st.created_at, st.updated_at
+       ORDER BY st.updated_at DESC, st.id DESC
+       LIMIT :limit`,
+      { organizationId: req.auth.organizationId, limit },
+    );
+    return ok(res, rows);
+  }),
+);
+
+router.post(
+  '/support/tickets',
+  supportAttachmentUpload.array('attachments', 10),
+  asyncHandler(async (req, res) => {
+    const body = normalizeSupportBody(req.body);
+    const categoryValues = new Set(supportCategories().categories.map((item) => item.value));
+    const topicValues = new Set(supportCategories().topics.map((item) => item.value));
+    const priorityValues = new Set(supportCategories().priorities.map((item) => item.value));
+    if (!categoryValues.has(body.category)) throw badRequest('Invalid support category');
+    if (!topicValues.has(body.topic)) throw badRequest('Invalid support topic');
+    if (body.category === 'issue' && !priorityValues.has(body.priority)) throw badRequest('Invalid support priority');
+    if (!body.subject) throw badRequest('Subject is required');
+    if (!body.message) throw badRequest('Message is required');
+
+    const result = await transaction(async (conn) => {
+      const linkedEventLogIds = body.eventLogIds;
+      const relatedEventLogId = linkedEventLogIds[0] || null;
+      if (relatedEventLogId) {
+        const [eventLogs] = await conn.execute(
+          `SELECT id FROM event_logs WHERE id = :eventLogId AND organization_id = :organizationId LIMIT 1`,
+          { eventLogId: relatedEventLogId, organizationId: req.auth.organizationId },
+        );
+        if (!eventLogs.length) throw badRequest('Related event log not found');
+      }
+
+      const taggedOrganizationId = body.tagOrganization
+        ? body.taggedOrganizationId || req.auth.organizationId
+        : null;
+      if (taggedOrganizationId) {
+        const [organizations] = await conn.execute(
+          `SELECT id FROM organizations WHERE id = :organizationId LIMIT 1`,
+          { organizationId: taggedOrganizationId },
+        );
+        if (!organizations.length) throw badRequest('Tagged organization not found');
+      }
+
+      const [ticket] = await conn.execute(
+        `INSERT INTO support_tickets (
+          organization_id, tagged_organization_id, created_by_admin_id, category, topic, priority,
+          subject, message, status, related_event_log_id, metadata_json
+        ) VALUES (
+          :organizationId, :taggedOrganizationId, :createdByAdminId, :category, :topic, :priority,
+          :subject, :message, 'open', :relatedEventLogId, :metadataJson
+        )`,
+        {
+          organizationId: req.auth.organizationId,
+          taggedOrganizationId,
+          createdByAdminId: req.auth.sub,
+          category: body.category,
+          topic: body.topic,
+          priority: body.priority,
+          subject: body.subject,
+          message: body.message,
+          relatedEventLogId,
+          metadataJson: toJson({
+            source: 'management',
+            originalEventLogIds: body.eventLogIds,
+          }),
+        },
+      );
+
+      const [message] = await conn.execute(
+        `INSERT INTO support_ticket_messages (
+          organization_id, support_ticket_id, sender_type, sender_admin_user_id, message
+        ) VALUES (
+          :organizationId, :ticketId, 'management', :senderAdminUserId, :message
+        )`,
+        {
+          organizationId: req.auth.organizationId,
+          ticketId: ticket.insertId,
+          senderAdminUserId: req.auth.sub,
+          message: body.message,
+        },
+      );
+      await insertSupportAttachments(conn, req, {
+        organizationId: req.auth.organizationId,
+        ticketId: ticket.insertId,
+        messageId: message.insertId,
+      });
+      const linked = await linkSupportEventLogs(conn, {
+        organizationId: req.auth.organizationId,
+        ticketId: ticket.insertId,
+        eventLogIds: body.eventLogIds,
+      });
+      return { id: ticket.insertId, messageId: message.insertId, linkedEventLogIds: linked };
+    });
+
+    return created(res, result, 'support ticket created');
+  }),
+);
+
+router.get(
+  '/support/tickets/:ticketId',
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({}).passthrough(),
+      params: z.object({ ticketId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const ticketId = req.validated.params.ticketId;
+    const ticket = await transaction(async (conn) => ensureSupportTicketAccess(conn, req.auth.organizationId, ticketId));
+    const attachments = await query(
+      `SELECT id, support_ticket_message_id, file_url, file_name, file_size, mime_type, created_at
+       FROM support_ticket_attachments
+       WHERE organization_id = :organizationId AND support_ticket_id = :ticketId
+       ORDER BY created_at ASC, id ASC`,
+      { organizationId: req.auth.organizationId, ticketId },
+    );
+    const eventLogs = await query(
+      `SELECT el.id, el.channel, el.action, el.entity_type, el.entity_id, el.method,
+              el.path, el.status_code, el.success, el.created_at
+       FROM support_ticket_event_logs stel
+       JOIN event_logs el ON el.id = stel.event_log_id
+       WHERE stel.organization_id = :organizationId
+         AND stel.support_ticket_id = :ticketId
+       ORDER BY el.created_at DESC`,
+      { organizationId: req.auth.organizationId, ticketId },
+    );
+    return ok(res, { ...ticket, attachments, eventLogs });
+  }),
+);
+
+async function supportTicketMessages(req, res) {
+  const ticketId = Number(req.params.ticketId);
+  const afterId = Math.max(Number(req.query.afterId || 0), 0);
+  await transaction(async (conn) => ensureSupportTicketAccess(conn, req.auth.organizationId, ticketId));
+  const rows = await query(
+    `SELECT stm.id, stm.sender_type, stm.sender_admin_user_id, stm.message, stm.created_at,
+            au.username_hash AS sender_username_hash
+     FROM support_ticket_messages stm
+     LEFT JOIN admin_users au
+       ON au.id = stm.sender_admin_user_id
+      AND au.organization_id = stm.organization_id
+     WHERE stm.organization_id = :organizationId
+       AND stm.support_ticket_id = :ticketId
+       AND stm.id > :afterId
+     ORDER BY stm.id ASC`,
+    { organizationId: req.auth.organizationId, ticketId, afterId },
+  );
+  return ok(res, rows);
+}
+
+router.get('/support/tickets/:ticketId/messages', asyncHandler(supportTicketMessages));
+
+router.get(
+  '/support/tickets/:ticketId/messages/stream',
+  asyncHandler(async (req, res) => {
+    const ticketId = Number(req.params.ticketId);
+    await transaction(async (conn) => ensureSupportTicketAccess(conn, req.auth.organizationId, ticketId));
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    let afterId = Math.max(Number(req.query.afterId || 0), 0);
+    let closed = false;
+    req.on('close', () => {
+      closed = true;
+    });
+
+    async function sendMessages() {
+      if (closed) return;
+      const rows = await query(
+        `SELECT id, sender_type, sender_admin_user_id, message, created_at
+         FROM support_ticket_messages
+         WHERE organization_id = :organizationId
+           AND support_ticket_id = :ticketId
+           AND id > :afterId
+         ORDER BY id ASC`,
+        { organizationId: req.auth.organizationId, ticketId, afterId },
+      );
+      if (rows.length) {
+        afterId = rows[rows.length - 1].id;
+        res.write(`event: messages\ndata: ${JSON.stringify(rows)}\n\n`);
+      } else {
+        res.write(`event: ping\ndata: ${JSON.stringify({ at: new Date().toISOString() })}\n\n`);
+      }
+    }
+
+    await sendMessages();
+    const timer = setInterval(() => {
+      sendMessages().catch((error) => {
+        res.write(`event: error\ndata: ${JSON.stringify({ message: error.message })}\n\n`);
+      });
+    }, 3000);
+    req.on('close', () => clearInterval(timer));
+  }),
+);
+
+router.post(
+  '/support/tickets/:ticketId/messages',
+  supportAttachmentUpload.array('attachments', 10),
+  validate(
+    z.object({
+      body: z.object({ message: z.string().min(1) }).passthrough(),
+      query: z.object({}).passthrough(),
+      params: z.object({ ticketId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const ticketId = req.validated.params.ticketId;
+    const result = await transaction(async (conn) => {
+      await ensureSupportTicketAccess(conn, req.auth.organizationId, ticketId);
+      const [message] = await conn.execute(
+        `INSERT INTO support_ticket_messages (
+          organization_id, support_ticket_id, sender_type, sender_admin_user_id, message
+        ) VALUES (
+          :organizationId, :ticketId, 'management', :senderAdminUserId, :message
+        )`,
+        {
+          organizationId: req.auth.organizationId,
+          ticketId,
+          senderAdminUserId: req.auth.sub,
+          message: req.validated.body.message,
+        },
+      );
+      await conn.execute(
+        `UPDATE support_tickets SET updated_at = CURRENT_TIMESTAMP WHERE id = :ticketId AND organization_id = :organizationId`,
+        { organizationId: req.auth.organizationId, ticketId },
+      );
+      await insertSupportAttachments(conn, req, {
+        organizationId: req.auth.organizationId,
+        ticketId,
+        messageId: message.insertId,
+      });
+      return { id: message.insertId };
+    });
+    return created(res, result, 'support message created');
   }),
 );
 
