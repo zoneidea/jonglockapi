@@ -1727,6 +1727,212 @@ router.post(
 );
 
 router.post(
+  '/bookings/checkins',
+  validate(
+    z.object({
+      body: z.object({
+        user: z.object({
+          email: z.string().email(),
+          name: z.string().optional().default(''),
+        }),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const emailHash = blindIndex(String(req.validated.body.user.email || '').trim().toLowerCase());
+    const rows = await query(
+      `SELECT
+          bi.id AS booking_item_id,
+          bi.organization_id,
+          bi.booking_id,
+          DATE_FORMAT(bi.booking_date, '%Y-%m-%d') AS booking_date,
+          bi.unit_price,
+          bi.status AS item_status,
+          bi.checked_in_at,
+          b.public_id,
+          b.market_id,
+          b.total_amount,
+          b.paid_at AS booking_paid_at,
+          m.code AS market_code,
+          m.name AS market_name,
+          bo.code AS booth_code,
+          bo.name AS booth_name,
+          payment_summary.paid_at AS payment_paid_at
+       FROM booking_items bi
+       JOIN bookings b
+         ON b.id = bi.booking_id
+        AND b.organization_id = bi.organization_id
+       JOIN mobile_users mu
+         ON mu.id = b.mobile_user_id
+        AND mu.organization_id = b.organization_id
+       JOIN markets m
+         ON m.id = b.market_id
+        AND m.organization_id = b.organization_id
+       JOIN booths bo
+         ON bo.id = bi.booth_id
+        AND bo.organization_id = bi.organization_id
+       LEFT JOIN (
+         SELECT organization_id, booking_id, MAX(COALESCE(paid_at, created_at)) AS paid_at
+         FROM payments
+         WHERE status = 'paid'
+         GROUP BY organization_id, booking_id
+       ) payment_summary
+         ON payment_summary.booking_id = b.id
+        AND payment_summary.organization_id = b.organization_id
+       WHERE mu.email_hash = :emailHash
+         AND b.status = 'paid'
+         AND bi.status = 'paid'
+       ORDER BY
+         CASE WHEN bi.booking_date >= CURDATE() THEN 0 ELSE 1 END ASC,
+         CASE WHEN bi.booking_date >= CURDATE() THEN bi.booking_date END ASC,
+         CASE WHEN bi.booking_date < CURDATE() THEN bi.booking_date END DESC,
+         bi.id ASC
+       LIMIT 200`,
+      { emailHash },
+    );
+
+    return ok(res, rows.map((row) => ({
+      bookingItemId: row.booking_item_id,
+      bookingId: row.booking_id,
+      publicId: row.public_id,
+      organizationId: row.organization_id,
+      marketId: row.market_id,
+      marketCode: row.market_code,
+      marketName: row.market_name,
+      boothCode: row.booth_code,
+      boothName: row.booth_name,
+      bookingDate: row.booking_date,
+      unitPrice: Number(row.unit_price || 0),
+      totalAmount: Number(row.total_amount || 0),
+      paidAt: row.booking_paid_at || row.payment_paid_at || null,
+      checkedInAt: row.checked_in_at || null,
+      status: row.item_status,
+    })));
+  }),
+);
+
+router.post(
+  '/booking-items/:bookingItemId/checkin',
+  validate(
+    z.object({
+      body: z.object({
+        user: z.object({
+          email: z.string().email(),
+          name: z.string().optional().default(''),
+        }),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({ bookingItemId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { bookingItemId } = req.validated.params;
+    const emailHash = blindIndex(String(req.validated.body.user.email || '').trim().toLowerCase());
+    const result = await transaction(async (conn) => {
+      const [rows] = await conn.execute(
+        `SELECT
+            bi.id,
+            bi.organization_id,
+            bi.booking_id,
+            DATE_FORMAT(bi.booking_date, '%Y-%m-%d') AS booking_date,
+            bi.status AS item_status,
+            bi.checked_in_at,
+            b.public_id,
+            b.market_id,
+            b.total_amount,
+            b.paid_at AS booking_paid_at,
+            mu.id AS mobile_user_id,
+            mu.email_hash,
+            m.code AS market_code,
+            m.name AS market_name,
+            bo.code AS booth_code,
+            bo.name AS booth_name,
+            payment_summary.paid_at AS payment_paid_at
+         FROM booking_items bi
+         JOIN bookings b
+           ON b.id = bi.booking_id
+          AND b.organization_id = bi.organization_id
+         JOIN mobile_users mu
+           ON mu.id = b.mobile_user_id
+          AND mu.organization_id = b.organization_id
+         JOIN markets m
+           ON m.id = b.market_id
+          AND m.organization_id = b.organization_id
+         JOIN booths bo
+           ON bo.id = bi.booth_id
+          AND bo.organization_id = bi.organization_id
+         LEFT JOIN (
+           SELECT organization_id, booking_id, MAX(COALESCE(paid_at, created_at)) AS paid_at
+           FROM payments
+           WHERE status = 'paid'
+           GROUP BY organization_id, booking_id
+         ) payment_summary
+           ON payment_summary.booking_id = b.id
+          AND payment_summary.organization_id = b.organization_id
+         WHERE bi.id = :bookingItemId
+           AND b.status = 'paid'
+           AND bi.status = 'paid'
+         LIMIT 1
+         FOR UPDATE`,
+        { bookingItemId },
+      );
+      if (!rows.length) {
+        throw badRequest('Booking item is not available for check-in');
+      }
+
+      const item = rows[0];
+      if (item.email_hash !== emailHash) {
+        throw badRequest('Booking owner does not match');
+      }
+
+      if (!item.checked_in_at) {
+        await conn.execute(
+          `UPDATE booking_items
+           SET checked_in_at = NOW(),
+               checked_in_by_mobile_user_id = :mobileUserId
+           WHERE id = :bookingItemId
+             AND organization_id = :organizationId`,
+          {
+            bookingItemId,
+            organizationId: item.organization_id,
+            mobileUserId: item.mobile_user_id,
+          },
+        );
+      }
+
+      const [updatedRows] = await conn.execute(
+        `SELECT checked_in_at
+         FROM booking_items
+         WHERE id = :bookingItemId AND organization_id = :organizationId
+         LIMIT 1`,
+        { bookingItemId, organizationId: item.organization_id },
+      );
+
+      return {
+        bookingItemId: item.id,
+        bookingId: item.booking_id,
+        publicId: item.public_id,
+        organizationId: item.organization_id,
+        marketId: item.market_id,
+        marketCode: item.market_code,
+        marketName: item.market_name,
+        boothCode: item.booth_code,
+        boothName: item.booth_name,
+        bookingDate: item.booking_date,
+        totalAmount: Number(item.total_amount || 0),
+        paidAt: item.booking_paid_at || item.payment_paid_at || null,
+        checkedInAt: updatedRows[0]?.checked_in_at || item.checked_in_at,
+        status: item.item_status,
+      };
+    });
+
+    return ok(res, result, 'booking item checked in');
+  }),
+);
+
+router.post(
   '/profile/me',
   validate(
     z.object({
