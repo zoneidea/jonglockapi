@@ -16,25 +16,25 @@ const PLATFORM_MENU_ACCESS = Object.freeze({
 
 const PLATFORM_NAVIGATION = Object.freeze([
   {
-    section: 'Overview',
+    section: 'ภาพรวม',
     items: [
-      { key: 'dashboard', label: 'Dashboard', path: '/dashboard' },
+      { key: 'dashboard', label: 'แดชบอร์ด', path: '/dashboard' },
     ],
   },
   {
-    section: 'Platform',
+    section: 'แพลตฟอร์ม',
     items: [
-      { key: 'organizations', label: 'Organizations', path: '/organizations' },
-      { key: 'subscriptions', label: 'Subscriptions', path: '/subscriptions' },
-      { key: 'billing', label: 'Billing', path: '/billing' },
+      { key: 'organizations', label: 'จัดการองค์กร', path: '/organizations' },
+      { key: 'subscriptions', label: 'การสมัครใช้งาน', path: '/subscriptions' },
+      { key: 'billing', label: 'การเงินแพลตฟอร์ม', path: '/billing' },
     ],
   },
   {
-    section: 'Operations',
+    section: 'ปฏิบัติการ',
     items: [
-      { key: 'support', label: 'Support Center', path: '/support' },
-      { key: 'monitoring', label: 'Monitoring', path: '/monitoring' },
-      { key: 'settings', label: 'Platform Settings', path: '/settings' },
+      { key: 'support', label: 'ศูนย์ช่วยเหลือ', path: '/support' },
+      { key: 'monitoring', label: 'ติดตามระบบ', path: '/monitoring' },
+      { key: 'settings', label: 'ตั้งค่าแพลตฟอร์ม', path: '/settings' },
     ],
   },
 ]);
