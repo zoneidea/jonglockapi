@@ -35,6 +35,70 @@ router.post(
 router.use(authenticate, requireRoles(ROLES.AUDIT));
 
 router.get(
+  '/summary',
+  asyncHandler(async (req, res) => {
+    const bookingDate = req.query.date || new Date().toISOString().slice(0, 10);
+    const marketIds = Array.isArray(req.auth.marketIds) ? req.auth.marketIds.filter(Boolean) : [];
+
+    if (!marketIds.length) {
+      return ok(res, {
+        bookingDate,
+        totalJobs: 0,
+        pendingJobs: 0,
+        violationJobs: 0,
+        totalFineAmount: 0,
+      });
+    }
+
+    const marketIdPlaceholders = marketIds.map((_, index) => `:marketId${index}`).join(', ');
+    const marketParams = marketIds.reduce((accumulator, marketId, index) => {
+      accumulator[`marketId${index}`] = marketId;
+      return accumulator;
+    }, {});
+
+    const rows = await query(
+      `SELECT COUNT(*) AS total_jobs,
+              SUM(CASE
+                    WHEN bi.audit_status IS NULL
+                      OR bi.audit_status NOT IN ('pass', 'warning', 'failed')
+                    THEN 1
+                    ELSE 0
+                  END) AS pending_jobs,
+              SUM(CASE WHEN bi.audit_status = 'failed' THEN 1 ELSE 0 END) AS violation_jobs,
+              COALESCE(SUM(COALESCE(ac_latest.total_fine_amount, 0)), 0) AS total_fine_amount
+       FROM booking_items bi
+       JOIN bookings b ON b.id = bi.booking_id
+       LEFT JOIN audit_checks ac_latest
+         ON ac_latest.id = (
+           SELECT ac2.id
+           FROM audit_checks ac2
+           WHERE ac2.booking_item_id = bi.id
+           ORDER BY ac2.id DESC
+           LIMIT 1
+         )
+       WHERE bi.organization_id = :organizationId
+         AND b.market_id IN (${marketIdPlaceholders})
+         AND b.status = 'paid'
+         AND bi.booking_date = :bookingDate`,
+      {
+        organizationId: req.auth.organizationId,
+        bookingDate,
+        ...marketParams,
+      },
+    );
+
+    const summary = rows[0] || {};
+    return ok(res, {
+      bookingDate,
+      totalJobs: Number(summary.total_jobs || 0),
+      pendingJobs: Number(summary.pending_jobs || 0),
+      violationJobs: Number(summary.violation_jobs || 0),
+      totalFineAmount: Number(summary.total_fine_amount || 0),
+    });
+  }),
+);
+
+router.get(
   '/markets/:marketId/bookings',
   requireMarketAccess(),
   asyncHandler(async (req, res) => {
