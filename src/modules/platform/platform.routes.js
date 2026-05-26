@@ -37,6 +37,25 @@ const organizationDetailSchema = z.object({
   query: z.object({}).optional(),
 });
 
+const subscriptionsQuerySchema = z.object({
+  query: z.object({
+    search: z.string().trim().max(120).optional(),
+    status: z.enum(['all', 'pending_activation', 'trialing', 'active', 'past_due', 'suspended', 'cancelled', 'expired']).optional(),
+    page: z.coerce.number().int().min(1).optional(),
+    pageSize: z.coerce.number().int().min(1).max(100).optional(),
+  }).optional(),
+  body: z.object({}).optional(),
+  params: z.object({}).optional(),
+});
+
+const subscriptionDetailSchema = z.object({
+  params: z.object({
+    subscriptionId: z.coerce.number().int().positive(),
+  }),
+  body: z.object({}).optional(),
+  query: z.object({}).optional(),
+});
+
 function requirePlatform(req, res, next) {
   if (req.auth?.userType !== 'platform') {
     return next(forbidden('Platform route only'));
@@ -86,6 +105,24 @@ router.get(
   asyncHandler(async (req, res) => {
     const organization = await platformService.getOrganizationDetail(req.validated.params.organizationId);
     return ok(res, organization);
+  }),
+);
+
+router.get(
+  '/subscriptions',
+  validate(subscriptionsQuerySchema),
+  asyncHandler(async (req, res) => {
+    const subscriptions = await platformService.listSubscriptions(req.validated.query || {});
+    return ok(res, subscriptions);
+  }),
+);
+
+router.get(
+  '/subscriptions/:subscriptionId',
+  validate(subscriptionDetailSchema),
+  asyncHandler(async (req, res) => {
+    const subscription = await platformService.getSubscriptionDetail(req.validated.params.subscriptionId);
+    return ok(res, subscription);
   }),
 );
 

@@ -150,7 +150,7 @@ async function getPlatformDashboardSummary() {
       name: row.name,
       status: row.status,
       subscriptionStatus: row.subscription_status || 'missing',
-      planName: row.plan_name || 'No plan',
+      planName: row.plan_name || 'ยังไม่ได้กำหนดแพ็กเกจ',
       createdAt: row.created_at,
     })),
   };
@@ -283,6 +283,7 @@ async function getOrganizationDetail(organizationId) {
         o.updated_at,
         o.vat_enabled,
         o.vat_rate,
+        os.id AS subscription_id,
         os.status AS subscription_status,
         COALESCE(os.current_period_start, os.trial_starts_at, os.activated_at) AS subscription_start_at,
         COALESCE(os.current_period_end, os.trial_ends_at) AS subscription_end_at,
@@ -371,6 +372,7 @@ async function getOrganizationDetail(organizationId) {
     mobileUserCount: Number(row.mobile_user_count || 0),
     bookingCount: Number(row.booking_count || 0),
     subscription: {
+      id: row.subscription_id ? Number(row.subscription_id) : null,
       planName: row.plan_name || 'ยังไม่ได้กำหนดแพ็กเกจ',
       status: row.subscription_status || 'missing',
       startAt: row.subscription_start_at,
@@ -396,10 +398,280 @@ async function getOrganizationDetail(organizationId) {
   };
 }
 
+async function listSubscriptions(filters = {}) {
+  const { search = '', status = 'all', page = 1, pageSize = 10 } = filters;
+  const pagination = normalizePagination(page, pageSize);
+  const keyword = search.trim();
+  const params = {
+    keyword: `%${keyword}%`,
+    status,
+    limit: pagination.pageSize,
+    offset: pagination.offset,
+  };
+
+  const statusClause = status !== 'all' ? `AND os.status = :status` : '';
+  const searchClause = keyword
+    ? `AND (os.subscription_code LIKE :keyword OR o.code LIKE :keyword OR o.name LIKE :keyword OR sp.name LIKE :keyword)`
+    : '';
+
+  const [totalRow] = await query(
+    `SELECT COUNT(*) AS total
+     FROM organization_subscriptions os
+     LEFT JOIN organizations o ON o.id = os.organization_id
+     LEFT JOIN subscription_plans sp ON sp.id = os.plan_id
+     WHERE 1 = 1
+       ${statusClause}
+       ${searchClause}`,
+    params,
+  );
+
+  const rows = await query(
+    `SELECT
+        os.id,
+        os.subscription_code,
+        os.status,
+        os.billing_interval,
+        os.billing_interval_count,
+        os.total_amount,
+        os.billing_currency,
+        os.included_markets,
+        os.included_admin_users,
+        os.included_active_booths,
+        os.included_monthly_bookings,
+        os.trial_starts_at,
+        os.trial_ends_at,
+        os.current_period_start,
+        os.current_period_end,
+        os.next_billing_at,
+        os.created_at,
+        o.id AS organization_id,
+        o.code AS organization_code,
+        o.name AS organization_name,
+        o.status AS organization_status,
+        sp.id AS plan_id,
+        sp.code AS plan_code,
+        sp.name AS plan_name,
+        sp.price_display_label,
+        COALESCE(inv.invoice_count, 0) AS invoice_count,
+        COALESCE(inv.unpaid_invoice_count, 0) AS unpaid_invoice_count
+     FROM organization_subscriptions os
+     LEFT JOIN organizations o ON o.id = os.organization_id
+     LEFT JOIN subscription_plans sp ON sp.id = os.plan_id
+     LEFT JOIN (
+       SELECT
+         organization_subscription_id,
+         COUNT(*) AS invoice_count,
+         SUM(CASE WHEN status IN ('issued', 'overdue') THEN 1 ELSE 0 END) AS unpaid_invoice_count
+       FROM subscription_invoices
+       GROUP BY organization_subscription_id
+     ) inv ON inv.organization_subscription_id = os.id
+     WHERE 1 = 1
+       ${statusClause}
+       ${searchClause}
+     ORDER BY os.created_at DESC, os.id DESC
+     LIMIT :limit OFFSET :offset`,
+    params,
+  );
+
+  return {
+    items: rows.map((row) => ({
+      id: row.id,
+      subscriptionCode: row.subscription_code,
+      status: row.status,
+      billingInterval: row.billing_interval,
+      billingIntervalCount: Number(row.billing_interval_count || 0),
+      totalAmount: Number(row.total_amount || 0),
+      currencyCode: row.billing_currency,
+      includedMarkets: Number(row.included_markets || 0),
+      includedAdminUsers: Number(row.included_admin_users || 0),
+      includedActiveBooths: Number(row.included_active_booths || 0),
+      includedMonthlyBookings: Number(row.included_monthly_bookings || 0),
+      trialStartsAt: row.trial_starts_at,
+      trialEndsAt: row.trial_ends_at,
+      currentPeriodStart: row.current_period_start,
+      currentPeriodEnd: row.current_period_end,
+      nextBillingAt: row.next_billing_at,
+      createdAt: row.created_at,
+      organization: {
+        id: row.organization_id,
+        code: row.organization_code || '',
+        name: row.organization_name || '',
+        status: row.organization_status || '',
+      },
+      plan: {
+        id: row.plan_id,
+        code: row.plan_code || '',
+        name: row.plan_name || 'ไม่ทราบแพ็กเกจ',
+        priceDisplayLabel: row.price_display_label || 'N/A',
+      },
+      invoiceCount: Number(row.invoice_count || 0),
+      unpaidInvoiceCount: Number(row.unpaid_invoice_count || 0),
+    })),
+    pagination: {
+      page: pagination.page,
+      pageSize: pagination.pageSize,
+      total: Number(totalRow?.total || 0),
+      totalPages: Math.max(Math.ceil(Number(totalRow?.total || 0) / pagination.pageSize), 1),
+    },
+  };
+}
+
+async function getSubscriptionDetail(subscriptionId) {
+  const rows = await query(
+    `SELECT
+        os.id,
+        os.subscription_code,
+        os.status,
+        os.billing_currency,
+        os.billing_interval,
+        os.billing_interval_count,
+        os.unit_price,
+        os.setup_fee,
+        os.discount_amount,
+        os.vat_rate,
+        os.subtotal_amount,
+        os.vat_amount,
+        os.total_amount,
+        os.included_markets,
+        os.included_admin_users,
+        os.included_active_booths,
+        os.included_monthly_bookings,
+        os.trial_starts_at,
+        os.trial_ends_at,
+        os.current_period_start,
+        os.current_period_end,
+        os.next_billing_at,
+        os.activated_at,
+        os.cancelled_at,
+        os.created_at,
+        o.id AS organization_id,
+        o.code AS organization_code,
+        o.name AS organization_name,
+        o.status AS organization_status,
+        sp.id AS plan_id,
+        sp.code AS plan_code,
+        sp.name AS plan_name,
+        sp.description AS plan_description,
+        sp.price_display_label,
+        sp.public_visible,
+        sp.is_free_tier,
+        sp.is_full_function
+     FROM organization_subscriptions os
+     LEFT JOIN organizations o ON o.id = os.organization_id
+     LEFT JOIN subscription_plans sp ON sp.id = os.plan_id
+     WHERE os.id = :subscriptionId
+     LIMIT 1`,
+    { subscriptionId },
+  );
+
+  const row = rows[0];
+  if (!row) {
+    throw notFound('ไม่พบข้อมูลการสมัครใช้งาน');
+  }
+
+  const recentInvoices = await query(
+    `SELECT
+        id,
+        invoice_no,
+        invoice_type,
+        status,
+        subtotal_amount,
+        vat_amount,
+        total_amount,
+        issued_at,
+        due_at,
+        paid_at
+     FROM subscription_invoices
+     WHERE organization_subscription_id = :subscriptionId
+     ORDER BY created_at DESC, id DESC
+     LIMIT 8`,
+    { subscriptionId },
+  );
+
+  const entitlements = await query(
+    `SELECT
+        pe.feature_key,
+        pe.enabled,
+        pe.limit_quantity,
+        fd.name,
+        fd.category
+     FROM subscription_plan_entitlements pe
+     JOIN subscription_feature_definitions fd ON fd.feature_key = pe.feature_key
+     WHERE pe.plan_id = :planId
+     ORDER BY fd.category, fd.sort_order, fd.feature_key`,
+    { planId: row.plan_id },
+  );
+
+  return {
+    id: row.id,
+    subscriptionCode: row.subscription_code,
+    status: row.status,
+    billingCurrency: row.billing_currency,
+    billingInterval: row.billing_interval,
+    billingIntervalCount: Number(row.billing_interval_count || 0),
+    unitPrice: Number(row.unit_price || 0),
+    setupFee: Number(row.setup_fee || 0),
+    discountAmount: Number(row.discount_amount || 0),
+    vatRate: Number(row.vat_rate || 0),
+    subtotalAmount: Number(row.subtotal_amount || 0),
+    vatAmount: Number(row.vat_amount || 0),
+    totalAmount: Number(row.total_amount || 0),
+    includedMarkets: Number(row.included_markets || 0),
+    includedAdminUsers: Number(row.included_admin_users || 0),
+    includedActiveBooths: Number(row.included_active_booths || 0),
+    includedMonthlyBookings: Number(row.included_monthly_bookings || 0),
+    trialStartsAt: row.trial_starts_at,
+    trialEndsAt: row.trial_ends_at,
+    currentPeriodStart: row.current_period_start,
+    currentPeriodEnd: row.current_period_end,
+    nextBillingAt: row.next_billing_at,
+    activatedAt: row.activated_at,
+    cancelledAt: row.cancelled_at,
+    createdAt: row.created_at,
+    organization: {
+      id: row.organization_id,
+      code: row.organization_code || '',
+      name: row.organization_name || '',
+      status: row.organization_status || '',
+    },
+    plan: {
+      id: row.plan_id,
+      code: row.plan_code || '',
+      name: row.plan_name || 'ไม่ทราบแพ็กเกจ',
+      description: row.plan_description || '',
+      priceDisplayLabel: row.price_display_label || 'N/A',
+      publicVisible: Boolean(row.public_visible),
+      isFreeTier: Boolean(row.is_free_tier),
+      isFullFunction: Boolean(row.is_full_function),
+    },
+    entitlements: entitlements.map((item) => ({
+      featureKey: item.feature_key,
+      name: item.name,
+      category: item.category,
+      enabled: Boolean(item.enabled),
+      limitQuantity: item.limit_quantity == null ? null : Number(item.limit_quantity),
+    })),
+    recentInvoices: recentInvoices.map((invoice) => ({
+      id: invoice.id,
+      invoiceNo: invoice.invoice_no,
+      invoiceType: invoice.invoice_type,
+      status: invoice.status,
+      subtotalAmount: Number(invoice.subtotal_amount || 0),
+      vatAmount: Number(invoice.vat_amount || 0),
+      totalAmount: Number(invoice.total_amount || 0),
+      issuedAt: invoice.issued_at,
+      dueAt: invoice.due_at,
+      paidAt: invoice.paid_at,
+    })),
+  };
+}
+
 module.exports = {
   getPlatformDashboardSummary,
   getPlatformUserById,
   getOrganizationDetail,
+  getSubscriptionDetail,
   listOrganizations,
+  listSubscriptions,
   loginPlatform,
 };
