@@ -95,6 +95,7 @@ function safeCompactJson(value) {
 }
 
 function inferChannel(pathname) {
+  if (pathname.includes('/platform')) return 'platform';
   if (pathname.includes('/management')) return 'management';
   if (pathname.includes('/mobile/audit')) return 'audit';
   if (pathname.includes('/mobile/payments')) return 'payment';
@@ -104,11 +105,13 @@ function inferChannel(pathname) {
 }
 
 function inferActorType(req, channel, responseBody) {
+  if (req.auth?.userType === 'platform') return 'platform';
   if (req.auth?.userType === 'admin') return 'management';
   if (req.auth?.userType === 'management') return 'management';
   if (req.auth?.userType === 'customer') return 'mobile';
   if (req.auth?.role === 'audit') return 'audit';
   if (responseBody?.data?.user && channel === 'management') return 'management';
+  if (responseBody?.data?.user && channel === 'platform') return 'platform';
   if (responseBody?.data?.user && channel === 'mobile') return 'mobile';
   if (responseBody?.data?.user && channel === 'audit') return 'audit';
   if (channel === 'mobile' && (req.body?.user?.email || req.body?.email || responseBody?.data?.publicId)) return 'mobile';
@@ -149,7 +152,7 @@ function segmentToEntity(segment) {
 function inferEntityType(req) {
   const path = (req.originalUrl || '').split('?')[0];
   const segments = path.split('/').filter(Boolean);
-  const ignored = new Set(['api', 'management', 'mobile', 'public', 'audit', 'payments', 'auth']);
+  const ignored = new Set(['api', 'platform', 'management', 'mobile', 'public', 'audit', 'payments', 'auth']);
   const candidates = segments.filter((segment) => !ignored.has(segment) && !/^\d+$/.test(segment));
   if (!candidates.length) return null;
 
