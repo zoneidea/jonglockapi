@@ -1,9 +1,11 @@
 const express = require('express');
 const { query } = require('../../config/db');
+const { cacheResponse } = require('../../middlewares/response-cache');
 const { asyncHandler } = require('../../utils/async-handler');
 const { ok } = require('../../utils/api-response');
 
 const router = express.Router();
+router.use(cacheResponse({ namespace: 'locations', ttlSeconds: 24 * 60 * 60, maxEntries: 1000 }));
 
 const DEFAULT_LIMIT = 100;
 const MAX_LIMIT = 500;

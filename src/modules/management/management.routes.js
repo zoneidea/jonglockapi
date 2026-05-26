@@ -9,6 +9,7 @@ const { query, transaction } = require('../../config/db');
 const { authenticate } = require('../../middlewares/auth');
 const { requireManagement, requireRoles, requireMarketAccess } = require('../../middlewares/rbac');
 const { validate } = require('../../middlewares/validate');
+const { clearResponseCache } = require('../../middlewares/response-cache');
 const { ROLES, MENU_ACCESS } = require('../../constants/roles');
 const { asyncHandler } = require('../../utils/async-handler');
 const { ok, created } = require('../../utils/api-response');
@@ -32,6 +33,11 @@ const authService = require('../auth/auth.service');
 const router = express.Router();
 const uploadRoot = path.join(__dirname, '..', '..', '..', 'uploads');
 const allowedImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+
+function clearPublicReadCache() {
+  clearResponseCache('public:markets');
+  clearResponseCache('public:announcements');
+}
 const imageUpload = multer({
   storage: multer.diskStorage({
     destination(req, file, callback) {
@@ -194,6 +200,68 @@ function bangkokDateString() {
     month: '2-digit',
     day: '2-digit',
   }).format(new Date());
+}
+
+function addDaysIso(dateValue, days) {
+  const date = new Date(`${dateValue}T00:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function dateTimeStart(dateValue) {
+  return `${dateValue} 00:00:00`;
+}
+
+function dateTimeEndExclusive(dateValue) {
+  return `${addDaysIso(dateValue, 1)} 00:00:00`;
+}
+
+function safeIsoDate(value) {
+  const text = String(value || '').trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : null;
+}
+
+function buildAccountingDateFilter({ dateField, startDate, endDate, aliases = {} }) {
+  const clauses = [];
+  const params = {};
+  const paymentAlias = aliases.payment || 'p';
+  const bookingAlias = aliases.booking || 'b';
+  const itemAlias = aliases.item || 'bi';
+  const itemDateColumn = aliases.itemDateColumn || 'booking_date';
+
+  if (dateField === 'created_date') {
+    if (startDate) {
+      clauses.push(`${bookingAlias}.created_at >= :startDateTime`);
+      params.startDateTime = dateTimeStart(startDate);
+    }
+    if (endDate) {
+      clauses.push(`${bookingAlias}.created_at < :endDateTime`);
+      params.endDateTime = dateTimeEndExclusive(endDate);
+    }
+  } else if (dateField === 'booking_date') {
+    if (startDate) {
+      clauses.push(`${itemAlias}.${itemDateColumn} >= :startDate`);
+      params.startDate = startDate;
+    }
+    if (endDate) {
+      clauses.push(`${itemAlias}.${itemDateColumn} <= :endDate`);
+      params.endDate = endDate;
+    }
+  } else {
+    if (startDate) {
+      clauses.push(`(${paymentAlias}.paid_at >= :startDateTime OR (${paymentAlias}.paid_at IS NULL AND ${paymentAlias}.created_at >= :startDateTime))`);
+      params.startDateTime = dateTimeStart(startDate);
+    }
+    if (endDate) {
+      clauses.push(`(${paymentAlias}.paid_at < :endDateTime OR (${paymentAlias}.paid_at IS NULL AND ${paymentAlias}.created_at < :endDateTime))`);
+      params.endDateTime = dateTimeEndExclusive(endDate);
+    }
+  }
+
+  return {
+    sql: clauses.length ? ` AND ${clauses.join(' AND ')}` : '',
+    params,
+  };
 }
 
 function copiedBoothCode(sourceCode, floorPlanId) {
@@ -1544,6 +1612,7 @@ router.put(
       },
     );
     if (req.file && existingRows[0]?.payment_qrcode_image_url) removeUploadedFile(existingRows[0].payment_qrcode_image_url);
+    clearPublicReadCache();
     return ok(
       res,
       {
@@ -1706,6 +1775,7 @@ router.post(
         );
       }
     }
+    clearPublicReadCache();
     return created(res, { id: result.insertId, imageUrl }, 'announcement created');
   }),
 );
@@ -1821,6 +1891,7 @@ router.patch(
     }
 
     if (bannerImage && current.image_url !== imageUrl) removeUploadedFile(current.image_url);
+    clearPublicReadCache();
     return ok(res, { id: parsed.params.announcementId, imageUrl }, 'announcement updated');
   }),
 );
@@ -1852,6 +1923,7 @@ router.patch(
       { organizationId: req.auth.organizationId, announcementId, imageId },
     );
     const imageUrl = await syncAnnouncementCoverImage(req.auth.organizationId, announcementId);
+    clearPublicReadCache();
     return ok(res, { announcementId, imageId, imageUrl }, 'announcement cover updated');
   }),
 );
@@ -1885,6 +1957,7 @@ router.delete(
     );
     removeUploadedFile(current.image_url);
     const imageUrl = await syncAnnouncementCoverImage(req.auth.organizationId, announcementId);
+    clearPublicReadCache();
     return ok(res, { announcementId, imageId, imageUrl }, 'announcement image deleted');
   }),
 );
@@ -2325,6 +2398,7 @@ router.patch(
       },
     );
     if (req.file && current.main_image_url !== mainImageUrl) removeUploadedFile(current.main_image_url);
+    clearPublicReadCache();
     return ok(res, { id: parsed.params.marketId, mainImageUrl }, 'market updated');
   }),
 );
@@ -2474,6 +2548,7 @@ router.post(
        VALUES (:organizationId, :marketId, :name, :planImageUrl, :startDate, :endDate, :status)`,
       { organizationId: req.auth.organizationId, marketId: parsed.params.marketId, planImageUrl, ...body },
     );
+    clearPublicReadCache();
     return created(res, { id: result.insertId, planImageUrl }, 'booth type created');
   }),
 );
@@ -2531,6 +2606,7 @@ router.patch(
       },
     );
     if (req.file && current.plan_image_url !== planImageUrl) removeUploadedFile(current.plan_image_url);
+    clearPublicReadCache();
     return ok(res, { id: parsed.params.boothTypeId, planImageUrl }, 'booth type updated');
   }),
 );
@@ -2629,6 +2705,7 @@ router.post(
       return { id: newFloorPlanId, planImageUrl, copiedBoothCount: sourceBooths.length };
     });
 
+    clearPublicReadCache();
     return created(res, result, 'booth type copied');
   }),
 );
@@ -2700,6 +2777,7 @@ router.post(
         status: body.status,
       },
     );
+    clearPublicReadCache();
     return created(res, { id: result.insertId }, 'booth created');
   }),
 );
@@ -2753,6 +2831,7 @@ router.patch(
       },
     );
     if (!result.affectedRows) throw notFound('Booth not found');
+    clearPublicReadCache();
     return ok(res, { id: boothId }, 'booth updated');
   }),
 );
@@ -2864,6 +2943,7 @@ router.post(
       return results;
     });
 
+    clearPublicReadCache();
     return created(res, inserted, 'images created');
   }),
 );
@@ -2922,6 +3002,7 @@ router.patch(
     );
 
     if (req.file && current.image_url !== imageUrl) removeUploadedFile(current.image_url);
+    clearPublicReadCache();
     return ok(res, { id: parsed.params.imageId, title: parsed.body.title, imageUrl, sortOrder: parsed.body.sortOrder, status: parsed.body.status }, 'image updated');
   }),
 );
@@ -2966,6 +3047,7 @@ router.post(
        VALUES (:organizationId, :marketId, :name, :imageUrl, :price, :quantity, :status)`,
       { organizationId: req.auth.organizationId, marketId: parsed.params.marketId, imageUrl, ...body },
     );
+    clearPublicReadCache();
     return created(res, { id: result.insertId, imageUrl }, 'accessory created');
   }),
 );
@@ -3002,6 +3084,7 @@ router.post(
         closeDate: body.closeDate || null,
       },
     );
+    clearPublicReadCache();
     return created(res, { id: result.insertId, mainImageUrl }, 'market created');
   }),
 );
@@ -4274,6 +4357,12 @@ router.get(
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
   asyncHandler(async (req, res) => {
     await expireStaleBookings({ execute: query }, req.auth.organizationId);
+    const dateFilter = buildAccountingDateFilter({
+      dateField: 'created_date',
+      startDate: safeIsoDate(req.query.startDate),
+      endDate: safeIsoDate(req.query.endDate),
+      aliases: { booking: 'b', payment: 'p', item: 'bi' },
+    });
     const rows = await query(
       `SELECT m.id AS market_id, m.name AS market_name, b.public_id AS booking_public_id, b.status,
               MIN(bi.booking_date) AS booking_date,
@@ -4293,8 +4382,7 @@ router.get(
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          AND b.status IN ('pending_payment', 'payment_processing', 'expired')
          AND bi.status IN ('pending_payment', 'payment_processing', 'expired')
-         AND (:startDate IS NULL OR DATE(b.created_at) >= :startDate)
-         AND (:endDate IS NULL OR DATE(b.created_at) <= :endDate)
+         ${dateFilter.sql}
        GROUP BY m.id, m.name, b.id, b.public_id, b.status, b.source, b.created_at,
                 b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
                 mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc, mu.email_enc
@@ -4303,8 +4391,7 @@ router.get(
         organizationId: req.auth.organizationId,
         adminUserId: req.auth.sub,
         hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
-        startDate: req.query.startDate || null,
-        endDate: req.query.endDate || null,
+        ...dateFilter.params,
       },
     );
     return ok(
@@ -4513,6 +4600,12 @@ router.get(
   asyncHandler(async (req, res) => {
     await expireStaleBookings({ execute: query }, req.auth.organizationId);
     const { startDate, endDate, marketId } = req.validated.query;
+    const dateFilter = buildAccountingDateFilter({
+      dateField: 'payment_date',
+      startDate,
+      endDate,
+      aliases: { payment: 'p', booking: 'b', item: 'bi' },
+    });
     const rows = await query(
       `SELECT bi.id,
               b.public_id AS booking_public_id,
@@ -4537,8 +4630,7 @@ router.get(
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          AND b.status = 'paid'
          AND bi.status = 'paid'
-         AND (:startDate IS NULL OR DATE(COALESCE(p.paid_at, p.created_at)) >= :startDate)
-         AND (:endDate IS NULL OR DATE(COALESCE(p.paid_at, p.created_at)) <= :endDate)
+         ${dateFilter.sql}
        GROUP BY bi.id, b.public_id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc,
                 DATE(COALESCE(p.paid_at, p.created_at)), b.subtotal_amount, b.discount_amount
        ORDER BY DATE(COALESCE(p.paid_at, p.created_at)) ASC, b.public_id ASC
@@ -4548,8 +4640,7 @@ router.get(
         adminUserId: req.auth.sub,
         hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
         marketId: marketId || null,
-        startDate: startDate || null,
-        endDate: endDate || null,
+        ...dateFilter.params,
       },
     );
     return ok(res, rows.map((row) => ({
@@ -4588,6 +4679,17 @@ router.get(
       booking_date: 'item_summary.first_booking_date DESC, b.public_id ASC',
       payment_date: 'COALESCE(p.paid_at, p.created_at) DESC, b.public_id ASC',
     }[sortBy];
+    const dateFilter = buildAccountingDateFilter({
+      dateField,
+      startDate,
+      endDate,
+      aliases: {
+        payment: 'p',
+        booking: 'b',
+        item: 'item_summary',
+        itemDateColumn: 'first_booking_date',
+      },
+    });
 
     const rows = await query(
       `SELECT b.id,
@@ -4668,22 +4770,7 @@ router.get(
          AND (:marketId IS NULL OR b.market_id = :marketId)
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          AND (:paidOnly = 0 OR (b.status = 'paid' AND p.status = 'paid'))
-         AND (
-           :startDate IS NULL
-           OR (
-             (:dateField = 'created_date' AND DATE(b.created_at) >= :startDate)
-             OR (:dateField = 'booking_date' AND item_summary.first_booking_date >= :startDate)
-             OR (:dateField = 'payment_date' AND DATE(COALESCE(p.paid_at, p.created_at)) >= :startDate)
-           )
-         )
-         AND (
-           :endDate IS NULL
-           OR (
-             (:dateField = 'created_date' AND DATE(b.created_at) <= :endDate)
-             OR (:dateField = 'booking_date' AND item_summary.first_booking_date <= :endDate)
-             OR (:dateField = 'payment_date' AND DATE(COALESCE(p.paid_at, p.created_at)) <= :endDate)
-           )
-         )
+         ${dateFilter.sql}
        ORDER BY ${orderBy}
        LIMIT 1000`,
       {
@@ -4692,9 +4779,7 @@ router.get(
         hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
         marketId: marketId || null,
         paidOnly: paidOnly ? 1 : 0,
-        startDate: startDate || null,
-        endDate: endDate || null,
-        dateField,
+        ...dateFilter.params,
       },
     );
 
@@ -4739,6 +4824,12 @@ router.get(
       booking_date: 'MIN(bi.booking_date) DESC, b.public_id ASC',
       payment_date: 'COALESCE(p.paid_at, p.created_at) DESC, b.public_id ASC',
     }[sortBy];
+    const dateFilter = buildAccountingDateFilter({
+      dateField,
+      startDate,
+      endDate,
+      aliases: { payment: 'p', booking: 'p', item: 'bi' },
+    });
     const rows = await query(
       `SELECT p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at, b.public_id AS booking_public_id,
               b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
@@ -4774,22 +4865,7 @@ router.get(
          AND (:marketId IS NULL OR b.market_id = :marketId)
          AND (:paidOnly = 0 OR p.status = 'paid')
          AND (:paidOnly = 0 OR b.status = 'paid')
-         AND (
-           :startDate IS NULL
-           OR (
-             (:dateField = 'created_date' AND DATE(p.created_at) >= :startDate)
-             OR (:dateField = 'booking_date' AND bi.booking_date >= :startDate)
-             OR (:dateField = 'payment_date' AND DATE(COALESCE(p.paid_at, p.created_at)) >= :startDate)
-           )
-         )
-         AND (
-           :endDate IS NULL
-           OR (
-             (:dateField = 'created_date' AND DATE(p.created_at) <= :endDate)
-             OR (:dateField = 'booking_date' AND bi.booking_date <= :endDate)
-             OR (:dateField = 'payment_date' AND DATE(COALESCE(p.paid_at, p.created_at)) <= :endDate)
-           )
-         )
+         ${dateFilter.sql}
        GROUP BY p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at, b.public_id,
                 b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
                 m.id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc,
@@ -4804,9 +4880,7 @@ router.get(
         hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
         paidOnly: paidOnly ? 1 : 0,
         marketId: marketId || null,
-        startDate: startDate || null,
-        endDate: endDate || null,
-        dateField,
+        ...dateFilter.params,
       },
     );
     return ok(
@@ -5051,6 +5125,12 @@ router.get(
   ),
   asyncHandler(async (req, res) => {
     const { startDate, endDate, marketId } = req.validated.query;
+    const dateFilter = buildAccountingDateFilter({
+      dateField: 'payment_date',
+      startDate,
+      endDate,
+      aliases: { payment: 'p', booking: 'b', item: 'bi' },
+    });
     const rows = await query(
       `SELECT p.id, p.public_id AS payment_public_id, p.provider, p.provider_reference,
               p.status AS payment_status, p.amount AS payment_amount, p.paid_at, p.created_at,
@@ -5081,8 +5161,7 @@ router.get(
        WHERE p.organization_id = :organizationId
          AND (:marketId IS NULL OR b.market_id = :marketId)
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
-         AND (:startDate IS NULL OR DATE(COALESCE(p.paid_at, p.created_at)) >= :startDate)
-         AND (:endDate IS NULL OR DATE(COALESCE(p.paid_at, p.created_at)) <= :endDate)
+         ${dateFilter.sql}
        ORDER BY COALESCE(p.paid_at, p.created_at) DESC, p.id DESC
        LIMIT 1000`,
       {
@@ -5090,8 +5169,7 @@ router.get(
         adminUserId: req.auth.sub,
         hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
         marketId: marketId || null,
-        startDate: startDate || null,
-        endDate: endDate || null,
+        ...dateFilter.params,
       },
     );
     return ok(res, rows.map((row) => {

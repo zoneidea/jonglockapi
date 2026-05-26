@@ -6,6 +6,7 @@ const multer = require('multer');
 const { z } = require('zod');
 const { query, transaction } = require('../../config/db');
 const { validate } = require('../../middlewares/validate');
+const { cacheResponse } = require('../../middlewares/response-cache');
 const { asyncHandler } = require('../../utils/async-handler');
 const { ok, created } = require('../../utils/api-response');
 const { blindIndex, decryptField, encryptField } = require('../../utils/crypto');
@@ -20,6 +21,8 @@ const { getFirebaseAuth, getFirebaseInitReason } = require('../../services/fireb
 const { deleteBoothTempLocksByBoothDates } = require('../../services/firestore-locks.service');
 
 const router = express.Router();
+const cachePublicMarkets = cacheResponse({ namespace: 'public:markets', ttlSeconds: 60, maxEntries: 300 });
+const cachePublicAnnouncements = cacheResponse({ namespace: 'public:announcements', ttlSeconds: 30, maxEntries: 100 });
 const uploadRoot = path.join(__dirname, '..', '..', '..', 'uploads');
 const allowedImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 const profileUpload = multer({
@@ -346,6 +349,7 @@ function calculateCouponDiscount(coupon, subtotalAmount) {
 
 router.get(
   '/markets',
+  cachePublicMarkets,
   asyncHandler(async (req, res) => {
     const search = String(req.query.q || '').trim();
     const params = {};
@@ -379,6 +383,7 @@ router.get(
 
 router.get(
   '/markets/:marketId',
+  cachePublicMarkets,
   asyncHandler(async (req, res) => {
     const marketId = Number(req.params.marketId);
     const rows = await query(
@@ -406,6 +411,7 @@ router.get(
 
 router.get(
   '/markets/:marketId/floor-plans',
+  cachePublicMarkets,
   asyncHandler(async (req, res) => {
     const marketId = Number(req.params.marketId);
     const rows = await query(
@@ -438,6 +444,7 @@ router.get(
 
 router.get(
   '/markets/:marketId/accessories',
+  cachePublicMarkets,
   validate(
     z.object({
       body: z.object({}).passthrough(),
@@ -2068,6 +2075,7 @@ router.post(
 
 router.get(
   '/announcements',
+  cachePublicAnnouncements,
   asyncHandler(async (req, res) => {
     const type = ['news', 'banner'].includes(String(req.query.type || '')) ? String(req.query.type) : null;
     const limit = Math.min(Math.max(Number(req.query.limit || 20), 1), 50);
