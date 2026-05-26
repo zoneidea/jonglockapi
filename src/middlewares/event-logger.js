@@ -1,5 +1,6 @@
 const { query } = require('../config/db');
 const { logger } = require('../config/logger');
+const { blindIndex } = require('../utils/crypto');
 
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 const REDACTED = '[REDACTED]';
@@ -10,6 +11,7 @@ const SENSITIVE_KEYS = new Set([
   'passwordhash',
   'password_hash',
   'token',
+  'firebaseidtoken',
   'accesstoken',
   'access_token',
   'refreshtoken',
@@ -69,11 +71,35 @@ function safeJson(value) {
   }
 }
 
+function compactForLog(value, depth = 0) {
+  if (depth > 5) return '[MAX_DEPTH]';
+  if (value == null) return value;
+  if (Array.isArray(value)) {
+    return {
+      type: 'array',
+      length: value.length,
+      sample: value.slice(0, 3).map((item) => compactForLog(item, depth + 1)),
+    };
+  }
+  if (typeof value !== 'object') return value;
+
+  const output = {};
+  for (const [key, childValue] of Object.entries(value)) {
+    output[key] = compactForLog(childValue, depth + 1);
+  }
+  return output;
+}
+
+function safeCompactJson(value) {
+  return safeJson(compactForLog(value));
+}
+
 function inferChannel(pathname) {
   if (pathname.includes('/management')) return 'management';
   if (pathname.includes('/mobile/audit')) return 'audit';
   if (pathname.includes('/mobile/payments')) return 'payment';
   if (pathname.includes('/mobile')) return 'mobile';
+  if (pathname.includes('/public')) return 'mobile';
   return 'unknown';
 }
 
@@ -85,6 +111,7 @@ function inferActorType(req, channel, responseBody) {
   if (responseBody?.data?.user && channel === 'management') return 'management';
   if (responseBody?.data?.user && channel === 'mobile') return 'mobile';
   if (responseBody?.data?.user && channel === 'audit') return 'audit';
+  if (channel === 'mobile' && (req.body?.user?.email || req.body?.email || responseBody?.data?.publicId)) return 'mobile';
   if (channel === 'payment') return 'payment';
   return 'anonymous';
 }
@@ -93,6 +120,12 @@ function inferAction(req) {
   const path = req.originalUrl || req.path || '';
   if (/\/auth\/login\b/.test(path)) return 'login';
   if (/\/auth\/register\b/.test(path)) return 'register';
+  if (/\/booths\/availability\b/.test(path)) return 'availability.check';
+  if (/\/bookings\/cart\b/.test(path)) return 'cart.list';
+  if (/\/bookings\/\d+\/summary\b/.test(path)) return 'booking.summary';
+  if (/\/bookings\/\d+\/confirm\b/.test(path)) return 'booking.confirm';
+  if (/\/bookings\/\d+\/payment-proof\b/.test(path)) return 'payment.proof.upload';
+  if (/\/profile\/me\b/.test(path)) return 'profile.sync';
   if (/\/cancel\b/.test(path)) return 'cancel';
   if (/\/callbacks\//.test(path)) return 'callback';
   if (/\/transactions\b/.test(path)) return 'payment.create';
@@ -116,7 +149,7 @@ function segmentToEntity(segment) {
 function inferEntityType(req) {
   const path = (req.originalUrl || '').split('?')[0];
   const segments = path.split('/').filter(Boolean);
-  const ignored = new Set(['api', 'management', 'mobile', 'audit', 'payments', 'auth']);
+  const ignored = new Set(['api', 'management', 'mobile', 'public', 'audit', 'payments', 'auth']);
   const candidates = segments.filter((segment) => !ignored.has(segment) && !/^\d+$/.test(segment));
   if (!candidates.length) return null;
 
@@ -125,12 +158,22 @@ function inferEntityType(req) {
   return segmentToEntity(candidates[candidates.length - 1]) || null;
 }
 
+function inferUniqueValueFromData(data, key) {
+  if (Array.isArray(data)) {
+    const values = Array.from(new Set(data.map((item) => item?.[key]).filter(Boolean)));
+    return values.length === 1 ? values[0] : null;
+  }
+  return data?.[key] || null;
+}
+
 function inferEntityId(req, responseBody) {
   const data = responseBody?.data;
   return (
     data?.id ||
     data?.publicId ||
     data?.public_id ||
+    data?.bookingId ||
+    data?.payment?.id ||
     req.params?.id ||
     req.params?.bookingId ||
     req.params?.bookingItemId ||
@@ -141,14 +184,123 @@ function inferEntityId(req, responseBody) {
 }
 
 function inferOrganizationId(req, responseBody) {
+  const data = responseBody?.data;
   return (
     req.auth?.organizationId ||
     req.body?.organizationId ||
     req.query?.organizationId ||
-    responseBody?.data?.organizationId ||
-    responseBody?.data?.user?.organizationId ||
+    data?.organizationId ||
+    data?.organization_id ||
+    data?.user?.organizationId ||
+    inferUniqueValueFromData(data, 'organizationId') ||
+    inferUniqueValueFromData(data, 'organization_id') ||
     null
   );
+}
+
+function publicEmailFromRequest(req) {
+  return String(req.body?.user?.email || req.body?.email || '').trim().toLowerCase();
+}
+
+async function findPublicProfileIdByEmail(email) {
+  if (!email) return null;
+  const rows = await query(
+    `SELECT id
+     FROM public_user_profiles
+     WHERE email_hash = :emailHash
+     LIMIT 1`,
+    { emailHash: blindIndex(email) },
+  );
+  return rows[0]?.id || null;
+}
+
+async function findMobileUserIdByEmail(email, organizationId) {
+  if (!email || !organizationId) return null;
+  const rows = await query(
+    `SELECT id
+     FROM mobile_users
+     WHERE organization_id = :organizationId
+       AND email_hash = :emailHash
+       AND status <> 'deleted'
+     LIMIT 1`,
+    { organizationId, emailHash: blindIndex(email) },
+  );
+  return rows[0]?.id || null;
+}
+
+async function resolveOrganizationFromRoute(req) {
+  const floorPlanId = Number(req.params?.floorPlanId || 0);
+  if (floorPlanId) {
+    const rows = await query(
+      `SELECT organization_id
+       FROM floor_plans
+       WHERE id = :floorPlanId
+       LIMIT 1`,
+      { floorPlanId },
+    );
+    if (rows[0]?.organization_id) return rows[0].organization_id;
+  }
+
+  const marketId = Number(req.params?.marketId || req.body?.marketId || req.query?.marketId || 0);
+  if (marketId) {
+    const rows = await query(
+      `SELECT organization_id
+       FROM markets
+       WHERE id = :marketId
+       LIMIT 1`,
+      { marketId },
+    );
+    if (rows[0]?.organization_id) return rows[0].organization_id;
+  }
+
+  const boothId = Number(req.params?.boothId || req.body?.boothId || 0);
+  if (boothId) {
+    const rows = await query(
+      `SELECT organization_id
+       FROM booths
+       WHERE id = :boothId
+       LIMIT 1`,
+      { boothId },
+    );
+    if (rows[0]?.organization_id) return rows[0].organization_id;
+  }
+
+  const bookingId = Number(req.params?.bookingId || req.body?.bookingId || 0);
+  if (bookingId) {
+    const rows = await query(
+      `SELECT organization_id
+       FROM bookings
+       WHERE id = :bookingId
+       LIMIT 1`,
+      { bookingId },
+    );
+    if (rows[0]?.organization_id) return rows[0].organization_id;
+  }
+
+  return null;
+}
+
+async function enrichEvent(req, event, responseBody) {
+  const enriched = { ...event };
+  if (!enriched.organizationId) {
+    enriched.organizationId = await resolveOrganizationFromRoute(req);
+  }
+
+  const email = publicEmailFromRequest(req);
+  if (enriched.actorType === 'mobile' && !enriched.actorId) {
+    enriched.actorId = await findMobileUserIdByEmail(email, enriched.organizationId)
+      || await findPublicProfileIdByEmail(email);
+  }
+
+  if (!enriched.actorRole && enriched.actorType === 'mobile') {
+    enriched.actorRole = 'customer';
+  }
+
+  if (!enriched.entityId && responseBody?.data?.bookingId) {
+    enriched.entityId = responseBody.data.bookingId;
+  }
+
+  return enriched;
 }
 
 function routePath(req) {
@@ -197,18 +349,22 @@ function eventLogger() {
         responseJson: safeJson(responseBody),
       };
 
-      query(
-        `INSERT INTO event_logs (
-          organization_id, actor_type, actor_id, actor_role, channel, action, entity_type, entity_id,
-          method, path, route_path, status_code, success, ip_address, user_agent, request_json, response_json
-        ) VALUES (
-          :organizationId, :actorType, :actorId, :actorRole, :channel, :action, :entityType, :entityId,
-          :method, :path, :routePath, :statusCode, :success, :ipAddress, :userAgent, :requestJson, :responseJson
-        )`,
-        event,
-      ).catch((error) => {
-        logger.error({ error, path: req.originalUrl }, 'Event log write failed');
-      });
+      event.responseJson = safeCompactJson(responseBody);
+
+      enrichEvent(req, event, responseBody)
+        .then((enrichedEvent) => query(
+          `INSERT INTO event_logs (
+            organization_id, actor_type, actor_id, actor_role, channel, action, entity_type, entity_id,
+            method, path, route_path, status_code, success, ip_address, user_agent, request_json, response_json
+          ) VALUES (
+            :organizationId, :actorType, :actorId, :actorRole, :channel, :action, :entityType, :entityId,
+            :method, :path, :routePath, :statusCode, :success, :ipAddress, :userAgent, :requestJson, :responseJson
+          )`,
+          enrichedEvent,
+        ))
+        .catch((error) => {
+          logger.error({ error, path: req.originalUrl }, 'Event log write failed');
+        });
     });
 
     return next();
