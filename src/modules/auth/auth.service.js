@@ -95,14 +95,18 @@ async function loginMobile({ organizationId, username, password }) {
   };
 }
 
-async function loginAudit({ username, password }) {
+async function loginAudit({ organizationCode, username, password }) {
   const usernameHash = blindIndex(username);
   const rows = await query(
-    `SELECT id, organization_id, role, password_hash, name_enc, status
-     FROM admin_users
-     WHERE username_hash = :usernameHash AND role = 'audit'
+    `SELECT au.id, au.organization_id, au.role, au.password_hash, au.name_enc, au.status,
+            o.code AS organization_code, o.name AS organization_name
+     FROM admin_users au
+     JOIN organizations o ON o.id = au.organization_id
+     WHERE au.username_hash = :usernameHash
+       AND au.role = 'audit'
+       AND o.code = :organizationCode
      LIMIT 1`,
-    { usernameHash },
+    { usernameHash, organizationCode },
   );
 
   const user = rows[0];
@@ -128,6 +132,8 @@ async function loginAudit({ username, password }) {
     user: {
       id: user.id,
       organizationId: user.organization_id,
+      organizationCode: user.organization_code,
+      organizationName: user.organization_name,
       role: user.role,
       menus: MENU_ACCESS[user.role],
       marketIds,

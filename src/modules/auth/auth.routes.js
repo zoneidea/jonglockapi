@@ -46,7 +46,17 @@ router.post(
 
 router.post(
   '/mobile/audit/login',
-  validate(managementLoginSchema),
+  validate(
+    z.object({
+      body: z.object({
+        organizationCode: z.string().min(1),
+        username: z.string().min(1),
+        password: z.string().min(1),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({}).passthrough(),
+    }),
+  ),
   asyncHandler(async (req, res) => {
     const result = await authService.loginAudit(req.validated.body);
     return ok(res, result);
