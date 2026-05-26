@@ -1837,6 +1837,7 @@ router.post(
             bi.organization_id,
             bi.booking_id,
             DATE_FORMAT(bi.booking_date, '%Y-%m-%d') AS booking_date,
+            DATE_FORMAT(CURDATE(), '%Y-%m-%d') AS current_date,
             bi.status AS item_status,
             bi.checked_in_at,
             b.public_id,
@@ -1885,6 +1886,10 @@ router.post(
       const item = rows[0];
       if (item.email_hash !== emailHash) {
         throw badRequest('Booking owner does not match');
+      }
+
+      if (String(item.booking_date).slice(0, 10) !== String(item.current_date).slice(0, 10)) {
+        throw badRequest('Check-in is only available on the booking date');
       }
 
       if (!item.checked_in_at) {
