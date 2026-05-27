@@ -4560,7 +4560,7 @@ router.get(
          AND bi.booking_date <= :endDate
        GROUP BY bi.id, b.public_id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc, bo.code, bo.name,
                 bi.booking_date, b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount
-       ORDER BY bi.booking_date DESC, b.created_at DESC, m.name, bo.sort_order, bo.code, b.public_id`,
+       ORDER BY bi.booking_date ASC, b.created_at DESC, m.name, bo.sort_order, bo.code, b.public_id`,
       {
         organizationId: req.auth.organizationId,
         adminUserId: req.auth.sub,
@@ -5219,9 +5219,12 @@ router.get(
       aliases: { payment: 'p', booking: 'b', item: 'bi' },
     });
     const rows = await query(
-      `SELECT p.id, p.public_id AS payment_public_id, p.provider, p.provider_reference,
+      `SELECT p.id, p.public_id AS payment_public_id, p.provider_reference,
+              CASE WHEN p.audit_check_id IS NOT NULL THEN 'audit_fine' ELSE 'booking' END AS payment_kind,
               p.status AS payment_status, p.amount AS payment_amount, p.paid_at, p.created_at,
-              b.public_id AS booking_public_id, b.status AS booking_status, b.total_amount AS booking_amount,
+              COALESCE(b.public_id, ac_b.public_id) AS booking_public_id,
+              CASE WHEN p.audit_check_id IS NOT NULL THEN ac.fine_payment_status ELSE b.status END AS booking_status,
+              CASE WHEN p.audit_check_id IS NOT NULL THEN ac.total_fine_amount ELSE b.total_amount END AS booking_amount,
               m.name AS market_name,
               ad.document_no, ad.document_type,
               (
@@ -5231,8 +5234,11 @@ router.get(
                   AND DATE(pc.received_at) = DATE(COALESCE(p.paid_at, p.created_at))
               ) AS callback_count
        FROM payments p
-       LEFT JOIN bookings b ON b.id = p.booking_id
-       LEFT JOIN markets m ON m.id = b.market_id
+       LEFT JOIN bookings b ON b.id = p.booking_id AND b.organization_id = p.organization_id
+       LEFT JOIN audit_checks ac ON ac.id = p.audit_check_id AND ac.organization_id = p.organization_id
+       LEFT JOIN booking_items ac_bi ON ac_bi.id = ac.booking_item_id AND ac_bi.organization_id = ac.organization_id
+       LEFT JOIN bookings ac_b ON ac_b.id = ac_bi.booking_id AND ac_b.organization_id = ac_bi.organization_id
+       LEFT JOIN markets m ON m.id = COALESCE(b.market_id, ac.market_id) AND m.organization_id = p.organization_id
        LEFT JOIN accounting_documents ad
          ON ad.id = (
            SELECT ad2.id
@@ -5244,9 +5250,9 @@ router.get(
            LIMIT 1
          )
        LEFT JOIN admin_market_assignments ama
-         ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE p.organization_id = :organizationId
-         AND (:marketId IS NULL OR b.market_id = :marketId)
+         AND (:marketId IS NULL OR m.id = :marketId)
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          ${dateFilter.sql}
        ORDER BY COALESCE(p.paid_at, p.created_at) DESC, p.id DESC
