@@ -149,6 +149,7 @@ router.get(
           mu.first_name_enc,
           mu.last_name_enc,
           ac_latest.result AS latest_audit_result,
+          ac_latest.note AS latest_audit_note,
           ac_latest.total_fine_amount AS latest_fine_amount,
           ac_latest.checked_at AS latest_checked_at,
           payment_summary.paid_at AS payment_paid_at
@@ -213,6 +214,7 @@ router.get(
           customerName: [firstName, lastName].filter(Boolean).join(' ').trim() || 'ไม่ระบุชื่อ',
           auditStatus: row.audit_status || 'pending',
           latestAuditResult: row.latest_audit_result || null,
+          latestAuditNote: row.latest_audit_note || '',
           latestFineAmount: Number(row.latest_fine_amount || 0),
           latestCheckedAt: row.latest_checked_at || null,
           checkedInAt: row.checked_in_at || null,
