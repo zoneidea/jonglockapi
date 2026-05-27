@@ -986,6 +986,7 @@ router.post(
         organizationCode: z.string().min(1),
         username: z.string().min(1),
         password: z.string().min(1),
+        rememberMe: z.boolean().optional().default(false),
       }),
       query: z.object({}).passthrough(),
       params: z.object({}).passthrough(),

@@ -15,6 +15,7 @@ const envSchema = z.object({
   DB_CONNECTION_LIMIT: z.coerce.number().default(10),
   JWT_SECRET: z.string().min(32),
   JWT_EXPIRES_IN: z.string().default('8h'),
+  MANAGEMENT_REMEMBER_EXPIRES_IN: z.string().default('30d'),
   MOBILE_JWT_EXPIRES_IN: z.string().default('30d'),
   FIELD_ENCRYPTION_KEY: z.string().min(32),
   FIELD_HASH_SECRET: z.string().min(16),

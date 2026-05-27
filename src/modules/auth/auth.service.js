@@ -14,7 +14,7 @@ async function getAssignedMarketIds(adminUserId) {
   return rows.map((row) => row.market_id);
 }
 
-async function loginManagement({ organizationCode, username, password }) {
+async function loginManagement({ organizationCode, username, password, rememberMe = false }) {
   const usernameHash = blindIndex(username);
   const rows = await query(
     `SELECT au.id, au.organization_id, au.role, au.username_hash, au.password_hash, au.name_enc, au.email_enc, au.status,
@@ -44,6 +44,8 @@ async function loginManagement({ organizationCode, username, password }) {
     role: user.role,
     organizationId: user.organization_id,
     marketIds,
+  }, {
+    expiresIn: rememberMe ? env.MANAGEMENT_REMEMBER_EXPIRES_IN : env.JWT_EXPIRES_IN,
   });
 
   return {
