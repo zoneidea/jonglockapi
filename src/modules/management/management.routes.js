@@ -862,8 +862,17 @@ async function nextAccountingDocumentNo(conn, organizationId, documentType, issu
 async function fetchPaymentAccountingDetail(conn, organizationId, paymentId, adminUserId, hasGlobalMarketAccess) {
   const [rows] = await conn.execute(
     `SELECT p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at,
-            b.id AS booking_id, b.public_id AS booking_public_id,
-            b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
+            p.audit_check_id,
+            COALESCE(b.id, ac_b.id) AS booking_id,
+            COALESCE(b.public_id, ac_b.public_id) AS booking_public_id,
+            CASE WHEN p.audit_check_id IS NOT NULL THEN 'audit_fine' ELSE 'booking' END AS payment_kind,
+            CASE WHEN p.audit_check_id IS NOT NULL
+              THEN COALESCE(ac.fine_amount, 0) + COALESCE(ac.accessories_fine_amount, 0) + COALESCE(ac.damage_fine_amount, 0)
+              ELSE b.subtotal_amount
+            END AS subtotal_amount,
+            CASE WHEN p.audit_check_id IS NOT NULL THEN 0 ELSE b.discount_amount END AS discount_amount,
+            CASE WHEN p.audit_check_id IS NOT NULL THEN ac.vat_amount ELSE b.vat_amount END AS vat_amount,
+            CASE WHEN p.audit_check_id IS NOT NULL THEN ac.total_fine_amount ELSE b.total_amount END AS total_amount,
             m.id AS market_id, m.name AS market_name,
             mu.username_enc, mu.first_name_enc, mu.last_name_enc,
             o.name AS organization_name, o.address AS organization_address, o.email AS organization_email, o.phone AS organization_phone,
@@ -872,21 +881,32 @@ async function fetchPaymentAccountingDetail(conn, organizationId, paymentId, adm
             GROUP_CONCAT(DISTINCT DATE_FORMAT(bi.booking_date, '%Y-%m-%d') ORDER BY bi.booking_date SEPARATOR ', ') AS booking_dates,
             GROUP_CONCAT(DISTINCT CONCAT(COALESCE(bo.code, ''), CASE WHEN bo.name IS NULL OR bo.name = '' THEN '' ELSE CONCAT(' ', bo.name) END) ORDER BY bo.sort_order, bo.code SEPARATOR ', ') AS booths
      FROM payments p
-     JOIN bookings b ON b.id = p.booking_id
+     LEFT JOIN bookings b ON b.id = p.booking_id AND b.organization_id = p.organization_id
+     LEFT JOIN audit_checks ac ON ac.id = p.audit_check_id AND ac.organization_id = p.organization_id
+     LEFT JOIN booking_items ac_bi ON ac_bi.id = ac.booking_item_id AND ac_bi.organization_id = ac.organization_id
+     LEFT JOIN bookings ac_b ON ac_b.id = ac_bi.booking_id AND ac_b.organization_id = ac_bi.organization_id
      JOIN organizations o ON o.id = p.organization_id
-     JOIN markets m ON m.id = b.market_id
-     JOIN mobile_users mu ON mu.id = b.mobile_user_id
-     LEFT JOIN booking_items bi ON bi.booking_id = b.id
+     JOIN markets m ON m.id = COALESCE(b.market_id, ac.market_id) AND m.organization_id = p.organization_id
+     LEFT JOIN mobile_users mu ON mu.id = COALESCE(b.mobile_user_id, ac_b.mobile_user_id) AND mu.organization_id = p.organization_id
+     LEFT JOIN booking_items bi
+       ON bi.organization_id = p.organization_id
+      AND (
+        (p.booking_id IS NOT NULL AND bi.booking_id = b.id)
+        OR (p.audit_check_id IS NOT NULL AND bi.id = ac.booking_item_id)
+      )
      LEFT JOIN booths bo ON bo.id = bi.booth_id
      LEFT JOIN admin_market_assignments ama
-       ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+       ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
      WHERE p.id = :paymentId
        AND p.organization_id = :organizationId
        AND p.status = 'paid'
-       AND b.status = 'paid'
+       AND (p.booking_id IS NULL OR b.status = 'paid')
+       AND (p.audit_check_id IS NULL OR ac.fine_payment_status = 'paid')
        AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
      GROUP BY p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at,
-              b.id, b.public_id, b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
+              p.audit_check_id, b.id, b.public_id, b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
+              ac.id, ac.fine_amount, ac.accessories_fine_amount, ac.damage_fine_amount, ac.vat_amount, ac.total_fine_amount,
+              ac_b.id, ac_b.public_id,
               m.id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc,
               o.name, o.address, o.email, o.phone, o.vat_enabled, o.vat_rate, o.registered_name,
               o.registered_tax_id, o.registered_subdistrict, o.registered_district, o.registered_province, o.registered_postcode
@@ -920,7 +940,7 @@ async function issueAccountingDocument(conn, { organizationId, paymentId, adminU
   const customerName = [decryptField(payment.first_name_enc), decryptField(payment.last_name_enc)].filter(Boolean).join(' ').trim() || decryptField(payment.username_enc) || '-';
   const lineItems = [
     {
-      description: 'ค่าจอง Booth',
+      description: payment.payment_kind === 'audit_fine' ? 'ค่าปรับ/ค่าบริการตรวจสอบตลาด' : 'ค่าจอง Booth',
       detail: payment.booths || '-',
       amount: Number(payment.subtotal_amount || 0),
     },
@@ -948,11 +968,11 @@ async function issueAccountingDocument(conn, { organizationId, paymentId, adminU
 
   const [createdDocument] = await conn.execute(
     `INSERT INTO accounting_documents (
-      organization_id, document_type, document_no, document_status, payment_id, booking_id,
+      organization_id, document_type, document_no, document_status, payment_id, booking_id, audit_check_id,
       issue_date, subtotal_amount, discount_amount, vat_amount, withholding_tax_amount, total_amount,
       customer_name, organization_snapshot_json, customer_snapshot_json, line_items_json, issued_by_admin_id
     ) VALUES (
-      :organizationId, :documentType, :documentNo, 'issued', :paymentId, :bookingId,
+      :organizationId, :documentType, :documentNo, 'issued', :paymentId, :bookingId, :auditCheckId,
       :issueDate, :subtotalAmount, :discountAmount, :vatAmount, 0, :totalAmount,
       :customerName, :organizationSnapshotJson, :customerSnapshotJson, :lineItemsJson, :adminUserId
     )`,
@@ -962,6 +982,7 @@ async function issueAccountingDocument(conn, { organizationId, paymentId, adminU
       documentNo,
       paymentId: payment.id,
       bookingId: payment.booking_id,
+      auditCheckId: payment.audit_check_id || null,
       issueDate,
       subtotalAmount: payment.subtotal_amount || 0,
       discountAmount: payment.discount_amount || 0,
@@ -4052,19 +4073,32 @@ router.get(
       `SELECT
           p.id, p.public_id, p.status, p.amount, p.provider_reference,
           p.proof_image_url, p.proof_uploaded_at, p.payer_note, p.paid_at,
-          b.id AS booking_id, b.public_id AS booking_public_id, b.status AS booking_status,
+          p.audit_check_id,
+          COALESCE(b.id, ac_b.id) AS booking_id,
+          COALESCE(b.public_id, ac_b.public_id) AS booking_public_id,
+          CASE WHEN p.audit_check_id IS NOT NULL THEN 'audit_fine' ELSE 'booking' END AS payment_kind,
+          b.status AS booking_status,
           b.expires_at, m.id AS market_id, m.name AS market_name,
           mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.email_enc
        FROM payments p
-       JOIN bookings b
+       LEFT JOIN bookings b
          ON b.id = p.booking_id
         AND b.organization_id = p.organization_id
+       LEFT JOIN audit_checks ac
+         ON ac.id = p.audit_check_id
+        AND ac.organization_id = p.organization_id
+       LEFT JOIN booking_items ac_bi
+         ON ac_bi.id = ac.booking_item_id
+        AND ac_bi.organization_id = ac.organization_id
+       LEFT JOIN bookings ac_b
+         ON ac_b.id = ac_bi.booking_id
+        AND ac_b.organization_id = ac_bi.organization_id
        JOIN markets m
-         ON m.id = b.market_id
-        AND m.organization_id = b.organization_id
-       JOIN mobile_users mu
-         ON mu.id = b.mobile_user_id
-        AND mu.organization_id = b.organization_id
+         ON m.id = COALESCE(b.market_id, ac.market_id)
+        AND m.organization_id = p.organization_id
+       LEFT JOIN mobile_users mu
+         ON mu.id = COALESCE(b.mobile_user_id, ac_b.mobile_user_id)
+        AND mu.organization_id = p.organization_id
        LEFT JOIN admin_market_assignments ama
          ON ama.market_id = m.id
         AND ama.admin_user_id = :adminUserId
@@ -4116,14 +4150,19 @@ router.patch(
     const result = await transaction(async (conn) => {
       await expireStaleBookings(conn, req.auth.organizationId);
       const [rows] = await conn.execute(
-        `SELECT p.id, p.public_id, p.booking_id, p.amount, p.status,
-                b.status AS booking_status, b.market_id, b.expires_at
+        `SELECT p.id, p.public_id, p.booking_id, p.audit_check_id, p.amount, p.status,
+                b.status AS booking_status, b.expires_at,
+                ac.fine_payment_status,
+                COALESCE(b.market_id, ac.market_id) AS market_id
          FROM payments p
-         JOIN bookings b
+         LEFT JOIN bookings b
            ON b.id = p.booking_id
           AND b.organization_id = p.organization_id
+         LEFT JOIN audit_checks ac
+           ON ac.id = p.audit_check_id
+          AND ac.organization_id = p.organization_id
          LEFT JOIN admin_market_assignments ama
-           ON ama.market_id = b.market_id
+           ON ama.market_id = COALESCE(b.market_id, ac.market_id)
           AND ama.admin_user_id = :adminUserId
           AND ama.status = 'active'
          WHERE p.id = :paymentId
@@ -4142,7 +4181,10 @@ router.patch(
       const payment = rows[0];
       if (!payment) throw notFound('Payment proof not found');
       if (!['waiting', 'failed'].includes(payment.status)) throw badRequest('Payment proof is not reviewable');
-      if (!['pending_payment', 'payment_processing'].includes(payment.booking_status)) {
+      if (payment.audit_check_id && !['waiting', 'pending'].includes(payment.fine_payment_status)) {
+        throw badRequest('Fine payment is not waiting for review');
+      }
+      if (!payment.audit_check_id && !['pending_payment', 'payment_processing'].includes(payment.booking_status)) {
         throw badRequest('Booking is not waiting for payment review');
       }
 
@@ -4153,30 +4195,40 @@ router.patch(
                paid_at = NOW(),
                verified_by_admin_id = :adminUserId,
                verified_at = NOW()
-           WHERE id = :paymentId
+          WHERE id = :paymentId
              AND organization_id = :organizationId`,
           { organizationId: req.auth.organizationId, paymentId: payment.id, adminUserId: req.auth.sub },
         );
-        await conn.execute(
-          `UPDATE bookings
-           SET status = 'paid',
-               paid_at = NOW()
-           WHERE id = :bookingId
-             AND organization_id = :organizationId`,
-          { organizationId: req.auth.organizationId, bookingId: payment.booking_id },
-        );
-        await conn.execute(
-          `UPDATE booking_items
-           SET status = 'paid'
-           WHERE booking_id = :bookingId
-             AND organization_id = :organizationId`,
-          { organizationId: req.auth.organizationId, bookingId: payment.booking_id },
-        );
-        await updateBookingLocksStatus(conn, {
-          organizationId: req.auth.organizationId,
-          bookingId: payment.booking_id,
-          status: 'paid',
-        });
+        if (payment.audit_check_id) {
+          await conn.execute(
+            `UPDATE audit_checks
+             SET fine_payment_status = 'paid'
+             WHERE id = :auditCheckId
+               AND organization_id = :organizationId`,
+            { organizationId: req.auth.organizationId, auditCheckId: payment.audit_check_id },
+          );
+        } else {
+          await conn.execute(
+            `UPDATE bookings
+             SET status = 'paid',
+                 paid_at = NOW()
+             WHERE id = :bookingId
+               AND organization_id = :organizationId`,
+            { organizationId: req.auth.organizationId, bookingId: payment.booking_id },
+          );
+          await conn.execute(
+            `UPDATE booking_items
+             SET status = 'paid'
+             WHERE booking_id = :bookingId
+               AND organization_id = :organizationId`,
+            { organizationId: req.auth.organizationId, bookingId: payment.booking_id },
+          );
+          await updateBookingLocksStatus(conn, {
+            organizationId: req.auth.organizationId,
+            bookingId: payment.booking_id,
+            status: 'paid',
+          });
+        }
       } else {
         await conn.execute(
           `UPDATE payments
@@ -4187,41 +4239,52 @@ router.patch(
              AND organization_id = :organizationId`,
           { organizationId: req.auth.organizationId, paymentId: payment.id, adminUserId: req.auth.sub },
         );
-        await conn.execute(
-          `UPDATE bookings
-           SET status = 'pending_payment',
-               cart_visible = 1,
-               expires_at = DATE_ADD(NOW(), INTERVAL ${PAYMENT_EXPIRES_MINUTES} MINUTE)
-           WHERE id = :bookingId
-             AND organization_id = :organizationId`,
-          { organizationId: req.auth.organizationId, bookingId: payment.booking_id },
-        );
-        await conn.execute(
-          `UPDATE booking_items
-           SET status = 'pending_payment'
-           WHERE booking_id = :bookingId
-             AND organization_id = :organizationId
-             AND status = 'payment_processing'`,
-          { organizationId: req.auth.organizationId, bookingId: payment.booking_id },
-        );
-        await updateBookingLocksStatus(conn, {
-          organizationId: req.auth.organizationId,
-          bookingId: payment.booking_id,
-          status: 'pending_payment',
-        });
-        await conn.execute(
-          `UPDATE booth_date_locks
-           SET expires_at = DATE_ADD(NOW(), INTERVAL ${PAYMENT_EXPIRES_MINUTES} MINUTE)
-           WHERE booking_id = :bookingId
-             AND organization_id = :organizationId`,
-          { organizationId: req.auth.organizationId, bookingId: payment.booking_id },
-        );
+        if (payment.audit_check_id) {
+          await conn.execute(
+            `UPDATE audit_checks
+             SET fine_payment_status = 'pending'
+             WHERE id = :auditCheckId
+               AND organization_id = :organizationId`,
+            { organizationId: req.auth.organizationId, auditCheckId: payment.audit_check_id },
+          );
+        } else {
+          await conn.execute(
+            `UPDATE bookings
+             SET status = 'pending_payment',
+                 cart_visible = 1,
+                 expires_at = DATE_ADD(NOW(), INTERVAL ${PAYMENT_EXPIRES_MINUTES} MINUTE)
+             WHERE id = :bookingId
+               AND organization_id = :organizationId`,
+            { organizationId: req.auth.organizationId, bookingId: payment.booking_id },
+          );
+          await conn.execute(
+            `UPDATE booking_items
+             SET status = 'pending_payment'
+             WHERE booking_id = :bookingId
+               AND organization_id = :organizationId
+               AND status = 'payment_processing'`,
+            { organizationId: req.auth.organizationId, bookingId: payment.booking_id },
+          );
+          await updateBookingLocksStatus(conn, {
+            organizationId: req.auth.organizationId,
+            bookingId: payment.booking_id,
+            status: 'pending_payment',
+          });
+          await conn.execute(
+            `UPDATE booth_date_locks
+             SET expires_at = DATE_ADD(NOW(), INTERVAL ${PAYMENT_EXPIRES_MINUTES} MINUTE)
+             WHERE booking_id = :bookingId
+               AND organization_id = :organizationId`,
+            { organizationId: req.auth.organizationId, bookingId: payment.booking_id },
+          );
+        }
       }
 
       return {
         id: payment.id,
         publicId: payment.public_id,
         bookingId: payment.booking_id,
+        auditCheckId: payment.audit_check_id,
         status: req.validated.body.status,
       };
     });
@@ -4822,9 +4885,9 @@ router.get(
     const { startDate, endDate, marketId, dateField, sortBy } = req.validated.query;
     const paidOnly = req.validated.query.paidOnly === '1' || req.validated.query.status === 'paid';
     const orderBy = {
-      booking_public_id: 'b.public_id ASC',
-      booking_date: 'MIN(bi.booking_date) DESC, b.public_id ASC',
-      payment_date: 'COALESCE(p.paid_at, p.created_at) DESC, b.public_id ASC',
+      booking_public_id: 'COALESCE(b.public_id, ac_b.public_id) ASC',
+      booking_date: 'MIN(bi.booking_date) DESC, COALESCE(b.public_id, ac_b.public_id) ASC',
+      payment_date: 'COALESCE(p.paid_at, p.created_at) DESC, COALESCE(b.public_id, ac_b.public_id) ASC',
     }[sortBy];
     const dateFilter = buildAccountingDateFilter({
       dateField,
@@ -4833,8 +4896,17 @@ router.get(
       aliases: { payment: 'p', booking: 'p', item: 'bi' },
     });
     const rows = await query(
-      `SELECT p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at, b.public_id AS booking_public_id,
-              b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
+      `SELECT p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at,
+              p.audit_check_id,
+              COALESCE(b.public_id, ac_b.public_id) AS booking_public_id,
+              CASE WHEN p.audit_check_id IS NOT NULL THEN 'audit_fine' ELSE 'booking' END AS payment_kind,
+              CASE WHEN p.audit_check_id IS NOT NULL
+                THEN COALESCE(ac.fine_amount, 0) + COALESCE(ac.accessories_fine_amount, 0) + COALESCE(ac.damage_fine_amount, 0)
+                ELSE b.subtotal_amount
+              END AS subtotal_amount,
+              CASE WHEN p.audit_check_id IS NOT NULL THEN 0 ELSE b.discount_amount END AS discount_amount,
+              CASE WHEN p.audit_check_id IS NOT NULL THEN ac.vat_amount ELSE b.vat_amount END AS vat_amount,
+              CASE WHEN p.audit_check_id IS NOT NULL THEN ac.total_fine_amount ELSE b.total_amount END AS total_amount,
               m.id AS market_id, m.name AS market_name,
               mu.username_enc, mu.first_name_enc, mu.last_name_enc,
               ad.id AS document_id, ad.document_type, ad.document_no, ad.document_status, ad.issue_date,
@@ -4844,10 +4916,13 @@ router.get(
               GROUP_CONCAT(DISTINCT DATE_FORMAT(bi.booking_date, '%Y-%m-%d') ORDER BY bi.booking_date SEPARATOR ', ') AS booking_dates,
               GROUP_CONCAT(DISTINCT CONCAT(COALESCE(bo.code, ''), CASE WHEN bo.name IS NULL OR bo.name = '' THEN '' ELSE CONCAT(' ', bo.name) END) ORDER BY bo.sort_order, bo.code SEPARATOR ', ') AS booths
        FROM payments p
-       LEFT JOIN bookings b ON b.id = p.booking_id
+       LEFT JOIN bookings b ON b.id = p.booking_id AND b.organization_id = p.organization_id
+       LEFT JOIN audit_checks ac ON ac.id = p.audit_check_id AND ac.organization_id = p.organization_id
+       LEFT JOIN booking_items ac_bi ON ac_bi.id = ac.booking_item_id AND ac_bi.organization_id = ac.organization_id
+       LEFT JOIN bookings ac_b ON ac_b.id = ac_bi.booking_id AND ac_b.organization_id = ac_bi.organization_id
        LEFT JOIN organizations o ON o.id = p.organization_id
-       LEFT JOIN markets m ON m.id = b.market_id
-       LEFT JOIN mobile_users mu ON mu.id = b.mobile_user_id
+       LEFT JOIN markets m ON m.id = COALESCE(b.market_id, ac.market_id) AND m.organization_id = p.organization_id
+       LEFT JOIN mobile_users mu ON mu.id = COALESCE(b.mobile_user_id, ac_b.mobile_user_id) AND mu.organization_id = p.organization_id
        LEFT JOIN accounting_documents ad
          ON ad.id = (
            SELECT ad2.id
@@ -4858,18 +4933,28 @@ router.get(
            ORDER BY ad2.id DESC
            LIMIT 1
          )
-       LEFT JOIN booking_items bi ON bi.booking_id = b.id
+       LEFT JOIN booking_items bi
+         ON bi.organization_id = p.organization_id
+        AND (
+          (p.booking_id IS NOT NULL AND bi.booking_id = b.id)
+          OR (p.audit_check_id IS NOT NULL AND bi.id = ac.booking_item_id)
+        )
        LEFT JOIN booths bo ON bo.id = bi.booth_id
        LEFT JOIN admin_market_assignments ama
-         ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE p.organization_id = :organizationId
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
-         AND (:marketId IS NULL OR b.market_id = :marketId)
+         AND (:marketId IS NULL OR m.id = :marketId)
          AND (:paidOnly = 0 OR p.status = 'paid')
-         AND (:paidOnly = 0 OR b.status = 'paid')
+         AND (:paidOnly = 0 OR (
+           (p.booking_id IS NOT NULL AND b.status = 'paid')
+           OR (p.audit_check_id IS NOT NULL AND ac.fine_payment_status = 'paid')
+         ))
          ${dateFilter.sql}
-       GROUP BY p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at, b.public_id,
-                b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
+       GROUP BY p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at,
+                p.audit_check_id, b.public_id, b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
+                ac.id, ac.fine_amount, ac.accessories_fine_amount, ac.damage_fine_amount, ac.vat_amount, ac.total_fine_amount,
+                ac_b.public_id,
                 m.id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc,
                 ad.id, ad.document_type, ad.document_no, ad.document_status, ad.issue_date,
                 o.name, o.address, o.email, o.phone, o.vat_enabled, o.vat_rate, o.registered_name,

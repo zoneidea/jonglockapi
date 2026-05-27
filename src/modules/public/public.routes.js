@@ -770,7 +770,7 @@ router.post(
           subtotal_amount, discount_amount, vat_amount, total_amount,
           expires_at
         ) VALUES (
-          :organizationId, :publicId, :marketId, :mobileUserId, 'mobile', 0, 'pending_payment',
+          :organizationId, :publicId, :marketId, :mobileUserId, 'mobile', 0, 'draft',
           :subtotalAmount, :discountAmount, :vatAmount, :totalAmount,
           DATE_ADD(NOW(), INTERVAL ${PAYMENT_EXPIRES_MINUTES} MINUTE)
         )`,
@@ -886,7 +886,7 @@ router.post(
          JOIN organizations o ON o.id = b.organization_id
          WHERE b.id = :bookingId
            AND b.source = 'mobile'
-           AND b.status = 'pending_payment'
+           AND b.status IN ('draft', 'pending_payment')
            AND b.expires_at IS NOT NULL
            AND b.expires_at > NOW()
          LIMIT 1
@@ -1115,7 +1115,7 @@ router.post(
           AND mu.organization_id = b.organization_id
          WHERE b.id = :bookingId
            AND b.source = 'mobile'
-           AND b.status = 'pending_payment'
+           AND b.status IN ('draft', 'pending_payment')
          LIMIT 1
          FOR UPDATE`,
         { bookingId },
@@ -1149,9 +1149,27 @@ router.post(
 
       await conn.execute(
         `UPDATE bookings
-         SET cart_visible = 1
+         SET status = 'pending_payment',
+             cart_visible = 1,
+             expires_at = DATE_ADD(NOW(), INTERVAL ${PAYMENT_EXPIRES_MINUTES} MINUTE)
          WHERE organization_id = :organizationId AND id = :bookingId`,
         { organizationId: booking.organization_id, bookingId },
+      );
+      const [updatedBookingRows] = await conn.execute(
+        `SELECT expires_at
+         FROM bookings
+         WHERE organization_id = :organizationId AND id = :bookingId
+         LIMIT 1`,
+        { organizationId: booking.organization_id, bookingId },
+      );
+      const confirmedExpiresAt = updatedBookingRows[0]?.expires_at || booking.expires_at;
+      await conn.execute(
+        `UPDATE booth_date_locks
+         SET expires_at = :expiresAt
+         WHERE organization_id = :organizationId
+           AND booking_id = :bookingId
+           AND status = 'held'`,
+        { organizationId: booking.organization_id, bookingId, expiresAt: confirmedExpiresAt },
       );
 
       return {
@@ -1159,8 +1177,8 @@ router.post(
         publicId: booking.public_id,
         organizationId: booking.organization_id,
         marketId: booking.market_id,
-        status: booking.status,
-        expiresAt: booking.expires_at,
+        status: 'pending_payment',
+        expiresAt: confirmedExpiresAt,
         totalAmount: Number(booking.total_amount || 0),
       };
     });

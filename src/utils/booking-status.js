@@ -3,7 +3,7 @@ async function expireStaleBookings(executor, organizationId) {
     `SELECT id
      FROM bookings
      WHERE organization_id = :organizationId
-       AND status = 'pending_payment'
+       AND status IN ('draft', 'pending_payment')
        AND expires_at IS NOT NULL
        AND expires_at <= NOW()`,
     { organizationId },
@@ -19,7 +19,7 @@ async function expireStaleBookings(executor, organizationId) {
      SET b.status = 'expired',
          bi.status = 'expired'
      WHERE b.organization_id = :organizationId
-       AND b.status = 'pending_payment'
+       AND b.status IN ('draft', 'pending_payment')
        AND bi.status = 'pending_payment'
        AND b.expires_at IS NOT NULL
        AND b.expires_at <= NOW()`,
