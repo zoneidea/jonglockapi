@@ -14,14 +14,17 @@ async function getAssignedMarketIds(adminUserId) {
   return rows.map((row) => row.market_id);
 }
 
-async function loginManagement({ username, password }) {
+async function loginManagement({ organizationCode, username, password }) {
   const usernameHash = blindIndex(username);
   const rows = await query(
-    `SELECT id, organization_id, role, username_hash, password_hash, name_enc, email_enc, status
-     FROM admin_users
-     WHERE username_hash = :usernameHash
+    `SELECT au.id, au.organization_id, au.role, au.username_hash, au.password_hash, au.name_enc, au.email_enc, au.status,
+            o.code AS organization_code, o.name AS organization_name
+     FROM admin_users au
+     JOIN organizations o ON o.id = au.organization_id
+     WHERE au.username_hash = :usernameHash
+       AND o.code = :organizationCode
      LIMIT 1`,
-    { usernameHash },
+    { usernameHash, organizationCode },
   );
 
   const user = rows[0];
@@ -48,6 +51,8 @@ async function loginManagement({ username, password }) {
     user: {
       id: user.id,
       organizationId: user.organization_id,
+      organizationCode: user.organization_code,
+      organizationName: user.organization_name,
       role: user.role,
       menus: MENU_ACCESS[user.role] || [],
       marketIds,
