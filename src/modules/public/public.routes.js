@@ -447,7 +447,7 @@ router.get(
   cachePublicMarkets,
   validate(
     z.object({
-      body: z.object({}).passthrough(),
+      body: z.any().optional(),
       query: z.object({}).passthrough(),
       params: z.object({ marketId: z.coerce.number().int().positive() }),
     }),
