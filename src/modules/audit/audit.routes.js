@@ -7,8 +7,8 @@ const { validate } = require('../../middlewares/validate');
 const { ROLES } = require('../../constants/roles');
 const { asyncHandler } = require('../../utils/async-handler');
 const { ok, created } = require('../../utils/api-response');
-const { notFound } = require('../../utils/errors');
-const { calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
+const { badRequest, notFound } = require('../../utils/errors');
+const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
 const { decryptField } = require('../../utils/crypto');
 const authService = require('../auth/auth.service');
 
@@ -221,6 +221,282 @@ router.get(
         };
       }),
     });
+  }),
+);
+
+router.get(
+  '/inspections/:bookingItemId/form',
+  validate(
+    z.object({
+      params: z.object({ bookingItemId: z.coerce.number().int().positive() }),
+      query: z.object({}).passthrough(),
+      body: z.any().optional(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const bookingItemId = req.validated.params.bookingItemId;
+    const marketIds = Array.isArray(req.auth.marketIds) ? req.auth.marketIds.filter(Boolean) : [];
+
+    if (!marketIds.length) throw notFound('Booking item not found');
+
+    const marketIdPlaceholders = marketIds.map((_, index) => `:marketId${index}`).join(', ');
+    const marketParams = marketIds.reduce((accumulator, marketId, index) => {
+      accumulator[`marketId${index}`] = marketId;
+      return accumulator;
+    }, {});
+
+    const rows = await query(
+      `SELECT bi.id AS booking_item_id, bi.booking_id, DATE_FORMAT(bi.booking_date, '%Y-%m-%d') AS booking_date,
+              bi.audit_status, bi.checked_in_at, b.public_id AS booking_public_id, b.market_id, m.name AS market_name,
+              bo.code AS booth_code, bo.name AS booth_name, mu.first_name_enc, mu.last_name_enc
+       FROM booking_items bi
+       JOIN bookings b ON b.id = bi.booking_id AND b.organization_id = bi.organization_id
+       JOIN markets m ON m.id = b.market_id AND m.organization_id = b.organization_id
+       JOIN booths bo ON bo.id = bi.booth_id AND bo.organization_id = bi.organization_id
+       LEFT JOIN mobile_users mu ON mu.id = b.mobile_user_id AND mu.organization_id = b.organization_id
+       WHERE bi.id = :bookingItemId
+         AND bi.organization_id = :organizationId
+         AND b.market_id IN (${marketIdPlaceholders})
+         AND b.status = 'paid'
+         AND bi.status = 'paid'
+       LIMIT 1`,
+      { organizationId: req.auth.organizationId, bookingItemId, ...marketParams },
+    );
+    const item = rows[0];
+    if (!item) throw notFound('Booking item not found');
+
+    const [vatSettings, accessories, bookingAccessories, latestCheckRows] = await Promise.all([
+      getOrganizationVatSettings({ execute: query }, req.auth.organizationId),
+      query(
+        `SELECT id, name, image_url, price, stock_quantity
+         FROM accessories
+         WHERE organization_id = :organizationId
+           AND market_id = :marketId
+           AND status = 'active'
+         ORDER BY name ASC`,
+        { organizationId: req.auth.organizationId, marketId: item.market_id },
+      ),
+      query(
+        `SELECT a.id, a.name, a.image_url, a.price, SUM(ba.quantity) AS quantity
+         FROM booking_accessories ba
+         JOIN accessories a ON a.id = ba.accessory_id AND a.organization_id = ba.organization_id
+         WHERE ba.organization_id = :organizationId
+           AND ba.booking_item_id = :bookingItemId
+         GROUP BY a.id, a.name, a.image_url, a.price
+         ORDER BY a.name ASC`,
+        { organizationId: req.auth.organizationId, bookingItemId },
+      ),
+      query(
+        `SELECT id, result, note, fine_amount, accessories_fine_amount, damage_fine_amount,
+                vat_amount, total_fine_amount, fine_payment_status, checked_at
+         FROM audit_checks
+         WHERE organization_id = :organizationId
+           AND booking_item_id = :bookingItemId
+         ORDER BY id DESC
+         LIMIT 1`,
+        { organizationId: req.auth.organizationId, bookingItemId },
+      ),
+    ]);
+
+    const firstName = decryptField(item.first_name_enc) || '';
+    const lastName = decryptField(item.last_name_enc) || '';
+    return ok(res, {
+      item: {
+        bookingItemId: item.booking_item_id,
+        bookingId: item.booking_id,
+        bookingPublicId: item.booking_public_id,
+        bookingDate: item.booking_date,
+        marketId: item.market_id,
+        marketName: item.market_name,
+        boothCode: item.booth_code,
+        boothName: item.booth_name,
+        customerName: [firstName, lastName].filter(Boolean).join(' ').trim() || 'ไม่ระบุชื่อ',
+        auditStatus: item.audit_status || 'pending',
+        checkedInAt: item.checked_in_at || null,
+      },
+      vat: {
+        enabled: Boolean(vatSettings.enabled),
+        rate: Number(vatSettings.rate || 0),
+      },
+      usedAccessories: bookingAccessories.map((accessory) => ({
+        id: accessory.id,
+        name: accessory.name,
+        imageUrl: accessory.image_url || '',
+        price: Number(accessory.price || 0),
+        quantity: Number(accessory.quantity || 0),
+        lineTotal: Number(accessory.price || 0) * Number(accessory.quantity || 0),
+      })),
+      availableAccessories: accessories.map((accessory) => ({
+        id: accessory.id,
+        name: accessory.name,
+        imageUrl: accessory.image_url || '',
+        price: Number(accessory.price || 0),
+        grossPrice: applyVatToAmount(accessory.price, vatSettings),
+        stockQuantity: Number(accessory.stock_quantity || 0),
+      })),
+      latestCheck: latestCheckRows[0] ? {
+        id: latestCheckRows[0].id,
+        result: latestCheckRows[0].result,
+        note: latestCheckRows[0].note || '',
+        fineAmount: Number(latestCheckRows[0].fine_amount || 0),
+        accessoriesAmount: Number(latestCheckRows[0].accessories_fine_amount || 0),
+        damageFineAmount: Number(latestCheckRows[0].damage_fine_amount || 0),
+        vatAmount: Number(latestCheckRows[0].vat_amount || 0),
+        totalAmount: Number(latestCheckRows[0].total_fine_amount || 0),
+        paymentStatus: latestCheckRows[0].fine_payment_status,
+        checkedAt: latestCheckRows[0].checked_at,
+      } : null,
+    });
+  }),
+);
+
+router.post(
+  '/inspections/:bookingItemId/check',
+  validate(
+    z.object({
+      params: z.object({ bookingItemId: z.coerce.number().int().positive() }),
+      body: z.object({
+        result: z.enum(['pass', 'warning', 'failed']),
+        note: z.string().max(2000).optional().default(''),
+        fineAmount: z.coerce.number().min(0).default(0),
+        accessories: z.array(z.object({
+          accessoryId: z.coerce.number().int().positive(),
+          quantity: z.coerce.number().int().min(0).max(99),
+        })).optional().default([]),
+      }),
+      query: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const bookingItemId = req.validated.params.bookingItemId;
+    const body = req.validated.body;
+    const marketIds = Array.isArray(req.auth.marketIds) ? req.auth.marketIds.filter(Boolean) : [];
+    if (!marketIds.length) throw notFound('Booking item not found');
+
+    const marketIdPlaceholders = marketIds.map((_, index) => `:marketId${index}`).join(', ');
+    const marketParams = marketIds.reduce((accumulator, marketId, index) => {
+      accumulator[`marketId${index}`] = marketId;
+      return accumulator;
+    }, {});
+    const selectedAccessories = (body.accessories || []).filter((item) => Number(item.quantity || 0) > 0);
+
+    const result = await transaction(async (conn) => {
+      const [itemRows] = await conn.execute(
+        `SELECT bi.id, b.market_id
+         FROM booking_items bi
+         JOIN bookings b ON b.id = bi.booking_id AND b.organization_id = bi.organization_id
+         WHERE bi.id = :bookingItemId
+           AND bi.organization_id = :organizationId
+           AND b.market_id IN (${marketIdPlaceholders})
+           AND b.status = 'paid'
+           AND bi.status = 'paid'
+         LIMIT 1
+         FOR UPDATE`,
+        { organizationId: req.auth.organizationId, bookingItemId, ...marketParams },
+      );
+      const item = itemRows[0];
+      if (!item) throw notFound('Booking item not found');
+
+      let accessoryRows = [];
+      if (selectedAccessories.length) {
+        const ids = selectedAccessories.map((accessory) => Number(accessory.accessoryId));
+        const placeholders = ids.map((_, index) => `:accessoryId${index}`).join(', ');
+        const params = ids.reduce((accumulator, id, index) => {
+          accumulator[`accessoryId${index}`] = id;
+          return accumulator;
+        }, {});
+        const [rows] = await conn.execute(
+          `SELECT id, name, price
+           FROM accessories
+           WHERE organization_id = :organizationId
+             AND market_id = :marketId
+             AND status = 'active'
+             AND id IN (${placeholders})`,
+          { organizationId: req.auth.organizationId, marketId: item.market_id, ...params },
+        );
+        accessoryRows = rows;
+        if (accessoryRows.length !== ids.length) throw badRequest('Some accessories are not available');
+      }
+
+      const accessoryById = new Map(accessoryRows.map((accessory) => [Number(accessory.id), accessory]));
+      const accessoryLines = selectedAccessories.map((selected) => {
+        const accessory = accessoryById.get(Number(selected.accessoryId));
+        const quantity = Number(selected.quantity || 0);
+        const unitPrice = Number(accessory.price || 0);
+        return {
+          accessoryId: Number(accessory.id),
+          quantity,
+          unitPrice,
+          lineTotal: unitPrice * quantity,
+        };
+      });
+      const accessoriesAmount = accessoryLines.reduce((sum, line) => sum + line.lineTotal, 0);
+      const fineAmount = body.result === 'failed' ? Number(body.fineAmount || 0) : 0;
+      const vatSettings = await getOrganizationVatSettings(conn, req.auth.organizationId);
+      const totals = calculateVatBreakdown(accessoriesAmount + fineAmount, 0, vatSettings);
+
+      const [check] = await conn.execute(
+        `INSERT INTO audit_checks (
+          organization_id, market_id, booking_item_id, checked_by_admin_id,
+          result, note, fine_amount, accessories_fine_amount, damage_fine_amount, vat_amount, total_fine_amount,
+          fine_payment_status
+        ) VALUES (
+          :organizationId, :marketId, :bookingItemId, :checkedByAdminId,
+          :result, :note, :fineAmount, :accessoriesAmount, 0, :vatAmount, :totalAmount,
+          :finePaymentStatus
+        )`,
+        {
+          organizationId: req.auth.organizationId,
+          marketId: item.market_id,
+          bookingItemId,
+          checkedByAdminId: req.auth.sub,
+          result: body.result,
+          note: body.note || null,
+          fineAmount,
+          accessoriesAmount,
+          vatAmount: totals.vatAmount,
+          totalAmount: totals.totalAmount,
+          finePaymentStatus: totals.totalAmount > 0 ? 'pending' : 'none',
+        },
+      );
+
+      for (const line of accessoryLines) {
+        await conn.execute(
+          `INSERT INTO audit_check_accessories (
+            organization_id, audit_check_id, accessory_id, quantity, unit_price, line_total
+          ) VALUES (
+            :organizationId, :auditCheckId, :accessoryId, :quantity, :unitPrice, :lineTotal
+          )`,
+          {
+            organizationId: req.auth.organizationId,
+            auditCheckId: check.insertId,
+            accessoryId: line.accessoryId,
+            quantity: line.quantity,
+            unitPrice: line.unitPrice,
+            lineTotal: line.lineTotal,
+          },
+        );
+      }
+
+      await conn.execute(
+        `UPDATE booking_items
+         SET audit_status = :auditStatus
+         WHERE id = :bookingItemId AND organization_id = :organizationId`,
+        { auditStatus: body.result, bookingItemId, organizationId: req.auth.organizationId },
+      );
+
+      return {
+        id: check.insertId,
+        result: body.result,
+        accessoriesAmount,
+        fineAmount,
+        vatAmount: totals.vatAmount,
+        totalAmount: totals.totalAmount,
+        paymentStatus: totals.totalAmount > 0 ? 'pending' : 'none',
+      };
+    });
+
+    return created(res, result, 'audit check saved');
   }),
 );
 

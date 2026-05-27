@@ -1399,6 +1399,210 @@ router.post(
 );
 
 router.post(
+  '/audit-checks/:auditCheckId/payment-info',
+  validate(
+    z.object({
+      body: z.object({
+        user: z.object({
+          email: z.string().email(),
+        }),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({ auditCheckId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { auditCheckId } = req.validated.params;
+    const emailHash = blindIndex(String(req.validated.body.user.email || '').trim().toLowerCase());
+    const rows = await query(
+      `SELECT ac.id, ac.organization_id, ac.market_id, ac.total_fine_amount, ac.fine_payment_status,
+              b.public_id AS booking_public_id, m.name AS market_name,
+              o.name AS organization_name, o.payment_promptpay_id, o.payment_bank_name,
+              o.payment_bank_account_name, o.payment_bank_account_no, o.payment_qrcode_image_url, o.payment_instructions,
+              p.id AS payment_id, p.public_id AS payment_public_id, p.status AS payment_status,
+              p.provider_reference, p.proof_image_url, p.proof_uploaded_at, p.payer_note
+       FROM audit_checks ac
+       JOIN booking_items bi ON bi.id = ac.booking_item_id AND bi.organization_id = ac.organization_id
+       JOIN bookings b ON b.id = bi.booking_id AND b.organization_id = bi.organization_id
+       JOIN mobile_users mu ON mu.id = b.mobile_user_id AND mu.organization_id = b.organization_id
+       JOIN markets m ON m.id = ac.market_id AND m.organization_id = ac.organization_id
+       JOIN organizations o ON o.id = ac.organization_id
+       LEFT JOIN payments p
+         ON p.audit_check_id = ac.id
+        AND p.organization_id = ac.organization_id
+        AND p.status IN ('created', 'waiting', 'failed')
+       WHERE ac.id = :auditCheckId
+         AND mu.email_hash = :emailHash
+         AND ac.total_fine_amount > 0
+         AND ac.fine_payment_status IN ('pending', 'waiting')
+       ORDER BY p.id DESC
+       LIMIT 1`,
+      { auditCheckId, emailHash },
+    );
+    const charge = rows[0];
+    if (!charge) throw badRequest('Audit charge not found');
+
+    return ok(res, {
+      bookingId: -Number(charge.id),
+      auditCheckId: charge.id,
+      publicId: `AUD-${charge.id}`,
+      organizationId: charge.organization_id,
+      marketId: charge.market_id,
+      marketName: charge.market_name,
+      status: charge.fine_payment_status === 'waiting' ? 'payment_processing' : 'pending_payment',
+      expiresAt: null,
+      amount: Number(charge.total_fine_amount || 0),
+      payment: charge.payment_id ? {
+        id: charge.payment_id,
+        publicId: charge.payment_public_id,
+        status: charge.payment_status,
+        providerReference: charge.provider_reference || '',
+        proofImageUrl: charge.proof_image_url || '',
+        proofUploadedAt: charge.proof_uploaded_at,
+        payerNote: charge.payer_note || '',
+      } : null,
+      paymentMethod: {
+        organizationName: charge.organization_name,
+        promptpayId: charge.payment_promptpay_id || '',
+        bankName: charge.payment_bank_name || '',
+        bankAccountName: charge.payment_bank_account_name || '',
+        bankAccountNo: charge.payment_bank_account_no || '',
+        qrCodeImageUrl: charge.payment_qrcode_image_url || '',
+        instructions: charge.payment_instructions || '',
+      },
+    });
+  }),
+);
+
+router.post(
+  '/audit-checks/:auditCheckId/payment-proof',
+  paymentProofUpload.single('proofImage'),
+  validate(
+    z.object({
+      body: z.object({
+        email: z.string().email(),
+        name: z.string().optional().default(''),
+        providerReference: z.string().max(255).optional().default(''),
+        payerNote: z.string().max(1000).optional().default(''),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({ auditCheckId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    if (!req.file) throw badRequest('Payment proof image is required');
+    const { auditCheckId } = req.validated.params;
+    const emailHash = blindIndex(String(req.validated.body.email || '').trim().toLowerCase());
+
+    const result = await transaction(async (conn) => {
+      const [rows] = await conn.execute(
+        `SELECT ac.id, ac.organization_id, ac.market_id, ac.total_fine_amount, ac.fine_payment_status,
+                mu.email_hash
+         FROM audit_checks ac
+         JOIN booking_items bi ON bi.id = ac.booking_item_id AND bi.organization_id = ac.organization_id
+         JOIN bookings b ON b.id = bi.booking_id AND b.organization_id = bi.organization_id
+         JOIN mobile_users mu ON mu.id = b.mobile_user_id AND mu.organization_id = b.organization_id
+         WHERE ac.id = :auditCheckId
+           AND ac.total_fine_amount > 0
+           AND ac.fine_payment_status IN ('pending', 'waiting')
+         LIMIT 1
+         FOR UPDATE`,
+        { auditCheckId },
+      );
+      const charge = rows[0];
+      if (!charge) throw badRequest('Audit charge not found');
+      if (emailHash !== charge.email_hash) throw badRequest('Charge owner does not match');
+
+      const proofImageUrl = publicUploadUrl(req, req.file.path);
+      const [paymentRows] = await conn.execute(
+        `SELECT id, public_id
+         FROM payments
+         WHERE organization_id = :organizationId
+           AND audit_check_id = :auditCheckId
+           AND status IN ('created', 'waiting', 'failed')
+         ORDER BY id DESC
+         LIMIT 1
+         FOR UPDATE`,
+        { organizationId: charge.organization_id, auditCheckId: charge.id },
+      );
+
+      let paymentId = paymentRows[0]?.id;
+      let paymentPublicId = paymentRows[0]?.public_id;
+      if (paymentId) {
+        await conn.execute(
+          `UPDATE payments
+           SET provider = 'manual',
+               provider_reference = :providerReference,
+               proof_image_url = :proofImageUrl,
+               proof_uploaded_at = NOW(),
+               payer_note = :payerNote,
+               status = 'waiting',
+               amount = :amount
+           WHERE id = :paymentId
+             AND organization_id = :organizationId`,
+          {
+            organizationId: charge.organization_id,
+            paymentId,
+            providerReference: req.validated.body.providerReference || null,
+            proofImageUrl,
+            payerNote: req.validated.body.payerNote || null,
+            amount: charge.total_fine_amount,
+          },
+        );
+      } else {
+        paymentPublicId = publicId('PAY');
+        const [paymentResult] = await conn.execute(
+          `INSERT INTO payments (
+            organization_id, public_id, audit_check_id, provider, provider_reference,
+            proof_image_url, proof_uploaded_at, payer_note, status, amount
+          ) VALUES (
+            :organizationId, :publicId, :auditCheckId, 'manual', :providerReference,
+            :proofImageUrl, NOW(), :payerNote, 'waiting', :amount
+          )`,
+          {
+            organizationId: charge.organization_id,
+            publicId: paymentPublicId,
+            auditCheckId: charge.id,
+            providerReference: req.validated.body.providerReference || null,
+            proofImageUrl,
+            payerNote: req.validated.body.payerNote || null,
+            amount: charge.total_fine_amount,
+          },
+        );
+        paymentId = paymentResult.insertId;
+      }
+
+      await conn.execute(
+        `UPDATE audit_checks
+         SET fine_payment_status = 'waiting'
+         WHERE id = :auditCheckId
+           AND organization_id = :organizationId`,
+        { organizationId: charge.organization_id, auditCheckId: charge.id },
+      );
+
+      return {
+        auditCheckId: charge.id,
+        bookingId: -Number(charge.id),
+        publicId: `AUD-${charge.id}`,
+        organizationId: charge.organization_id,
+        marketId: charge.market_id,
+        status: 'payment_processing',
+        payment: {
+          id: paymentId,
+          publicId: paymentPublicId,
+          status: 'waiting',
+          amount: Number(charge.total_fine_amount || 0),
+          proofImageUrl,
+          proofUploadedAt: new Date().toISOString(),
+        },
+      };
+    });
+
+    return ok(res, result, 'payment proof uploaded');
+  }),
+);
+
+router.post(
   '/bookings/cart',
   validate(
     z.object({
@@ -1418,7 +1622,8 @@ router.post(
     }
 
     const emailHash = blindIndex(String(req.validated.body.user.email || '').trim().toLowerCase());
-    const bookings = await query(
+    const [bookings, auditCharges] = await Promise.all([
+      query(
       `SELECT
           b.id, b.public_id, b.organization_id, b.market_id, b.status, b.expires_at,
           b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
@@ -1441,15 +1646,53 @@ router.post(
        ORDER BY b.expires_at ASC, b.created_at DESC
        LIMIT 100`,
       { emailHash },
-    );
+      ),
+      query(
+        `SELECT
+            ac.id AS audit_check_id, ac.organization_id, ac.market_id, ac.booking_item_id,
+            ac.result, ac.note, ac.fine_amount, ac.accessories_fine_amount, ac.vat_amount,
+            ac.total_fine_amount, ac.fine_payment_status, ac.checked_at,
+            DATE_FORMAT(bi.booking_date, '%Y-%m-%d') AS booking_date,
+            b.public_id AS booking_public_id,
+            m.name AS market_name, m.main_image_url AS market_image_url,
+            bo.code AS booth_code, bo.name AS booth_name,
+            o.vat_enabled, o.vat_rate
+         FROM audit_checks ac
+         JOIN booking_items bi ON bi.id = ac.booking_item_id AND bi.organization_id = ac.organization_id
+         JOIN bookings b ON b.id = bi.booking_id AND b.organization_id = bi.organization_id
+         JOIN mobile_users mu ON mu.id = b.mobile_user_id AND mu.organization_id = b.organization_id
+         JOIN markets m ON m.id = ac.market_id AND m.organization_id = ac.organization_id
+         JOIN booths bo ON bo.id = bi.booth_id AND bo.organization_id = bi.organization_id
+         JOIN organizations o ON o.id = ac.organization_id
+         WHERE mu.email_hash = :emailHash
+           AND ac.total_fine_amount > 0
+           AND ac.fine_payment_status = 'pending'
+         ORDER BY ac.checked_at DESC
+         LIMIT 100`,
+        { emailHash },
+      ),
+    ]);
 
-    if (!bookings.length) {
+    if (!bookings.length && !auditCharges.length) {
       return ok(res, []);
     }
 
+    const auditChargeIds = auditCharges.map((charge) => charge.audit_check_id);
+    const auditAccessories = auditChargeIds.length ? await query(
+      `SELECT aca.audit_check_id, a.id, a.name, a.image_url, aca.unit_price AS price,
+              SUM(aca.quantity) AS quantity,
+              SUM(aca.line_total) AS line_total
+       FROM audit_check_accessories aca
+       JOIN accessories a ON a.id = aca.accessory_id AND a.organization_id = aca.organization_id
+       WHERE aca.audit_check_id IN (${datePlaceholders(auditChargeIds)})
+       GROUP BY aca.audit_check_id, a.id, a.name, a.image_url, aca.unit_price
+       ORDER BY a.name ASC`,
+      dateParams(auditChargeIds),
+    ) : [];
+
     const bookingIds = bookings.map((booking) => booking.id);
     const bookingIdParams = dateParams(bookingIds);
-    const items = await query(
+    const items = bookingIds.length ? await query(
       `SELECT
           bi.id, bi.booking_id, bi.booth_id, DATE_FORMAT(bi.booking_date, '%Y-%m-%d') AS booking_date,
           bi.unit_price, bo.code AS booth_code, bo.name AS booth_name
@@ -1461,8 +1704,8 @@ router.post(
          AND bi.status = 'pending_payment'
        ORDER BY bi.booking_date ASC, bi.id ASC`,
       bookingIdParams,
-    );
-    const accessories = await query(
+    ) : [];
+    const accessories = bookingIds.length ? await query(
       `SELECT
           bi.booking_id, a.id, a.name, a.image_url, a.price,
           SUM(ba.quantity) AS quantity,
@@ -1478,7 +1721,7 @@ router.post(
        GROUP BY bi.booking_id, a.id, a.name, a.image_url, a.price
        ORDER BY a.name ASC`,
       bookingIdParams,
-    );
+    ) : [];
 
     const itemsByBookingId = new Map();
     items.forEach((item) => {
@@ -1505,7 +1748,19 @@ router.post(
       accessoriesByBookingId.set(accessory.booking_id, list);
     });
 
-    return ok(res, bookings.map((booking) => ({
+    const accessoriesByAuditCheckId = new Map();
+    auditAccessories.forEach((accessory) => {
+      const list = accessoriesByAuditCheckId.get(accessory.audit_check_id) || [];
+      list.push(mapAccessory({
+        ...accessory,
+        stock_quantity: 0,
+        gross_price: accessory.price,
+      }, Number(accessory.quantity || 0), Number(accessory.line_total || 0)));
+      accessoriesByAuditCheckId.set(accessory.audit_check_id, list);
+    });
+
+    const bookingCartItems = bookings.map((booking) => ({
+      cartItemType: 'booking',
       bookingId: booking.id,
       publicId: booking.public_id,
       organizationId: booking.organization_id,
@@ -1522,7 +1777,37 @@ router.post(
       vatRate: Number(booking.vat_rate || 0),
       items: itemsByBookingId.get(booking.id) || [],
       accessories: accessoriesByBookingId.get(booking.id) || [],
-    })));
+    }));
+
+    const auditCartItems = auditCharges.map((charge) => ({
+      cartItemType: 'audit_check',
+      bookingId: -Number(charge.audit_check_id),
+      auditCheckId: charge.audit_check_id,
+      publicId: `AUD-${charge.audit_check_id}`,
+      organizationId: charge.organization_id,
+      marketId: charge.market_id,
+      marketName: charge.market_name,
+      marketImageUrl: charge.market_image_url || '',
+      status: 'pending_payment',
+      expiresAt: null,
+      subtotalAmount: Number(charge.accessories_fine_amount || 0) + Number(charge.fine_amount || 0),
+      discountAmount: 0,
+      vatAmount: Number(charge.vat_amount || 0),
+      totalAmount: Number(charge.total_fine_amount || 0),
+      vatEnabled: Number(charge.vat_enabled || 0) === 1,
+      vatRate: Number(charge.vat_rate || 0),
+      items: [{
+        id: charge.booking_item_id,
+        boothId: 0,
+        boothCode: charge.booth_code,
+        boothName: `ค่าตรวจสอบ: ${charge.booth_name || charge.booth_code || '-'}`,
+        bookingDate: charge.booking_date,
+        unitPrice: Number(charge.fine_amount || 0),
+      }],
+      accessories: accessoriesByAuditCheckId.get(charge.audit_check_id) || [],
+    }));
+
+    return ok(res, [...bookingCartItems, ...auditCartItems]);
   }),
 );
 
