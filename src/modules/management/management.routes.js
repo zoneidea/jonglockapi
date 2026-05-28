@@ -4714,11 +4714,29 @@ router.get(
               m.name AS market_name,
               mu.username_enc, mu.first_name_enc, mu.last_name_enc,
               DATE(COALESCE(p.paid_at, p.created_at)) AS paid_date,
-              GREATEST(COALESCE(b.subtotal_amount, 0) - COALESCE(b.discount_amount, 0), 0) AS amount_before_vat,
+              COALESCE(ROUND(
+                GREATEST(COALESCE(b.subtotal_amount, 0) - COALESCE(b.discount_amount, 0), 0)
+                * COALESCE(bi.unit_price, 0)
+                / NULLIF(item_totals.total_unit_price, 0),
+                2
+              ), 0) AS amount_before_vat,
               GROUP_CONCAT(DISTINCT pr.name ORDER BY pr.name SEPARATOR ', ') AS product_names
        FROM booking_items bi
        JOIN bookings b ON b.id = bi.booking_id
-       JOIN payments p ON p.booking_id = b.id AND p.organization_id = b.organization_id AND p.status = 'paid'
+       JOIN (
+         SELECT booking_id, organization_id, MAX(COALESCE(paid_at, created_at)) AS paid_at, MAX(created_at) AS created_at
+         FROM payments
+         WHERE organization_id = :organizationId
+           AND booking_id IS NOT NULL
+           AND status = 'paid'
+         GROUP BY booking_id, organization_id
+       ) p ON p.booking_id = b.id AND p.organization_id = b.organization_id
+       JOIN (
+         SELECT booking_id, organization_id, COALESCE(SUM(unit_price), 0) AS total_unit_price
+         FROM booking_items
+         WHERE organization_id = :organizationId
+         GROUP BY booking_id, organization_id
+       ) item_totals ON item_totals.booking_id = b.id AND item_totals.organization_id = b.organization_id
        JOIN markets m ON m.id = b.market_id
        JOIN mobile_users mu ON mu.id = b.mobile_user_id
        LEFT JOIN booking_products bp ON bp.booking_item_id = bi.id
@@ -4727,14 +4745,13 @@ router.get(
          ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE bi.organization_id = :organizationId
          AND b.organization_id = :organizationId
-         AND p.organization_id = :organizationId
          AND (:marketId IS NULL OR b.market_id = :marketId)
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          AND b.status = 'paid'
          AND bi.status = 'paid'
          ${dateFilter.sql}
        GROUP BY bi.id, b.public_id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc,
-                DATE(COALESCE(p.paid_at, p.created_at)), b.subtotal_amount, b.discount_amount
+                DATE(COALESCE(p.paid_at, p.created_at)), b.subtotal_amount, b.discount_amount, bi.unit_price, item_totals.total_unit_price
        ORDER BY DATE(COALESCE(p.paid_at, p.created_at)) ASC, b.public_id ASC
        LIMIT 1000`,
       {
@@ -4854,6 +4871,7 @@ router.get(
          FROM audit_checks ac
          JOIN booking_items bi ON bi.id = ac.booking_item_id
          WHERE ac.organization_id = :organizationId
+           AND ac.fine_payment_status = 'paid'
          GROUP BY bi.booking_id
        ) fine_summary ON fine_summary.booking_id = b.id
        LEFT JOIN payments p
@@ -5042,18 +5060,21 @@ router.get(
       `SELECT ad.id, ad.document_type, ad.document_no, ad.document_status, ad.issue_date,
               ad.subtotal_amount, ad.discount_amount, ad.vat_amount, ad.withholding_tax_amount, ad.total_amount,
               ad.customer_name, ad.cancel_reason, ad.cancelled_at,
-              p.public_id AS payment_public_id, b.public_id AS booking_public_id,
+              p.public_id AS payment_public_id, COALESCE(b.public_id, ac_b.public_id) AS booking_public_id,
               source.document_no AS source_document_no,
               issuer.name_enc AS issued_by_name_enc,
               canceller.name_enc AS cancelled_by_name_enc
        FROM accounting_documents ad
        LEFT JOIN payments p ON p.id = ad.payment_id
        LEFT JOIN bookings b ON b.id = ad.booking_id
+       LEFT JOIN audit_checks ac ON ac.id = ad.audit_check_id AND ac.organization_id = ad.organization_id
+       LEFT JOIN booking_items ac_bi ON ac_bi.id = ac.booking_item_id AND ac_bi.organization_id = ac.organization_id
+       LEFT JOIN bookings ac_b ON ac_b.id = ac_bi.booking_id AND ac_b.organization_id = ac_bi.organization_id
        LEFT JOIN accounting_documents source ON source.id = ad.source_document_id
        LEFT JOIN admin_users issuer ON issuer.id = ad.issued_by_admin_id
        LEFT JOIN admin_users canceller ON canceller.id = ad.cancelled_by_admin_id
        LEFT JOIN admin_market_assignments ama
-         ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         ON ama.market_id = COALESCE(b.market_id, ac.market_id) AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE ad.organization_id = :organizationId
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          AND (:startDate IS NULL OR ad.issue_date >= :startDate)
@@ -5064,7 +5085,7 @@ router.get(
            :keyword = ''
            OR ad.document_no LIKE :keywordLike
            OR ad.customer_name LIKE :keywordLike
-           OR b.public_id LIKE :keywordLike
+           OR COALESCE(b.public_id, ac_b.public_id) LIKE :keywordLike
            OR p.public_id LIKE :keywordLike
          )
        ORDER BY ad.issue_date DESC, ad.id DESC
@@ -5111,17 +5132,20 @@ router.get(
       `SELECT ad.id, ad.document_type, ad.document_no, ad.document_status, ad.issue_date,
               ad.customer_name, ad.subtotal_amount, ad.discount_amount, ad.vat_amount, ad.total_amount,
               source.document_no AS source_document_no,
-              b.public_id AS booking_public_id, p.public_id AS payment_public_id
+              COALESCE(b.public_id, ac_b.public_id) AS booking_public_id, p.public_id AS payment_public_id
        FROM accounting_documents ad
        LEFT JOIN accounting_documents source ON source.id = ad.source_document_id
        LEFT JOIN bookings b ON b.id = ad.booking_id
+       LEFT JOIN audit_checks ac ON ac.id = ad.audit_check_id AND ac.organization_id = ad.organization_id
+       LEFT JOIN booking_items ac_bi ON ac_bi.id = ac.booking_item_id AND ac_bi.organization_id = ac.organization_id
+       LEFT JOIN bookings ac_b ON ac_b.id = ac_bi.booking_id AND ac_b.organization_id = ac_bi.organization_id
        LEFT JOIN payments p ON p.id = ad.payment_id
        LEFT JOIN admin_market_assignments ama
-         ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         ON ama.market_id = COALESCE(b.market_id, ac.market_id) AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE ad.organization_id = :organizationId
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          AND ad.document_type IN ('tax_invoice', 'credit_note')
-         AND ad.document_status IN ('issued', 'cancelled')
+         AND ad.document_status = 'issued'
          AND (:startDate IS NULL OR ad.issue_date >= :startDate)
          AND (:endDate IS NULL OR ad.issue_date <= :endDate)
        ORDER BY ad.issue_date ASC, ad.document_no ASC
@@ -5184,7 +5208,7 @@ router.get(
          LEFT JOIN admin_market_assignments ama
            ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
          WHERE b.organization_id = :organizationId
-           AND b.status IN ('pending_payment', 'payment_processing', 'expired')
+           AND b.status IN ('pending_payment', 'payment_processing')
            AND (:marketId IS NULL OR b.market_id = :marketId)
            AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          GROUP BY b.id, b.public_id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc, b.total_amount, b.status, b.expires_at, b.created_at
@@ -5256,7 +5280,7 @@ router.get(
       aliases: { payment: 'p', booking: 'b', item: 'bi' },
     });
     const rows = await query(
-      `SELECT p.id, p.public_id AS payment_public_id, p.provider_reference,
+      `SELECT p.id, p.public_id AS payment_public_id, p.provider, p.provider_reference,
               CASE WHEN p.audit_check_id IS NOT NULL THEN 'audit_fine' ELSE 'booking' END AS payment_kind,
               p.status AS payment_status, p.amount AS payment_amount, p.paid_at, p.created_at,
               COALESCE(b.public_id, ac_b.public_id) AS booking_public_id,
@@ -5309,7 +5333,7 @@ router.get(
         ...row,
         amount_matched: amountMatched ? 1 : 0,
         status_matched: statusMatched ? 1 : 0,
-        reconciliation_status: amountMatched && statusMatched && Number(row.callback_count || 0) > 0 ? 'matched' : 'review',
+        reconciliation_status: amountMatched && statusMatched && (row.provider === 'manual' || Number(row.callback_count || 0) > 0) ? 'matched' : 'review',
       };
     }));
   }),
@@ -5332,17 +5356,21 @@ router.get(
     const { startDate, endDate } = req.validated.query;
     const rows = await query(
       `SELECT ad.id, 'credit_note' AS refund_type, ad.document_no, ad.document_status, ad.issue_date,
-              ad.customer_name, ad.total_amount, ad.cancel_reason AS reason,
+              ad.customer_name, NULL AS username_enc, NULL AS first_name_enc, NULL AS last_name_enc,
+              ad.total_amount, ad.cancel_reason AS reason,
               source.document_no AS source_document_no,
-              b.public_id AS booking_public_id, p.public_id AS payment_public_id,
+              COALESCE(b.public_id, ac_b.public_id) AS booking_public_id, p.public_id AS payment_public_id,
               issuer.name_enc AS issued_by_name_enc
        FROM accounting_documents ad
        LEFT JOIN accounting_documents source ON source.id = ad.source_document_id
        LEFT JOIN bookings b ON b.id = ad.booking_id
+       LEFT JOIN audit_checks ac ON ac.id = ad.audit_check_id AND ac.organization_id = ad.organization_id
+       LEFT JOIN booking_items ac_bi ON ac_bi.id = ac.booking_item_id AND ac_bi.organization_id = ac.organization_id
+       LEFT JOIN bookings ac_b ON ac_b.id = ac_bi.booking_id AND ac_b.organization_id = ac_bi.organization_id
        LEFT JOIN payments p ON p.id = ad.payment_id
        LEFT JOIN admin_users issuer ON issuer.id = ad.issued_by_admin_id
        LEFT JOIN admin_market_assignments ama
-         ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         ON ama.market_id = COALESCE(b.market_id, ac.market_id) AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE ad.organization_id = :organizationId
          AND ad.document_type = 'credit_note'
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
@@ -5351,15 +5379,19 @@ router.get(
        UNION ALL
        SELECT p.id, 'payment_refund' AS refund_type, p.public_id AS document_no, p.status AS document_status,
               DATE(COALESCE(p.paid_at, p.created_at)) AS issue_date,
-              CONCAT(COALESCE(mu.first_name_enc, ''), ' ', COALESCE(mu.last_name_enc, '')) AS customer_name,
-              p.amount AS total_amount, b.comment AS reason,
-              NULL AS source_document_no, b.public_id AS booking_public_id, p.public_id AS payment_public_id,
+              NULL AS customer_name,
+              mu.username_enc, mu.first_name_enc, mu.last_name_enc,
+              p.amount AS total_amount, COALESCE(b.comment, ac.note) AS reason,
+              NULL AS source_document_no, COALESCE(b.public_id, ac_b.public_id) AS booking_public_id, p.public_id AS payment_public_id,
               NULL AS issued_by_name_enc
        FROM payments p
-       LEFT JOIN bookings b ON b.id = p.booking_id
-       LEFT JOIN mobile_users mu ON mu.id = b.mobile_user_id
+       LEFT JOIN bookings b ON b.id = p.booking_id AND b.organization_id = p.organization_id
+       LEFT JOIN audit_checks ac ON ac.id = p.audit_check_id AND ac.organization_id = p.organization_id
+       LEFT JOIN booking_items ac_bi ON ac_bi.id = ac.booking_item_id AND ac_bi.organization_id = ac.organization_id
+       LEFT JOIN bookings ac_b ON ac_b.id = ac_bi.booking_id AND ac_b.organization_id = ac_bi.organization_id
+       LEFT JOIN mobile_users mu ON mu.id = COALESCE(b.mobile_user_id, ac_b.mobile_user_id) AND mu.organization_id = p.organization_id
        LEFT JOIN admin_market_assignments ama
-         ON ama.market_id = b.market_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         ON ama.market_id = COALESCE(b.market_id, ac.market_id) AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE p.organization_id = :organizationId
          AND p.status IN ('refunded', 'cancelled')
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
@@ -5378,9 +5410,12 @@ router.get(
     return ok(res, rows.map((row) => ({
       ...row,
       customer_name: row.refund_type === 'payment_refund'
-        ? row.customer_name.split(' ').map((part) => decryptField(part)).filter(Boolean).join(' ').trim() || '-'
+        ? [decryptField(row.first_name_enc), decryptField(row.last_name_enc)].filter(Boolean).join(' ').trim() || decryptField(row.username_enc) || '-'
         : row.customer_name || '-',
       issued_by_name: decryptField(row.issued_by_name_enc) || '-',
+      username_enc: undefined,
+      first_name_enc: undefined,
+      last_name_enc: undefined,
       issued_by_name_enc: undefined,
     })));
   }),
