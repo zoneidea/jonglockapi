@@ -4299,11 +4299,13 @@ router.get(
   asyncHandler(async (req, res) => {
     await expireStaleBookings({ execute: query }, req.auth.organizationId);
     const today = bangkokDateString();
+    const monthStart = `${today.slice(0, 7)}-01`;
     const scope = {
       organizationId: req.auth.organizationId,
       adminUserId: req.auth.sub,
       hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
       today,
+      monthStart,
     };
 
     const [
@@ -4312,6 +4314,8 @@ router.get(
       dailyCustomers,
       bookingPaidTodayRows,
       finePaidTodayRows,
+      paidThisMonthRows,
+      pendingProofRows,
       bookingOutstandingRows,
       fineOutstandingRows,
     ] = await Promise.all([
@@ -4378,6 +4382,35 @@ router.get(
         scope,
       ),
       query(
+        `SELECT COALESCE(SUM(p.amount), 0) AS total
+         FROM payments p
+         LEFT JOIN bookings b ON b.id = p.booking_id AND b.organization_id = p.organization_id
+         LEFT JOIN audit_checks ac ON ac.id = p.audit_check_id AND ac.organization_id = p.organization_id
+         JOIN markets m ON m.id = COALESCE(b.market_id, ac.market_id) AND m.organization_id = p.organization_id
+         LEFT JOIN admin_market_assignments ama
+           ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         WHERE p.organization_id = :organizationId
+           AND p.status = 'paid'
+           AND DATE(COALESCE(p.paid_at, p.created_at)) BETWEEN :monthStart AND :today
+           AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)`,
+        scope,
+      ),
+      query(
+        `SELECT COUNT(*) AS total
+         FROM payments p
+         LEFT JOIN bookings b ON b.id = p.booking_id AND b.organization_id = p.organization_id
+         LEFT JOIN audit_checks ac ON ac.id = p.audit_check_id AND ac.organization_id = p.organization_id
+         JOIN markets m ON m.id = COALESCE(b.market_id, ac.market_id) AND m.organization_id = p.organization_id
+         LEFT JOIN admin_market_assignments ama
+           ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         WHERE p.organization_id = :organizationId
+           AND p.provider = 'manual'
+           AND p.status = 'waiting'
+           AND p.proof_image_url IS NOT NULL
+           AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)`,
+        scope,
+      ),
+      query(
         `SELECT COALESCE(SUM(b.total_amount), 0) AS total
          FROM bookings b
          JOIN markets m ON m.id = b.market_id
@@ -4411,8 +4444,12 @@ router.get(
       dailyCustomers: Number(dailyCustomers[0]?.total || 0),
       bookingPaidToday: Number(bookingPaidTodayRows[0]?.total || 0),
       finePaidToday: Number(finePaidTodayRows[0]?.total || 0),
+      paidToday: Number(bookingPaidTodayRows[0]?.total || 0) + Number(finePaidTodayRows[0]?.total || 0),
+      paidThisMonth: Number(paidThisMonthRows[0]?.total || 0),
+      pendingPaymentProofs: Number(pendingProofRows[0]?.total || 0),
       bookingOutstanding: Number(bookingOutstandingRows[0]?.total || 0),
       fineOutstanding: Number(fineOutstandingRows[0]?.total || 0),
+      outstandingTotal: Number(bookingOutstandingRows[0]?.total || 0) + Number(fineOutstandingRows[0]?.total || 0),
     });
   }),
 );
