@@ -27,7 +27,7 @@ const {
   updateBookingLocksStatus,
 } = require('../../utils/booth-locks');
 const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
-const { getCurrentSubscription, requireSubscriptionForMutations } = require('../../services/subscription.service');
+const { assertPlanQuota, getCurrentSubscription, requireSubscriptionForMutations } = require('../../services/subscription.service');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
@@ -2699,6 +2699,10 @@ router.post(
           sourceBoothTypeId: parsed.body.sourceBoothTypeId,
         },
       );
+      const copiedActiveBooths = sourceBooths.filter((booth) => booth.status === 'active').length;
+      if (copiedActiveBooths > 0) {
+        await assertPlanQuota(req.auth.organizationId, 'booth_management', copiedActiveBooths);
+      }
 
       for (const booth of sourceBooths) {
         await connection.execute(
@@ -2784,6 +2788,9 @@ router.post(
   ),
   asyncHandler(async (req, res) => {
     const body = req.validated.body;
+    if (body.status === 'active') {
+      await assertPlanQuota(req.auth.organizationId, 'booth_management', 1);
+    }
     const code = String(body.code || '').trim() || await buildNextBoothCode(req.auth.organizationId, req.validated.params.marketId);
     const result = await query(
       `INSERT INTO booths (organization_id, market_id, floor_plan_id, category_id, code, name, price, sort_order, status)
@@ -3094,6 +3101,7 @@ router.post(
     const body = parsed.body;
     const code = String(body.code || '').trim() || await buildNextMarketCode(req.auth.organizationId);
     const mainImageUrl = req.file ? publicUploadUrl(req, req.file.path) : null;
+    await assertPlanQuota(req.auth.organizationId, 'market_management', 1);
     const result = await query(
       `INSERT INTO markets (organization_id, code, name, description, main_image_url, open_date, close_date, status)
        VALUES (:organizationId, :code, :name, :description, :mainImageUrl, :openDate, :closeDate, 'active')`,
@@ -3244,6 +3252,7 @@ router.post(
   asyncHandler(async (req, res) => {
     const marketId = req.validated.params.marketId;
     const { mobileUserId, items } = req.validated.body;
+    await assertPlanQuota(req.auth.organizationId, 'booking_management', items.length);
 
     const result = await transaction(async (conn) => {
       return createManagementBooking(conn, {
@@ -3278,6 +3287,7 @@ router.post(
     const rows = bookingImportRowsFromWorkbook(req.file.buffer);
     if (!rows.length) throw badRequest('Excel file has no booking rows');
     if (rows.length > 500) throw badRequest('Import supports up to 500 rows per file');
+    await assertPlanQuota(req.auth.organizationId, 'booking_management', rows.length);
 
     const groups = new Map();
     for (const row of rows) {
@@ -5718,6 +5728,7 @@ router.post(
     if (body.role !== ROLES.SUPERVISOR && body.marketIds.length === 0 && body.role !== ROLES.ACCOUNTING) {
       throw badRequest('At least one market assignment is required for this role');
     }
+    await assertPlanQuota(req.auth.organizationId, 'admin_management', 1);
 
     const result = await query(
       `INSERT INTO admin_users (

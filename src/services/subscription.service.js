@@ -19,6 +19,7 @@ const FEATURE_BY_PATH = [
   [/^\/markets\/\d+\/audit/, 'market_audit'],
   [/^\/markets/, 'market_management'],
   [/^\/coupons/, 'coupon_management'],
+  [/^\/payment-proofs/, 'booking_management'],
   [/^\/bookings/, 'booking_management'],
   [/^\/booking-edit/, 'booking_management'],
   [/^\/accounting/, 'accounting'],
@@ -156,6 +157,93 @@ function canUseFeature(subscription, featureKey) {
   return Boolean(subscription.entitlements?.[featureKey]?.enabled);
 }
 
+function getPlanLimit(subscription, featureKey) {
+  const entitlementLimit = subscription?.entitlements?.[featureKey]?.limit;
+  if (entitlementLimit !== null && entitlementLimit !== undefined) return Number(entitlementLimit);
+
+  const plan = subscription?.plan || {};
+  if (featureKey === 'market_management') return Number(plan.includedMarkets || 0);
+  if (featureKey === 'admin_management') return Number(plan.includedAdminUsers || 0);
+  if (featureKey === 'booth_management') return Number(plan.includedActiveBooths || 0);
+  if (featureKey === 'booking_management') return Number(plan.includedMonthlyBookings || 0);
+  return null;
+}
+
+async function getQuotaUsage(organizationId, featureKey) {
+  if (featureKey === 'market_management') {
+    const rows = await query(
+      `SELECT COUNT(*) AS total
+       FROM markets
+       WHERE organization_id = :organizationId
+         AND status = 'active'`,
+      { organizationId },
+    );
+    return Number(rows[0]?.total || 0);
+  }
+
+  if (featureKey === 'admin_management') {
+    const rows = await query(
+      `SELECT COUNT(*) AS total
+       FROM admin_users
+       WHERE organization_id = :organizationId
+         AND status = 'active'`,
+      { organizationId },
+    );
+    return Number(rows[0]?.total || 0);
+  }
+
+  if (featureKey === 'booth_management') {
+    const rows = await query(
+      `SELECT COUNT(*) AS total
+       FROM booths
+       WHERE organization_id = :organizationId
+         AND status = 'active'`,
+      { organizationId },
+    );
+    return Number(rows[0]?.total || 0);
+  }
+
+  if (featureKey === 'booking_management') {
+    const rows = await query(
+      `SELECT COUNT(bi.id) AS total
+       FROM booking_items bi
+       JOIN bookings b
+         ON b.id = bi.booking_id
+        AND b.organization_id = bi.organization_id
+       WHERE bi.organization_id = :organizationId
+         AND b.created_at >= DATE_FORMAT(CURRENT_DATE(), '%Y-%m-01')
+         AND b.created_at < DATE_ADD(DATE_FORMAT(CURRENT_DATE(), '%Y-%m-01'), INTERVAL 1 MONTH)
+         AND b.status NOT IN ('expired', 'cancelled_by_customer')
+         AND bi.status NOT IN ('expired', 'cancelled_by_customer')`,
+      { organizationId },
+    );
+    return Number(rows[0]?.total || 0);
+  }
+
+  return 0;
+}
+
+async function assertPlanQuota(organizationId, featureKey, requestedQuantity = 1) {
+  const subscription = await getCurrentSubscription(organizationId);
+  if (!subscription.writeAllowed) {
+    throw forbidden('Subscription is expired or inactive');
+  }
+  if (!canUseFeature(subscription, featureKey)) {
+    throw forbidden(`Current subscription plan does not include ${featureKey}`);
+  }
+
+  const limit = getPlanLimit(subscription, featureKey);
+  if (limit === null || limit === undefined || limit <= 0) return subscription;
+
+  const usage = await getQuotaUsage(organizationId, featureKey);
+  const requested = Number(requestedQuantity || 1);
+  if (usage + requested > limit) {
+    throw forbidden(`Package quota exceeded for ${featureKey}. Limit ${limit}, current ${usage}, requested ${requested}`);
+  }
+
+  return subscription;
+}
+
 async function assertFeatureAccess(organizationId, featureKey) {
   const subscription = await getCurrentSubscription(organizationId);
   if (!subscription.writeAllowed) {
@@ -187,6 +275,7 @@ function requireSubscriptionForMutations(options = {}) {
 
 module.exports = {
   assertFeatureAccess,
+  assertPlanQuota,
   canUseFeature,
   getCurrentSubscription,
   requireSubscriptionForMutations,

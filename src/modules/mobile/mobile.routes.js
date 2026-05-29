@@ -14,7 +14,7 @@ const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/p
 const { expireStaleBookings } = require('../../utils/booking-status');
 const { PAYMENT_EXPIRES_MINUTES } = require('../../constants/booking');
 const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
-const { requireSubscriptionForMutations } = require('../../services/subscription.service');
+const { assertPlanQuota, requireSubscriptionForMutations } = require('../../services/subscription.service');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
@@ -240,6 +240,7 @@ router.post(
   asyncHandler(async (req, res) => {
     const { marketId, items } = req.validated.body;
     await expireStaleBookings({ execute: query }, req.auth.organizationId);
+    await assertPlanQuota(req.auth.organizationId, 'booking_management', items.length);
     const vatSettings = await getOrganizationVatSettings({ execute: query }, req.auth.organizationId);
     const result = await transaction(async (conn) => {
       const [marketRows] = await conn.execute(
