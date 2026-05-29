@@ -2837,6 +2837,23 @@ router.patch(
   asyncHandler(async (req, res) => {
     const { marketId, boothId } = req.validated.params;
     const body = req.validated.body;
+    const currentRows = await query(
+      `SELECT status
+       FROM booths
+       WHERE id = :boothId
+         AND organization_id = :organizationId
+         AND market_id = :marketId
+       LIMIT 1`,
+      {
+        organizationId: req.auth.organizationId,
+        marketId,
+        boothId,
+      },
+    );
+    if (!currentRows.length) throw notFound('Booth not found');
+    if (body.status === 'active' && currentRows[0].status !== 'active') {
+      await assertPlanQuota(req.auth.organizationId, 'booth_management', 1);
+    }
     const result = await query(
       `UPDATE booths
        SET floor_plan_id = :floorPlanId,

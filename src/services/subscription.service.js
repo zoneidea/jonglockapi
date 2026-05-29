@@ -27,6 +27,13 @@ const FEATURE_BY_PATH = [
   [/^\/dashboard/, 'dashboard'],
 ];
 
+const QUOTA_FEATURES = [
+  { key: 'market_management', label: 'ตลาด', code: 'markets' },
+  { key: 'admin_management', label: 'ผู้ดูแลระบบ', code: 'adminUsers' },
+  { key: 'booth_management', label: 'บูธที่เปิดใช้งาน', code: 'activeBooths' },
+  { key: 'booking_management', label: 'รายการจองต่อเดือน', code: 'monthlyBookings' },
+];
+
 function parseJson(value, fallback = {}) {
   if (!value) return fallback;
   if (typeof value === 'object') return value;
@@ -117,36 +124,57 @@ async function getCurrentSubscription(organizationId) {
   const expired = terminalStatus || isDateExpired(effectiveEndAt, gracePeriodDays);
   const fullFunction = Number(row.is_full_function) === 1;
   const active = !expired && ['pending_activation', 'trialing', 'active'].includes(row.status);
+  const plan = {
+    id: row.plan_id,
+    code: row.plan_code,
+    name: row.plan_name,
+    description: row.plan_description,
+    trialDays: Number(row.trial_days || 0),
+    currencyCode: row.currency_code,
+    basePrice: Number(row.base_price || 0),
+    priceDisplayLabel: row.price_display_label || 'N/A',
+    includedMarkets: Number(row.included_markets || 0),
+    includedAdminUsers: Number(row.included_admin_users || 0),
+    includedActiveBooths: Number(row.included_active_booths || 0),
+    includedMonthlyBookings: Number(row.included_monthly_bookings || 0),
+    isFreeTier: Number(row.is_free_tier) === 1,
+    isFullFunction: fullFunction,
+    features: parseJson(row.features_json, []),
+  };
+  const quotaSubscription = { plan, entitlements };
+  const quotas = {};
+  for (const item of QUOTA_FEATURES) {
+    const limit = getPlanLimit(quotaSubscription, item.key);
+    const used = await getQuotaUsage(row.organization_id, item.key);
+    quotas[item.key] = {
+      code: item.code,
+      label: item.label,
+      used,
+      limit,
+      unlimited: limit === null || limit === undefined || limit <= 0,
+      exceeded: !fullFunction && limit !== null && limit !== undefined && limit > 0 && used > limit,
+    };
+  }
+  const quotaViolations = Object.values(quotas).filter((item) => item.exceeded);
+  const quotaExceeded = quotaViolations.length > 0;
+  const writeAllowed = active && !quotaExceeded;
 
   return {
     exists: true,
     id: row.id,
     subscriptionCode: row.subscription_code,
     status: row.status,
-    accessStatus: expired ? 'expired' : active ? 'active' : 'read_only',
+    accessStatus: expired ? 'expired' : quotaExceeded ? 'over_quota' : active ? 'active' : 'read_only',
     active,
     expired,
-    writeAllowed: active,
+    writeAllowed,
+    quotaExceeded,
+    quotaViolations,
+    quotas,
     effectiveEndAt,
     gracePeriodDays,
     fullFunction,
-    plan: {
-      id: row.plan_id,
-      code: row.plan_code,
-      name: row.plan_name,
-      description: row.plan_description,
-      trialDays: Number(row.trial_days || 0),
-      currencyCode: row.currency_code,
-      basePrice: Number(row.base_price || 0),
-      priceDisplayLabel: row.price_display_label || 'N/A',
-      includedMarkets: Number(row.included_markets || 0),
-      includedAdminUsers: Number(row.included_admin_users || 0),
-      includedActiveBooths: Number(row.included_active_booths || 0),
-      includedMonthlyBookings: Number(row.included_monthly_bookings || 0),
-      isFreeTier: Number(row.is_free_tier) === 1,
-      isFullFunction: fullFunction,
-      features: parseJson(row.features_json, []),
-    },
+    plan,
     entitlements,
   };
 }
@@ -226,6 +254,9 @@ async function getQuotaUsage(organizationId, featureKey) {
 async function assertPlanQuota(organizationId, featureKey, requestedQuantity = 1) {
   const subscription = await getCurrentSubscription(organizationId);
   if (!subscription.writeAllowed) {
+    if (subscription.accessStatus === 'over_quota' || subscription.quotaExceeded) {
+      throw forbidden('Subscription package quota exceeded. Please upgrade package or reduce active data before making changes.');
+    }
     throw forbidden('Subscription is expired or inactive');
   }
   if (!canUseFeature(subscription, featureKey)) {
@@ -247,6 +278,9 @@ async function assertPlanQuota(organizationId, featureKey, requestedQuantity = 1
 async function assertFeatureAccess(organizationId, featureKey) {
   const subscription = await getCurrentSubscription(organizationId);
   if (!subscription.writeAllowed) {
+    if (subscription.accessStatus === 'over_quota' || subscription.quotaExceeded) {
+      throw forbidden('Subscription package quota exceeded. Please upgrade package or reduce active data before making changes.');
+    }
     throw forbidden('Subscription is expired or inactive');
   }
   if (!canUseFeature(subscription, featureKey)) {

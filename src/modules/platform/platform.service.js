@@ -38,6 +38,42 @@ function normalizePagination(page, pageSize) {
   };
 }
 
+function buildUsageLimits(values = {}) {
+  const items = [
+    {
+      key: 'markets',
+      label: 'ตลาด',
+      used: Number(values.markets || 0),
+      limit: Number(values.includedMarkets || 0),
+    },
+    {
+      key: 'adminUsers',
+      label: 'ผู้ดูแลระบบ',
+      used: Number(values.adminUsers || 0),
+      limit: Number(values.includedAdminUsers || 0),
+    },
+    {
+      key: 'activeBooths',
+      label: 'บูธที่เปิดใช้งาน',
+      used: Number(values.activeBooths || 0),
+      limit: Number(values.includedActiveBooths || 0),
+    },
+    {
+      key: 'monthlyBookings',
+      label: 'รายการจองเดือนนี้',
+      used: Number(values.monthlyBookings || 0),
+      limit: Number(values.includedMonthlyBookings || 0),
+    },
+  ];
+
+  return items.map((item) => ({
+    ...item,
+    unlimited: item.limit <= 0,
+    exceeded: item.limit > 0 && item.used > item.limit,
+    percent: item.limit > 0 ? Math.min(Math.round((item.used / item.limit) * 100), 999) : 0,
+  }));
+}
+
 async function getPlatformUserById(userId) {
   const rows = await query(
     `SELECT id, role, status, name_enc, email_enc
@@ -452,11 +488,45 @@ async function listSubscriptions(filters = {}) {
         sp.code AS plan_code,
         sp.name AS plan_name,
         sp.price_display_label,
+        COALESCE(mc.market_count, 0) AS market_count,
+        COALESCE(ac.admin_count, 0) AS admin_count,
+        COALESCE(bc.active_booth_count, 0) AS active_booth_count,
+        COALESCE(bic.monthly_booking_count, 0) AS monthly_booking_count,
         COALESCE(inv.invoice_count, 0) AS invoice_count,
         COALESCE(inv.unpaid_invoice_count, 0) AS unpaid_invoice_count
      FROM organization_subscriptions os
      LEFT JOIN organizations o ON o.id = os.organization_id
      LEFT JOIN subscription_plans sp ON sp.id = os.plan_id
+     LEFT JOIN (
+       SELECT organization_id, COUNT(*) AS market_count
+       FROM markets
+       WHERE status = 'active'
+       GROUP BY organization_id
+     ) mc ON mc.organization_id = os.organization_id
+     LEFT JOIN (
+       SELECT organization_id, COUNT(*) AS admin_count
+       FROM admin_users
+       WHERE status = 'active'
+       GROUP BY organization_id
+     ) ac ON ac.organization_id = os.organization_id
+     LEFT JOIN (
+       SELECT organization_id, COUNT(*) AS active_booth_count
+       FROM booths
+       WHERE status = 'active'
+       GROUP BY organization_id
+     ) bc ON bc.organization_id = os.organization_id
+     LEFT JOIN (
+       SELECT b.organization_id, COUNT(bi.id) AS monthly_booking_count
+       FROM booking_items bi
+       JOIN bookings b
+         ON b.id = bi.booking_id
+        AND b.organization_id = bi.organization_id
+       WHERE b.created_at >= DATE_FORMAT(CURRENT_DATE(), '%Y-%m-01')
+         AND b.created_at < DATE_ADD(DATE_FORMAT(CURRENT_DATE(), '%Y-%m-01'), INTERVAL 1 MONTH)
+         AND b.status NOT IN ('expired', 'cancelled_by_customer')
+         AND bi.status NOT IN ('expired', 'cancelled_by_customer')
+       GROUP BY b.organization_id
+     ) bic ON bic.organization_id = os.organization_id
      LEFT JOIN (
        SELECT
          organization_subscription_id,
@@ -506,6 +576,16 @@ async function listSubscriptions(filters = {}) {
       },
       invoiceCount: Number(row.invoice_count || 0),
       unpaidInvoiceCount: Number(row.unpaid_invoice_count || 0),
+      usageLimits: buildUsageLimits({
+        markets: row.market_count,
+        adminUsers: row.admin_count,
+        activeBooths: row.active_booth_count,
+        monthlyBookings: row.monthly_booking_count,
+        includedMarkets: row.included_markets,
+        includedAdminUsers: row.included_admin_users,
+        includedActiveBooths: row.included_active_booths,
+        includedMonthlyBookings: row.included_monthly_bookings,
+      }),
     })),
     pagination: {
       page: pagination.page,
@@ -602,6 +682,26 @@ async function getSubscriptionDetail(subscriptionId) {
     { planId: row.plan_id },
   );
 
+  const [usage] = await query(
+    `SELECT
+        (SELECT COUNT(*) FROM markets WHERE organization_id = :organizationId AND status = 'active') AS market_count,
+        (SELECT COUNT(*) FROM admin_users WHERE organization_id = :organizationId AND status = 'active') AS admin_count,
+        (SELECT COUNT(*) FROM booths WHERE organization_id = :organizationId AND status = 'active') AS active_booth_count,
+        (
+          SELECT COUNT(bi.id)
+          FROM booking_items bi
+          JOIN bookings b
+            ON b.id = bi.booking_id
+           AND b.organization_id = bi.organization_id
+          WHERE bi.organization_id = :organizationId
+            AND b.created_at >= DATE_FORMAT(CURRENT_DATE(), '%Y-%m-01')
+            AND b.created_at < DATE_ADD(DATE_FORMAT(CURRENT_DATE(), '%Y-%m-01'), INTERVAL 1 MONTH)
+            AND b.status NOT IN ('expired', 'cancelled_by_customer')
+            AND bi.status NOT IN ('expired', 'cancelled_by_customer')
+        ) AS monthly_booking_count`,
+    { organizationId: row.organization_id },
+  );
+
   return {
     id: row.id,
     subscriptionCode: row.subscription_code,
@@ -620,6 +720,16 @@ async function getSubscriptionDetail(subscriptionId) {
     includedAdminUsers: Number(row.included_admin_users || 0),
     includedActiveBooths: Number(row.included_active_booths || 0),
     includedMonthlyBookings: Number(row.included_monthly_bookings || 0),
+    usageLimits: buildUsageLimits({
+      markets: usage?.market_count,
+      adminUsers: usage?.admin_count,
+      activeBooths: usage?.active_booth_count,
+      monthlyBookings: usage?.monthly_booking_count,
+      includedMarkets: row.included_markets,
+      includedAdminUsers: row.included_admin_users,
+      includedActiveBooths: row.included_active_booths,
+      includedMonthlyBookings: row.included_monthly_bookings,
+    }),
     trialStartsAt: row.trial_starts_at,
     trialEndsAt: row.trial_ends_at,
     currentPeriodStart: row.current_period_start,
