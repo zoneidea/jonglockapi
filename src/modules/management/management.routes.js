@@ -4457,12 +4457,30 @@ router.get(
 router.get(
   '/reports/bookings',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({
+        startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        marketId: z.coerce.number().int().positive().optional(),
+        status: z.enum(['active', 'expired', 'all']).optional().default('active'),
+      }),
+      params: z.object({}).passthrough(),
+    }),
+  ),
   asyncHandler(async (req, res) => {
     await expireStaleBookings({ execute: query }, req.auth.organizationId);
+    const { marketId, status } = req.validated.query;
+    const statusFilter = status === 'expired'
+      ? "AND b.status = 'expired' AND bi.status = 'expired'"
+      : status === 'all'
+        ? "AND b.status IN ('pending_payment', 'payment_processing', 'expired') AND bi.status IN ('pending_payment', 'payment_processing', 'expired')"
+        : "AND b.status IN ('pending_payment', 'payment_processing') AND bi.status IN ('pending_payment', 'payment_processing')";
     const dateFilter = buildAccountingDateFilter({
       dateField: 'created_date',
-      startDate: safeIsoDate(req.query.startDate),
-      endDate: safeIsoDate(req.query.endDate),
+      startDate: req.validated.query.startDate,
+      endDate: req.validated.query.endDate,
       aliases: { booking: 'b', payment: 'p', item: 'bi' },
     });
     const rows = await query(
@@ -4481,9 +4499,9 @@ router.get(
        LEFT JOIN admin_market_assignments ama
          ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE b.organization_id = :organizationId
+         AND (:marketId IS NULL OR b.market_id = :marketId)
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
-         AND b.status IN ('pending_payment', 'payment_processing', 'expired')
-         AND bi.status IN ('pending_payment', 'payment_processing', 'expired')
+         ${statusFilter}
          ${dateFilter.sql}
        GROUP BY m.id, m.name, b.id, b.public_id, b.status, b.source, b.created_at,
                 b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
@@ -4492,6 +4510,7 @@ router.get(
       {
         organizationId: req.auth.organizationId,
         adminUserId: req.auth.sub,
+        marketId: marketId || null,
         hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
         ...dateFilter.params,
       },
@@ -4518,12 +4537,27 @@ router.get(
 router.get(
   '/reports/available-booths',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({
+        bookingDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        marketId: z.coerce.number().int().positive().optional(),
+      }),
+      params: z.object({}).passthrough(),
+    }),
+  ),
   asyncHandler(async (req, res) => {
     await expireStaleBookings({ execute: query }, req.auth.organizationId);
-    const bookingDate = req.query.bookingDate || req.query.startDate || new Date().toISOString().slice(0, 10);
+    const startDate = req.validated.query.startDate || req.validated.query.bookingDate || new Date().toISOString().slice(0, 10);
+    const endDate = req.validated.query.endDate || startDate;
+    const marketId = req.validated.query.marketId || null;
     const rows = await query(
       `SELECT m.id AS market_id, m.name AS market_name, b.id AS booth_id, b.code AS booth_code, b.name AS booth_name,
-              b.price, c.name AS category_name, c.name AS production_category_name, fp.name AS floor_plan_name, :bookingDate AS booking_date
+              b.price, c.name AS category_name, c.name AS production_category_name, fp.name AS floor_plan_name,
+              :startDate AS booking_date, :endDate AS booking_end_date
        FROM booths b
        JOIN markets m ON m.id = b.market_id
        LEFT JOIN product_categories c ON c.id = b.category_id
@@ -4533,7 +4567,8 @@ router.get(
        LEFT JOIN booking_items bi
          ON bi.booth_id = b.id
         AND bi.organization_id = b.organization_id
-        AND bi.booking_date = :bookingDate
+        AND bi.booking_date >= :startDate
+        AND bi.booking_date <= :endDate
         AND bi.status IN ('pending_payment', 'payment_processing', 'paid')
        LEFT JOIN bookings bk
          ON bk.id = bi.booking_id
@@ -4541,6 +4576,7 @@ router.get(
         AND bk.status IN ('pending_payment', 'payment_processing', 'paid')
        WHERE b.organization_id = :organizationId
          AND b.status = 'active'
+         AND (:marketId IS NULL OR b.market_id = :marketId)
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          AND bk.id IS NULL
        ORDER BY m.name, fp.name, b.sort_order, b.code`,
@@ -4548,7 +4584,9 @@ router.get(
         organizationId: req.auth.organizationId,
         adminUserId: req.auth.sub,
         hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
-        bookingDate,
+        startDate,
+        endDate,
+        marketId,
       },
     );
     const vatSettings = await getOrganizationVatSettings({ execute: query }, req.auth.organizationId);
@@ -4566,20 +4604,45 @@ router.get(
 router.get(
   '/reports/daily-sales',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN, ROLES.ACCOUNTING),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({
+        startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        bookingDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        marketId: z.coerce.number().int().positive().optional(),
+      }),
+      params: z.object({}).passthrough(),
+    }),
+  ),
   asyncHandler(async (req, res) => {
     await expireStaleBookings({ execute: query }, req.auth.organizationId);
-    const startDate = req.query.startDate || req.query.bookingDate || new Date().toISOString().slice(0, 10);
-    const endDate = req.query.endDate || startDate;
+    const startDate = req.validated.query.startDate || req.validated.query.bookingDate || new Date().toISOString().slice(0, 10);
+    const endDate = req.validated.query.endDate || startDate;
+    const marketId = req.validated.query.marketId || null;
     const rows = await query(
       `SELECT bi.id,
               b.public_id AS booking_public_id,
+              b.status AS booking_status,
+              bi.status AS item_status,
               m.name AS market_name,
               mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc,
               bo.code AS booth_code, bo.name AS booth_name,
               GROUP_CONCAT(DISTINCT p.name ORDER BY p.name SEPARATOR ', ') AS product_names,
-              bi.booking_date, b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount
+              bi.booking_date,
+              COALESCE(bi.unit_price, 0) AS subtotal_amount,
+              COALESCE(ROUND(COALESCE(b.discount_amount, 0) * COALESCE(bi.unit_price, 0) / NULLIF(item_totals.total_unit_price, 0), 2), 0) AS discount_amount,
+              COALESCE(ROUND(COALESCE(b.vat_amount, 0) * COALESCE(bi.unit_price, 0) / NULLIF(item_totals.total_unit_price, 0), 2), 0) AS vat_amount,
+              COALESCE(ROUND(COALESCE(b.total_amount, 0) * COALESCE(bi.unit_price, 0) / NULLIF(item_totals.total_unit_price, 0), 2), 0) AS total_amount
        FROM booking_items bi
        JOIN bookings b ON b.id = bi.booking_id
+       JOIN (
+         SELECT booking_id, organization_id, COALESCE(SUM(unit_price), 0) AS total_unit_price
+         FROM booking_items
+         WHERE organization_id = :organizationId
+         GROUP BY booking_id, organization_id
+       ) item_totals ON item_totals.booking_id = b.id AND item_totals.organization_id = b.organization_id
        JOIN markets m ON m.id = b.market_id
        JOIN mobile_users mu ON mu.id = b.mobile_user_id
        JOIN booths bo ON bo.id = bi.booth_id
@@ -4590,13 +4653,14 @@ router.get(
        WHERE bi.organization_id = :organizationId
          AND b.organization_id = :organizationId
          AND mu.organization_id = :organizationId
+         AND (:marketId IS NULL OR b.market_id = :marketId)
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          AND b.status = 'paid'
          AND bi.status = 'paid'
          AND bi.booking_date >= :startDate
          AND bi.booking_date <= :endDate
-       GROUP BY bi.id, b.public_id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc, bo.code, bo.name,
-                bi.booking_date, b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount
+       GROUP BY bi.id, b.public_id, b.status, bi.status, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc, bo.code, bo.name,
+                bi.booking_date, bi.unit_price, b.discount_amount, b.vat_amount, b.total_amount, item_totals.total_unit_price
        ORDER BY bi.booking_date ASC, b.created_at DESC, m.name, bo.sort_order, bo.code, b.public_id`,
       {
         organizationId: req.auth.organizationId,
@@ -4604,6 +4668,7 @@ router.get(
         hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
         startDate,
         endDate,
+        marketId,
       },
     );
     return ok(
@@ -4629,23 +4694,39 @@ router.get(
       body: z.object({}).passthrough().optional().default({}),
       query: z.object({
         mobileUserId: z.coerce.number().int().positive(),
+        startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+        marketId: z.coerce.number().int().positive().optional(),
+        limit: z.coerce.number().int().min(1).max(1000).optional().default(500),
       }),
       params: z.object({}).passthrough(),
     }),
   ),
   asyncHandler(async (req, res) => {
     await expireStaleBookings({ execute: query }, req.auth.organizationId);
-    const { mobileUserId } = req.validated.query;
+    const { mobileUserId, startDate, endDate, marketId, limit } = req.validated.query;
     const rows = await query(
       `SELECT bi.id,
               b.public_id AS booking_public_id,
+              b.status AS booking_status,
+              bi.status AS item_status,
               m.name AS market_name,
               mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc,
               bo.code AS booth_code, bo.name AS booth_name,
               GROUP_CONCAT(DISTINCT p.name ORDER BY p.name SEPARATOR ', ') AS product_names,
-              bi.booking_date, b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount
+              bi.booking_date,
+              COALESCE(bi.unit_price, 0) AS subtotal_amount,
+              COALESCE(ROUND(COALESCE(b.discount_amount, 0) * COALESCE(bi.unit_price, 0) / NULLIF(item_totals.total_unit_price, 0), 2), 0) AS discount_amount,
+              COALESCE(ROUND(COALESCE(b.vat_amount, 0) * COALESCE(bi.unit_price, 0) / NULLIF(item_totals.total_unit_price, 0), 2), 0) AS vat_amount,
+              COALESCE(ROUND(COALESCE(b.total_amount, 0) * COALESCE(bi.unit_price, 0) / NULLIF(item_totals.total_unit_price, 0), 2), 0) AS total_amount
        FROM booking_items bi
        JOIN bookings b ON b.id = bi.booking_id
+       JOIN (
+         SELECT booking_id, organization_id, COALESCE(SUM(unit_price), 0) AS total_unit_price
+         FROM booking_items
+         WHERE organization_id = :organizationId
+         GROUP BY booking_id, organization_id
+       ) item_totals ON item_totals.booking_id = b.id AND item_totals.organization_id = b.organization_id
        JOIN markets m ON m.id = b.market_id
        JOIN mobile_users mu ON mu.id = b.mobile_user_id
        JOIN booths bo ON bo.id = bi.booth_id
@@ -4657,16 +4738,24 @@ router.get(
          AND b.organization_id = :organizationId
          AND mu.organization_id = :organizationId
          AND b.mobile_user_id = :mobileUserId
+         AND (:marketId IS NULL OR b.market_id = :marketId)
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          AND b.status = 'paid'
          AND bi.status = 'paid'
-       GROUP BY bi.id, b.public_id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc, bo.code, bo.name,
-                bi.booking_date, b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount
-       ORDER BY bi.booking_date DESC, b.created_at DESC, m.name, bo.sort_order, bo.code, b.public_id`,
+         AND (:startDate IS NULL OR bi.booking_date >= :startDate)
+         AND (:endDate IS NULL OR bi.booking_date <= :endDate)
+       GROUP BY bi.id, b.public_id, b.status, bi.status, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc, mu.phone_enc, bo.code, bo.name,
+                bi.booking_date, bi.unit_price, b.discount_amount, b.vat_amount, b.total_amount, item_totals.total_unit_price
+       ORDER BY bi.booking_date DESC, b.created_at DESC, m.name, bo.sort_order, bo.code, b.public_id
+       LIMIT :limit`,
       {
         organizationId: req.auth.organizationId,
         adminUserId: req.auth.sub,
         mobileUserId,
+        startDate: startDate || null,
+        endDate: endDate || null,
+        marketId: marketId || null,
+        limit,
         hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
       },
     );
