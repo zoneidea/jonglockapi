@@ -34,7 +34,7 @@ const PLATFORM_NAVIGATION = Object.freeze([
     items: [
       { key: 'support', label: 'ช่วยเหลือ', path: '/support' },
       { key: 'monitoring', label: 'สถานะระบบ', path: '/monitoring' },
-      { key: 'settings', label: 'ตั้งค่าระบบ', path: '/settings' },
+      { key: 'settings', label: 'ตั้งค่าไอคอนแอป', path: '/settings' },
     ],
   },
 ]);

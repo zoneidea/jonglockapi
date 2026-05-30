@@ -8,6 +8,27 @@ const {
   PLATFORM_NAVIGATION,
 } = require('../../constants/platform');
 
+const APP_ICON_VARIANTS = Object.freeze([
+  {
+    key: 'default',
+    name: 'Jonglock Default',
+    description: 'ไอคอนหลักสำหรับแอป Jonglock',
+    accentColor: '#0f1728',
+  },
+  {
+    key: 'teal',
+    name: 'Jonglock Teal',
+    description: 'ชุดไอคอนสีเขียวอมฟ้า สำหรับแคมเปญทั่วไป',
+    accentColor: '#0f9f8f',
+  },
+  {
+    key: 'midnight',
+    name: 'Jonglock Midnight',
+    description: 'ชุดไอคอนโทนเข้ม สำหรับภาพลักษณ์ทางการ',
+    accentColor: '#07131f',
+  },
+]);
+
 function buildNavigation(role) {
   const allowed = new Set(PLATFORM_MENU_ACCESS[role] || []);
   return PLATFORM_NAVIGATION.map((section) => ({
@@ -72,6 +93,56 @@ function buildUsageLimits(values = {}) {
     exceeded: item.limit > 0 && item.used > item.limit,
     percent: item.limit > 0 ? Math.min(Math.round((item.used / item.limit) * 100), 999) : 0,
   }));
+}
+
+function getAppIconVariant(iconKey) {
+  return APP_ICON_VARIANTS.find((item) => item.key === iconKey) || APP_ICON_VARIANTS[0];
+}
+
+async function ensureAppIconSetting() {
+  await query(
+    `INSERT INTO platform_app_icon_settings (id, active_icon_key, metadata_json)
+     VALUES (1, 'default', JSON_OBJECT('source', 'runtime'))
+     ON DUPLICATE KEY UPDATE id = id`,
+    {},
+  );
+}
+
+async function getAppIconSettings() {
+  await ensureAppIconSetting();
+  const rows = await query(
+    `SELECT active_icon_key, updated_by_platform_user_id, updated_at
+     FROM platform_app_icon_settings
+     WHERE id = 1
+     LIMIT 1`,
+    {},
+  );
+  const row = rows[0] || {};
+  const activeIcon = getAppIconVariant(row.active_icon_key);
+  return {
+    activeIconKey: activeIcon.key,
+    activeIcon,
+    variants: APP_ICON_VARIANTS,
+    updatedByPlatformUserId: row.updated_by_platform_user_id || null,
+    updatedAt: row.updated_at || null,
+  };
+}
+
+async function updateAppIconSettings({ iconKey, platformUserId }) {
+  const variant = getAppIconVariant(iconKey);
+  if (variant.key !== iconKey) {
+    throw notFound('ไม่พบชุดไอคอนที่เลือก');
+  }
+  await ensureAppIconSetting();
+  await query(
+    `UPDATE platform_app_icon_settings
+     SET active_icon_key = :iconKey,
+         updated_by_platform_user_id = :platformUserId,
+         metadata_json = JSON_OBJECT('updatedFrom', 'platform')
+     WHERE id = 1`,
+    { iconKey, platformUserId },
+  );
+  return getAppIconSettings();
 }
 
 async function getPlatformUserById(userId) {
@@ -777,6 +848,8 @@ async function getSubscriptionDetail(subscriptionId) {
 }
 
 module.exports = {
+  APP_ICON_VARIANTS,
+  getAppIconSettings,
   getPlatformDashboardSummary,
   getPlatformUserById,
   getOrganizationDetail,
@@ -784,4 +857,5 @@ module.exports = {
   listOrganizations,
   listSubscriptions,
   loginPlatform,
+  updateAppIconSettings,
 };

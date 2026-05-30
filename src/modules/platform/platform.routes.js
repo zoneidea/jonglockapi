@@ -56,6 +56,14 @@ const subscriptionDetailSchema = z.object({
   query: z.object({}).optional(),
 });
 
+const appIconSettingsSchema = z.object({
+  body: z.object({
+    iconKey: z.enum(['default', 'teal', 'midnight']),
+  }),
+  query: z.object({}).optional(),
+  params: z.object({}).optional(),
+});
+
 function requirePlatform(req, res, next) {
   if (req.auth?.userType !== 'platform') {
     return next(forbidden('Platform route only'));
@@ -87,6 +95,26 @@ router.get(
   asyncHandler(async (req, res) => {
     const summary = await platformService.getPlatformDashboardSummary();
     return ok(res, summary);
+  }),
+);
+
+router.get(
+  '/app-settings/icon',
+  asyncHandler(async (req, res) => {
+    const settings = await platformService.getAppIconSettings();
+    return ok(res, settings);
+  }),
+);
+
+router.patch(
+  '/app-settings/icon',
+  validate(appIconSettingsSchema),
+  asyncHandler(async (req, res) => {
+    const settings = await platformService.updateAppIconSettings({
+      iconKey: req.validated.body.iconKey,
+      platformUserId: req.auth.sub,
+    });
+    return ok(res, settings, 'app icon settings updated');
   }),
 );
 

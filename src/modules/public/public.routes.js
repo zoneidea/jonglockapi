@@ -19,10 +19,12 @@ const { PAYMENT_EXPIRES_MINUTES } = require('../../constants/booking');
 const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
 const { getFirebaseAuth, getFirebaseInitReason } = require('../../services/firebase-admin.service');
 const { deleteBoothTempLocksByBoothDates } = require('../../services/firestore-locks.service');
+const { getAppIconSettings } = require('../platform/platform.service');
 
 const router = express.Router();
 const cachePublicMarkets = cacheResponse({ namespace: 'public:markets', ttlSeconds: 60, maxEntries: 300 });
 const cachePublicAnnouncements = cacheResponse({ namespace: 'public:announcements', ttlSeconds: 30, maxEntries: 100 });
+const cachePublicAppConfig = cacheResponse({ namespace: 'public:app-config', ttlSeconds: 60, maxEntries: 10 });
 const uploadRoot = path.join(__dirname, '..', '..', '..', 'uploads');
 const allowedImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
 const profileUpload = multer({
@@ -2583,6 +2585,22 @@ router.post(
         gross_price: applyVatToAmount(booth.price, vatSettings),
       }),
       dates: availability,
+    });
+  }),
+);
+
+router.get(
+  '/app-config',
+  cachePublicAppConfig,
+  asyncHandler(async (req, res) => {
+    const iconSettings = await getAppIconSettings();
+    return ok(res, {
+      appIcon: {
+        activeIconKey: iconSettings.activeIconKey,
+        activeIcon: iconSettings.activeIcon,
+        variants: iconSettings.variants,
+        updatedAt: iconSettings.updatedAt,
+      },
     });
   }),
 );
