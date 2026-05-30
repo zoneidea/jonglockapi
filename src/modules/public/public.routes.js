@@ -51,6 +51,30 @@ const profileUpload = multer({
   },
 });
 
+const storeProfileUpload = multer({
+  storage: multer.diskStorage({
+    destination(req, file, callback) {
+      const destination = path.join(uploadRoot, 'public-stores');
+      fs.mkdirSync(destination, { recursive: true });
+      callback(null, destination);
+    },
+    filename(req, file, callback) {
+      const extension = path.extname(file.originalname || '').toLowerCase();
+      const safeName = path
+        .basename(file.originalname || 'store-image', extension)
+        .replace(/[^a-zA-Z0-9-_]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 80) || 'store-image';
+      callback(null, `${Date.now()}-${Math.round(Math.random() * 1e9)}-${safeName}${extension}`);
+    },
+  }),
+  limits: { files: 9, fileSize: 5 * 1024 * 1024 },
+  fileFilter(req, file, callback) {
+    if (!allowedImageTypes.has(file.mimetype)) return callback(badRequest('Only JPG, PNG, WEBP, and GIF images are allowed'));
+    return callback(null, true);
+  },
+});
+
 const paymentProofUpload = multer({
   storage: multer.diskStorage({
     destination(req, file, callback) {
@@ -134,6 +158,16 @@ function mapFloorPlan(row) {
     status: row.status,
     boothCount: Number(row.booth_count || 0),
   };
+}
+
+function parseGalleryJson(value) {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.filter(Boolean) : [];
+  } catch {
+    return [];
+  }
 }
 
 function mapBooth(row) {
@@ -253,18 +287,26 @@ async function findOrCreatePublicProfile(conn, user) {
   }
 
   const emailHash = blindIndex(email);
-  const [existingRows] = await conn.execute(
-    `SELECT id,
-            public_id,
-            display_name_enc,
-            email_enc,
-            phone_enc,
-            phone_verified_at,
-            firebase_uid,
-            avatar_url,
-            address_enc,
-            province_id,
-            amphure_id,
+      const [existingRows] = await conn.execute(
+        `SELECT id,
+                public_id,
+                display_name_enc,
+                email_enc,
+                phone_enc,
+                phone_verified_at,
+                firebase_uid,
+                avatar_url,
+                store_name_enc,
+                store_logo_url,
+                store_product_desc_enc,
+                store_facebook_url,
+                store_line_id,
+                store_website_url,
+                store_contact_phone_enc,
+                store_gallery_json,
+                address_enc,
+                province_id,
+                amphure_id,
             subdistrict_id,
             pdpa_terms_accepted_at,
             pdpa_marketing_accepted_at,
@@ -301,6 +343,14 @@ async function findOrCreatePublicProfile(conn, user) {
             phone_verified_at,
             firebase_uid,
             avatar_url,
+            store_name_enc,
+            store_logo_url,
+            store_product_desc_enc,
+            store_facebook_url,
+            store_line_id,
+            store_website_url,
+            store_contact_phone_enc,
+            store_gallery_json,
             address_enc,
             province_id,
             amphure_id,
@@ -327,6 +377,14 @@ function mapPublicProfile(row) {
     phoneVerifiedAt: row.phone_verified_at,
     firebaseUid: row.firebase_uid || '',
     avatarUrl: row.avatar_url || '',
+    storeName: decryptField(row.store_name_enc) || '',
+    storeLogoUrl: row.store_logo_url || '',
+    storeProductDescription: decryptField(row.store_product_desc_enc) || '',
+    storeFacebookUrl: row.store_facebook_url || '',
+    storeLineId: row.store_line_id || '',
+    storeWebsiteUrl: row.store_website_url || '',
+    storeContactPhone: decryptField(row.store_contact_phone_enc) || '',
+    storeGalleryImages: parseGalleryJson(row.store_gallery_json),
     address: decryptField(row.address_enc) || '',
     provinceId: row.province_id ? Number(row.province_id) : null,
     amphureId: row.amphure_id ? Number(row.amphure_id) : null,
@@ -2317,6 +2375,14 @@ router.post(
                 phone_verified_at,
                 firebase_uid,
                 avatar_url,
+                store_name_enc,
+                store_logo_url,
+                store_product_desc_enc,
+                store_facebook_url,
+                store_line_id,
+                store_website_url,
+                store_contact_phone_enc,
+                store_gallery_json,
                 address_enc,
                 province_id,
                 amphure_id,
@@ -2434,6 +2500,14 @@ router.post(
                 phone_verified_at,
                 firebase_uid,
                 avatar_url,
+                store_name_enc,
+                store_logo_url,
+                store_product_desc_enc,
+                store_facebook_url,
+                store_line_id,
+                store_website_url,
+                store_contact_phone_enc,
+                store_gallery_json,
                 address_enc,
                 province_id,
                 amphure_id,
@@ -2486,6 +2560,14 @@ router.post(
                 phone_verified_at,
                 firebase_uid,
                 avatar_url,
+                store_name_enc,
+                store_logo_url,
+                store_product_desc_enc,
+                store_facebook_url,
+                store_line_id,
+                store_website_url,
+                store_contact_phone_enc,
+                store_gallery_json,
                 address_enc,
                 province_id,
                 amphure_id,
@@ -2502,6 +2584,153 @@ router.post(
     });
 
     return ok(res, mapPublicProfile(profile), 'avatar uploaded');
+  }),
+);
+
+router.post(
+  '/profile/store',
+  storeProfileUpload.fields([
+    { name: 'logo', maxCount: 1 },
+    { name: 'gallery', maxCount: 8 },
+  ]),
+  asyncHandler(async (req, res) => {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const name = String(req.body?.name || '').trim();
+    if (!email) {
+      throw badRequest('email is required');
+    }
+
+    const logoFile = Array.isArray(req.files?.logo) ? req.files.logo[0] : null;
+    const galleryFiles = Array.isArray(req.files?.gallery) ? req.files.gallery : [];
+    const body = {
+      storeName: String(req.body?.storeName || '').trim(),
+      storeProductDescription: String(req.body?.storeProductDescription || '').trim(),
+      storeFacebookUrl: String(req.body?.storeFacebookUrl || '').trim(),
+      storeLineId: String(req.body?.storeLineId || '').trim(),
+      storeWebsiteUrl: String(req.body?.storeWebsiteUrl || '').trim(),
+      storeContactPhone: String(req.body?.storeContactPhone || '').trim(),
+    };
+
+    const profile = await transaction(async (conn) => {
+      const current = await findOrCreatePublicProfile(conn, { email, name });
+      const currentGallery = parseGalleryJson(current.store_gallery_json);
+      const nextLogoUrl = logoFile ? publicUploadUrl(req, logoFile.path) : current.store_logo_url || '';
+      const nextGalleryImages = galleryFiles.length
+        ? galleryFiles.map((file) => publicUploadUrl(req, file.path))
+        : currentGallery;
+
+      await conn.execute(
+        `UPDATE public_user_profiles
+         SET store_name_enc = :storeNameEnc,
+             store_logo_url = :storeLogoUrl,
+             store_product_desc_enc = :storeProductDescriptionEnc,
+             store_facebook_url = :storeFacebookUrl,
+             store_line_id = :storeLineId,
+             store_website_url = :storeWebsiteUrl,
+             store_contact_phone_enc = :storeContactPhoneEnc,
+             store_gallery_json = :storeGalleryJson
+         WHERE id = :id`,
+        {
+          id: current.id,
+          storeNameEnc: encryptField(body.storeName),
+          storeLogoUrl: nextLogoUrl || null,
+          storeProductDescriptionEnc: encryptField(body.storeProductDescription),
+          storeFacebookUrl: body.storeFacebookUrl || null,
+          storeLineId: body.storeLineId || null,
+          storeWebsiteUrl: body.storeWebsiteUrl || null,
+          storeContactPhoneEnc: encryptField(body.storeContactPhone),
+          storeGalleryJson: JSON.stringify(nextGalleryImages),
+        },
+      );
+      const [rows] = await conn.execute(
+        `SELECT id,
+                public_id,
+                display_name_enc,
+                email_enc,
+                phone_enc,
+                phone_verified_at,
+                firebase_uid,
+                avatar_url,
+                store_name_enc,
+                store_logo_url,
+                store_product_desc_enc,
+                store_facebook_url,
+                store_line_id,
+                store_website_url,
+                store_contact_phone_enc,
+                store_gallery_json,
+                address_enc,
+                province_id,
+                amphure_id,
+                subdistrict_id,
+                pdpa_terms_accepted_at,
+                pdpa_marketing_accepted_at,
+                notification_enabled
+         FROM public_user_profiles
+         WHERE id = :id
+         LIMIT 1`,
+        { id: current.id },
+      );
+      return rows[0];
+    });
+
+    return ok(res, mapPublicProfile(profile), 'store profile updated');
+  }),
+);
+
+router.post(
+  '/profile/device-token',
+  validate(
+    z.object({
+      body: z.object({
+        user: z.object({
+          email: z.string().email(),
+          name: z.string().optional().default(''),
+        }),
+        organizationId: z.coerce.number().int().positive(),
+        fcmToken: z.string().min(20).max(512),
+        platform: z.enum(['ios', 'android', 'unknown']).optional().default('unknown'),
+        deviceId: z.string().max(191).optional().default(''),
+        appVersion: z.string().max(50).optional().default(''),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const body = req.validated.body;
+    const result = await transaction(async (conn) => {
+      const profile = await findOrCreatePublicProfile(conn, body.user);
+      const mobileUserId = await findOrCreatePublicMobileUser(conn, body.organizationId, body.user);
+      await conn.execute(
+        `INSERT INTO mobile_device_tokens (
+          organization_id, mobile_user_id, public_profile_id, fcm_token, platform, device_id, app_version, status, last_seen_at
+        ) VALUES (
+          :organizationId, :mobileUserId, :publicProfileId, :fcmToken, :platform, :deviceId, :appVersion, 'active', NOW()
+        )
+        ON DUPLICATE KEY UPDATE
+          organization_id = VALUES(organization_id),
+          mobile_user_id = VALUES(mobile_user_id),
+          public_profile_id = VALUES(public_profile_id),
+          platform = VALUES(platform),
+          device_id = VALUES(device_id),
+          app_version = VALUES(app_version),
+          status = 'active',
+          last_seen_at = NOW()`,
+        {
+          organizationId: body.organizationId,
+          mobileUserId,
+          publicProfileId: profile.id,
+          fcmToken: body.fcmToken,
+          platform: body.platform,
+          deviceId: body.deviceId || null,
+          appVersion: body.appVersion || null,
+        },
+      );
+      return { registered: true, organizationId: body.organizationId, mobileUserId };
+    });
+
+    return ok(res, result, 'device token registered');
   }),
 );
 
