@@ -20,6 +20,7 @@ const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = 
 const { getFirebaseAuth, getFirebaseInitReason } = require('../../services/firebase-admin.service');
 const { deleteBoothTempLocksByBoothDates } = require('../../services/firestore-locks.service');
 const { getAppIconSettings } = require('../platform/platform.service');
+const authService = require('../auth/auth.service');
 
 const router = express.Router();
 const cachePublicMarkets = cacheResponse({ namespace: 'public:markets', ttlSeconds: 60, maxEntries: 300 });
@@ -231,6 +232,24 @@ function normalizeDisplayName(name, fallbackEmail) {
   const cleanName = String(name || '').trim();
   if (cleanName) return cleanName;
   return String(fallbackEmail || '').split('@')[0] || 'Jonglock User';
+}
+
+function slugifyOrganizationName(name) {
+  return String(name || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '')
+    .slice(0, 6) || 'ORG';
+}
+
+async function generateOrganizationCode(conn, companyName) {
+  const base = slugifyOrganizationName(companyName);
+  for (let attempt = 1; attempt <= 50; attempt += 1) {
+    const suffix = String(attempt).padStart(3, '0');
+    const code = `${base}${suffix}`;
+    const [rows] = await conn.execute(`SELECT id FROM organizations WHERE code = :code LIMIT 1`, { code });
+    if (!rows.length) return code;
+  }
+  return publicId('ORG');
 }
 
 async function findOrCreatePublicMobileUser(conn, organizationId, user) {
@@ -2934,9 +2953,11 @@ router.post(
         companyPhone: z.string().min(8).max(30),
         lineId: z.string().max(120).optional().or(z.literal('')).default(''),
         address: z.string().min(5).max(1000),
-        supervisorName: z.string().min(2).max(255),
+        supervisorFirstName: z.string().min(1).max(120),
+        supervisorLastName: z.string().min(1).max(120),
         supervisorEmail: z.string().email(),
         supervisorPhone: z.string().min(8).max(30).optional().or(z.literal('')).default(''),
+        supervisorUsername: z.string().min(3).max(60).regex(/^[A-Za-z0-9._-]+$/),
         password: z.string().min(10).refine(assertPasswordPolicy, PASSWORD_POLICY_MESSAGE),
         marketCountEstimate: z.coerce.number().int().min(1).max(999).optional().default(1),
         expectedGoLiveDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().or(z.literal('')).default(''),
@@ -2950,6 +2971,7 @@ router.post(
   ),
   asyncHandler(async (req, res) => {
     const body = req.validated.body;
+    const supervisorName = `${body.supervisorFirstName} ${body.supervisorLastName}`.trim();
     const result = await transaction(async (conn) => {
       const [plans] = await conn.execute(
         `SELECT *
@@ -2977,8 +2999,21 @@ router.post(
         throw conflict('This email already has an active signup request');
       }
 
+      const [existingUsernameRows] = await conn.execute(
+        `SELECT au.id
+         FROM admin_users au
+         JOIN organizations o ON o.id = au.organization_id
+         WHERE au.username_hash = :usernameHash
+         LIMIT 1`,
+        { usernameHash: blindIndex(body.supervisorUsername) },
+      );
+      if (existingUsernameRows.length) {
+        throw conflict('Supervisor username is already in use');
+      }
+
       const requestNo = publicId('SUB');
       const subscriptionCode = publicId('OSUB');
+      const organizationCode = await generateOrganizationCode(conn, body.companyName);
       const now = new Date();
       const trialEndsAt = new Date(now.getTime() + Number(plan.trial_days || 0) * 24 * 60 * 60 * 1000);
       const basePrice = Number(plan.base_price || 0);
@@ -3011,7 +3046,7 @@ router.post(
           companyPhoneHash: blindIndex(body.companyPhone),
           lineIdEnc: encryptField(body.lineId),
           addressEnc: encryptField(body.address),
-          supervisorNameEnc: encryptField(body.supervisorName),
+          supervisorNameEnc: encryptField(supervisorName),
           supervisorEmailEnc: encryptField(body.supervisorEmail),
           supervisorEmailHash,
           supervisorPhoneEnc: encryptField(body.supervisorPhone),
@@ -3028,24 +3063,64 @@ router.post(
             planCode: plan.code,
             planName: plan.name,
             sourceHost: req.get('host') || null,
+            organizationCode,
+            supervisorUsername: body.supervisorUsername,
           }),
+        },
+      );
+
+      const [organizationResult] = await conn.execute(
+        `INSERT INTO organizations (
+          code, name, address, email, phone, line_id, status
+        ) VALUES (
+          :code, :name, :address, :email, :phone, :lineId, 'active'
+        )`,
+        {
+          code: organizationCode,
+          name: body.companyName,
+          address: body.address,
+          email: body.companyEmail,
+          phone: body.companyPhone,
+          lineId: body.lineId || null,
+        },
+      );
+      const organizationId = organizationResult.insertId;
+
+      await conn.execute(
+        `INSERT INTO admin_users (
+          organization_id, username_hash, password_hash, role,
+          name_enc, email_enc, email_hash, phone_enc, phone_hash, status
+        ) VALUES (
+          :organizationId, :usernameHash, :passwordHash, 'supervisor',
+          :nameEnc, :emailEnc, :emailHash, :phoneEnc, :phoneHash, 'active'
+        )`,
+        {
+          organizationId,
+          usernameHash: blindIndex(body.supervisorUsername),
+          passwordHash: await bcrypt.hash(body.password, 12),
+          nameEnc: encryptField(supervisorName),
+          emailEnc: encryptField(body.supervisorEmail),
+          emailHash: blindIndex(body.supervisorEmail),
+          phoneEnc: encryptField(body.supervisorPhone),
+          phoneHash: blindIndex(body.supervisorPhone),
         },
       );
 
       await conn.execute(
         `INSERT INTO organization_subscriptions (
-          subscription_code, signup_request_id, plan_id, status, billing_currency, billing_interval, billing_interval_count,
+          subscription_code, organization_id, signup_request_id, plan_id, status, billing_currency, billing_interval, billing_interval_count,
           unit_price, setup_fee, discount_amount, vat_rate, subtotal_amount, vat_amount, total_amount,
           included_markets, included_admin_users, included_active_booths, included_monthly_bookings,
-          trial_starts_at, trial_ends_at, current_period_start, current_period_end, next_billing_at, metadata_json
+          trial_starts_at, trial_ends_at, current_period_start, current_period_end, next_billing_at, activated_at, metadata_json
         ) VALUES (
-          :subscriptionCode, :signupRequestId, :planId, 'pending_activation', :billingCurrency, :billingInterval, :billingIntervalCount,
+          :subscriptionCode, :organizationId, :signupRequestId, :planId, 'trialing', :billingCurrency, :billingInterval, :billingIntervalCount,
           :unitPrice, :setupFee, 0, :vatRate, :subtotalAmount, :vatAmount, :totalAmount,
           :includedMarkets, :includedAdminUsers, :includedActiveBooths, :includedMonthlyBookings,
-          NOW(), :trialEndsAt, NOW(), :trialEndsAt, :trialEndsAt, :metadataJson
+          NOW(), :trialEndsAt, NOW(), :trialEndsAt, :trialEndsAt, NOW(), :metadataJson
         )`,
         {
           subscriptionCode,
+          organizationId,
           signupRequestId: signup.insertId,
           planId: plan.id,
           billingCurrency: plan.currency_code,
@@ -3065,22 +3140,39 @@ router.post(
           metadataJson: JSON.stringify({
             planCode: plan.code,
             requestedMarketCount: body.marketCountEstimate,
+            organizationCode,
           }),
         },
+      );
+
+      await conn.execute(
+        `UPDATE organization_signup_requests
+         SET status = 'provisioned', reviewed_at = NOW()
+         WHERE id = :signupRequestId`,
+        { signupRequestId: signup.insertId },
       );
 
       return {
         requestNo,
         subscriptionCode,
         companyName: body.companyName,
+        organizationCode,
+        supervisorUsername: body.supervisorUsername,
         preferredPlan: plan.name,
         preferredPlanCode: plan.code,
         trialEndsAt,
-        status: 'pending_review',
+        status: 'provisioned',
       };
     });
 
-    return created(res, result, 'subscription signup submitted');
+    const managementSession = await authService.loginManagement({
+      organizationCode: result.organizationCode,
+      username: result.supervisorUsername,
+      password: body.password,
+      rememberMe: true,
+    });
+
+    return created(res, { ...result, managementSession }, 'subscription signup completed');
   }),
 );
 
