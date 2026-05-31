@@ -2646,6 +2646,7 @@ router.get(
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
   requireMarketAccess(),
   asyncHandler(async (req, res) => {
+    const status = ['active', 'inactive'].includes(String(req.query.status || '')) ? String(req.query.status) : '';
     const rows = await query(
       `SELECT fp.id, fp.name, fp.plan_image_url, fp.start_date, fp.end_date, fp.status,
               COUNT(b.id) AS booth_count
@@ -2655,9 +2656,10 @@ router.get(
         AND b.organization_id = fp.organization_id
         AND b.market_id = fp.market_id
        WHERE fp.organization_id = :organizationId AND fp.market_id = :marketId
+         AND (:status = '' OR fp.status = :status)
        GROUP BY fp.id, fp.name, fp.plan_image_url, fp.start_date, fp.end_date, fp.status
        ORDER BY fp.start_date DESC, fp.id DESC`,
-      { organizationId: req.auth.organizationId, marketId: Number(req.params.marketId) },
+      { organizationId: req.auth.organizationId, marketId: Number(req.params.marketId), status },
     );
     return ok(res, rows);
   }),
@@ -2677,6 +2679,7 @@ router.post(
           startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
           endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
           boothCount: z.coerce.number().int().min(1).default(1),
+          defaultPrice: z.coerce.number().min(0).default(0),
           categoryId: z.coerce.number().int().positive().optional().nullable(),
           status: z.enum(['active', 'inactive']).default('active'),
         }),
@@ -2734,7 +2737,7 @@ router.post(
             categoryId,
             code,
             name: code,
-            price: 0,
+            price: body.defaultPrice,
             sortOrder: index + 1,
             status: generatedBoothStatus,
           },
@@ -2963,6 +2966,19 @@ router.post(
       await assertPlanQuota(req.auth.organizationId, 'booth_management', 1);
     }
     const code = String(body.code || '').trim() || await buildNextBoothCode(req.auth.organizationId, req.validated.params.marketId);
+    const sortRows = await query(
+      `SELECT COALESCE(MAX(sort_order), 0) AS max_sort_order
+       FROM booths
+       WHERE organization_id = :organizationId
+         AND market_id = :marketId
+         AND (:floorPlanId IS NULL OR floor_plan_id = :floorPlanId)`,
+      {
+        organizationId: req.auth.organizationId,
+        marketId: req.validated.params.marketId,
+        floorPlanId: body.floorPlanId || null,
+      },
+    );
+    const sortOrder = Number(sortRows[0]?.max_sort_order || 0) + 1;
     const result = await query(
       `INSERT INTO booths (organization_id, market_id, floor_plan_id, category_id, code, name, price, sort_order, status)
        VALUES (:organizationId, :marketId, :floorPlanId, :categoryId, :code, :name, :price, :sortOrder, :status)`,
@@ -2974,12 +2990,80 @@ router.post(
         code,
         name: body.name,
         price: body.price,
-        sortOrder: body.sortOrder,
+        sortOrder,
         status: body.status,
       },
     );
     clearPublicReadCache();
     return created(res, { id: result.insertId }, 'booth created');
+  }),
+);
+
+router.patch(
+  '/markets/:marketId/booths/bulk',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  validate(
+    z.object({
+      body: z.object({
+        boothIds: z.array(z.coerce.number().int().positive()).min(1),
+        categoryId: z.union([z.coerce.number().int().positive(), z.literal(''), z.null()]).optional(),
+        price: z.union([z.coerce.number().min(0), z.literal(''), z.null()]).optional(),
+      }).refine((body) => body.categoryId !== undefined || body.price !== undefined, {
+        message: 'Please provide category or price to update',
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({ marketId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { marketId } = req.validated.params;
+    const body = req.validated.body;
+    const uniqueBoothIds = Array.from(new Set(body.boothIds.map(Number)));
+    const updates = [];
+    const params = {
+      organizationId: req.auth.organizationId,
+      marketId,
+    };
+
+    if (body.categoryId !== undefined && body.categoryId !== '') {
+      const categoryId = body.categoryId === null ? null : Number(body.categoryId);
+      if (categoryId) {
+        const categoryRows = await query(
+          `SELECT id
+           FROM product_categories
+           WHERE id = :categoryId
+             AND organization_id = :organizationId
+             AND market_id = :marketId
+           LIMIT 1`,
+          { organizationId: req.auth.organizationId, marketId, categoryId },
+        );
+        if (!categoryRows[0]) throw badRequest('Category not found for this market');
+      }
+      updates.push('category_id = :categoryId');
+      params.categoryId = categoryId;
+    }
+
+    if (body.price !== undefined && body.price !== '') {
+      updates.push('price = :price');
+      params.price = body.price === null ? 0 : Number(body.price);
+    }
+
+    if (!updates.length) throw badRequest('No bulk update values provided');
+    const idPlaceholders = uniqueBoothIds.map((_, index) => `:boothId${index}`).join(', ');
+    uniqueBoothIds.forEach((id, index) => {
+      params[`boothId${index}`] = id;
+    });
+    const result = await query(
+      `UPDATE booths
+       SET ${updates.join(', ')}
+       WHERE organization_id = :organizationId
+         AND market_id = :marketId
+         AND id IN (${idPlaceholders})`,
+      params,
+    );
+    clearPublicReadCache();
+    return ok(res, { updatedCount: result.affectedRows }, 'booths bulk updated');
   }),
 );
 
