@@ -315,6 +315,32 @@ function nextSequenceCode(rows, fieldName, defaultPrefix) {
   return `${bestPrefix}${String(maxNumber + 1).padStart(bestWidth, '0')}`;
 }
 
+function nextSequenceCodes(rows, fieldName, defaultPrefix, count) {
+  const total = Math.max(0, Number(count || 0));
+  if (!total) return [];
+
+  let maxNumber = 0;
+  let bestPrefix = defaultPrefix;
+  let bestWidth = 3;
+
+  for (const row of rows) {
+    const rawValue = String(row?.[fieldName] || '').trim();
+    const match = rawValue.match(/^([^0-9]*?)(\d+)$/);
+    if (!match) continue;
+    const prefix = match[1] || defaultPrefix;
+    const digits = match[2];
+    const numericValue = Number(digits);
+    if (Number.isNaN(numericValue)) continue;
+    if (numericValue > maxNumber) {
+      maxNumber = numericValue;
+      bestPrefix = prefix;
+      bestWidth = Math.max(3, digits.length);
+    }
+  }
+
+  return Array.from({ length: total }, (_, index) => `${bestPrefix}${String(maxNumber + index + 1).padStart(bestWidth, '0')}`);
+}
+
 async function buildNextMarketCode(organizationId) {
   const rows = await query(
     `SELECT code
@@ -2610,10 +2636,16 @@ router.get(
   requireMarketAccess(),
   asyncHandler(async (req, res) => {
     const rows = await query(
-      `SELECT id, name, plan_image_url, start_date, end_date, status
-       FROM floor_plans
-       WHERE organization_id = :organizationId AND market_id = :marketId
-       ORDER BY start_date DESC, id DESC`,
+      `SELECT fp.id, fp.name, fp.plan_image_url, fp.start_date, fp.end_date, fp.status,
+              COUNT(b.id) AS booth_count
+       FROM floor_plans fp
+       LEFT JOIN booths b
+         ON b.floor_plan_id = fp.id
+        AND b.organization_id = fp.organization_id
+        AND b.market_id = fp.market_id
+       WHERE fp.organization_id = :organizationId AND fp.market_id = :marketId
+       GROUP BY fp.id, fp.name, fp.plan_image_url, fp.start_date, fp.end_date, fp.status
+       ORDER BY fp.start_date DESC, fp.id DESC`,
       { organizationId: req.auth.organizationId, marketId: Number(req.params.marketId) },
     );
     return ok(res, rows);
@@ -2633,19 +2665,74 @@ router.post(
           name: z.string().min(1),
           startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
           endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+          boothCount: z.coerce.number().int().min(1).default(1),
+          categoryId: z.coerce.number().int().positive().optional().nullable(),
           status: z.enum(['active', 'inactive']).default('active'),
         }),
       })
       .parse({ params: req.params, body: req.body });
     const body = parsed.body;
     const planImageUrl = req.file ? publicUploadUrl(req, req.file.path) : null;
-    const result = await query(
-      `INSERT INTO floor_plans (organization_id, market_id, name, plan_image_url, start_date, end_date, status)
-       VALUES (:organizationId, :marketId, :name, :planImageUrl, :startDate, :endDate, :status)`,
-      { organizationId: req.auth.organizationId, marketId: parsed.params.marketId, planImageUrl, ...body },
-    );
+    await ensureFixedProductCategories(req.auth.organizationId, parsed.params.marketId);
+    let categoryId = body.categoryId || null;
+    if (categoryId) {
+      const categoryRows = await query(
+        `SELECT id
+         FROM product_categories
+         WHERE id = :categoryId
+           AND organization_id = :organizationId
+           AND market_id = :marketId
+         LIMIT 1`,
+        {
+          categoryId,
+          organizationId: req.auth.organizationId,
+          marketId: parsed.params.marketId,
+        },
+      );
+      if (!categoryRows[0]) throw badRequest('Category not found for this market');
+    }
+    const generatedBoothStatus = body.status === 'active' ? 'active' : 'inactive';
+    if (generatedBoothStatus === 'active') {
+      await assertPlanQuota(req.auth.organizationId, 'booth_management', body.boothCount);
+    }
+    const result = await transaction(async (connection) => {
+      const [insertResult] = await connection.execute(
+        `INSERT INTO floor_plans (organization_id, market_id, name, plan_image_url, start_date, end_date, status)
+         VALUES (:organizationId, :marketId, :name, :planImageUrl, :startDate, :endDate, :status)`,
+        { organizationId: req.auth.organizationId, marketId: parsed.params.marketId, planImageUrl, ...body },
+      );
+      const floorPlanId = insertResult.insertId;
+      const [existingBoothRows] = await connection.execute(
+        `SELECT code
+         FROM booths
+         WHERE organization_id = :organizationId AND market_id = :marketId`,
+        { organizationId: req.auth.organizationId, marketId: parsed.params.marketId },
+      );
+      const boothCodes = nextSequenceCodes(existingBoothRows, 'code', 'B', body.boothCount);
+      for (const [index, code] of boothCodes.entries()) {
+        await connection.execute(
+          `INSERT INTO booths (
+            organization_id, market_id, floor_plan_id, category_id, code, name, price, sort_order, status
+          ) VALUES (
+            :organizationId, :marketId, :floorPlanId, :categoryId, :code, :name, :price, :sortOrder, :status
+          )`,
+          {
+            organizationId: req.auth.organizationId,
+            marketId: parsed.params.marketId,
+            floorPlanId,
+            categoryId,
+            code,
+            name: code,
+            price: 0,
+            sortOrder: index + 1,
+            status: generatedBoothStatus,
+          },
+        );
+      }
+      return { id: floorPlanId, planImageUrl, boothCount: boothCodes.length };
+    });
     clearPublicReadCache();
-    return created(res, { id: result.insertId, planImageUrl }, 'booth type created');
+    return created(res, result, 'booth type created');
   }),
 );
 
@@ -3183,8 +3270,6 @@ router.post(
           code: z.string().optional().default(''),
           name: z.string().min(1),
           description: z.string().optional().default(''),
-          openDate: z.string().optional().nullable(),
-          closeDate: z.string().optional().nullable(),
           openDays: z.any().optional(),
         }),
       })
@@ -3203,13 +3288,13 @@ router.post(
         name: body.name,
         description: body.description,
         mainImageUrl,
-        openDate: body.openDate || null,
-        closeDate: body.closeDate || null,
+        openDate: null,
+        closeDate: null,
         openDaysJson: JSON.stringify(openDays.length ? openDays : ALL_MARKET_OPEN_DAYS),
       },
     );
     clearPublicReadCache();
-    return created(res, { id: result.insertId, mainImageUrl }, 'market created');
+    return created(res, { id: result.insertId, mainImageUrl, code }, 'market created');
   }),
 );
 
