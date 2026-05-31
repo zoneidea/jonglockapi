@@ -111,6 +111,15 @@ function mapMarket(row) {
   const galleryImages = row.gallery_images
     ? String(row.gallery_images).split('||').filter(Boolean)
     : [];
+  let openDays = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+  try {
+    if (row.open_days_json) {
+      const parsed = typeof row.open_days_json === 'string' ? JSON.parse(row.open_days_json) : row.open_days_json;
+      if (Array.isArray(parsed)) {
+        openDays = parsed.map((item) => String(item || '').toLowerCase()).filter(Boolean);
+      }
+    }
+  } catch {}
 
   return {
     id: row.id,
@@ -127,6 +136,9 @@ function mapMarket(row) {
     email: row.email || '',
     openDate: row.open_date,
     closeDate: row.close_date,
+    openDays,
+    isHolidayToday: Number(row.is_holiday_today || 0) === 1,
+    holidayTitleToday: row.holiday_title_today || '',
     galleryImages,
   };
 }
@@ -443,7 +455,25 @@ router.get(
     const rows = await query(
       `SELECT
           m.id, m.organization_id, m.code, m.name, m.description, m.terms, m.main_image_url,
-          m.address, m.opening_hours, m.phone, m.line_id, m.email, m.open_date, m.close_date,
+          m.address, m.opening_hours, m.open_days_json, m.phone, m.line_id, m.email, m.open_date, m.close_date,
+          EXISTS (
+            SELECT 1
+            FROM market_holidays mh
+            WHERE mh.organization_id = m.organization_id
+              AND mh.market_id = m.id
+              AND mh.status = 'active'
+              AND CURRENT_DATE() BETWEEN mh.start_date AND mh.end_date
+          ) AS is_holiday_today,
+          (
+            SELECT mh.title
+            FROM market_holidays mh
+            WHERE mh.organization_id = m.organization_id
+              AND mh.market_id = m.id
+              AND mh.status = 'active'
+              AND CURRENT_DATE() BETWEEN mh.start_date AND mh.end_date
+            ORDER BY mh.id DESC
+            LIMIT 1
+          ) AS holiday_title_today,
           GROUP_CONCAT(mi.image_url ORDER BY mi.sort_order ASC, mi.id DESC SEPARATOR '||') AS gallery_images
        FROM markets m
        JOIN organizations o ON o.id = m.organization_id
@@ -469,7 +499,25 @@ router.get(
     const rows = await query(
       `SELECT
           m.id, m.organization_id, m.code, m.name, m.description, m.terms, m.main_image_url,
-          m.address, m.opening_hours, m.phone, m.line_id, m.email, m.open_date, m.close_date,
+          m.address, m.opening_hours, m.open_days_json, m.phone, m.line_id, m.email, m.open_date, m.close_date,
+          EXISTS (
+            SELECT 1
+            FROM market_holidays mh
+            WHERE mh.organization_id = m.organization_id
+              AND mh.market_id = m.id
+              AND mh.status = 'active'
+              AND CURRENT_DATE() BETWEEN mh.start_date AND mh.end_date
+          ) AS is_holiday_today,
+          (
+            SELECT mh.title
+            FROM market_holidays mh
+            WHERE mh.organization_id = m.organization_id
+              AND mh.market_id = m.id
+              AND mh.status = 'active'
+              AND CURRENT_DATE() BETWEEN mh.start_date AND mh.end_date
+            ORDER BY mh.id DESC
+            LIMIT 1
+          ) AS holiday_title_today,
           GROUP_CONCAT(mi.image_url ORDER BY mi.sort_order ASC, mi.id DESC SEPARATOR '||') AS gallery_images
        FROM markets m
        JOIN organizations o ON o.id = m.organization_id

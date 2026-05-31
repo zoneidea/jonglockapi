@@ -1,9 +1,10 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const { Readable } = require('stream');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
-const XLSX = require('xlsx');
+const ExcelJS = require('exceljs');
 const { z } = require('zod');
 const { query, transaction } = require('../../config/db');
 const { authenticate } = require('../../middlewares/auth');
@@ -28,6 +29,7 @@ const {
 } = require('../../utils/booth-locks');
 const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
 const { assertPlanQuota, getCurrentSubscription, requireSubscriptionForMutations } = require('../../services/subscription.service');
+const { sendMobilePushNotification } = require('../../services/mobile-notification.service');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
@@ -37,6 +39,25 @@ const allowedImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'ima
 function clearPublicReadCache() {
   clearResponseCache('public:markets');
   clearResponseCache('public:announcements');
+}
+
+const ALL_MARKET_OPEN_DAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+
+function normalizeOpenDays(value) {
+  if (Array.isArray(value)) {
+    const normalized = value.map((item) => String(item || '').trim().toLowerCase()).filter((item) => ALL_MARKET_OPEN_DAYS.includes(item));
+    return Array.from(new Set(normalized));
+  }
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return [];
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) return normalizeOpenDays(parsed);
+    } catch {}
+    return normalizeOpenDays(text.split(','));
+  }
+  return [];
 }
 const imageUpload = multer({
   storage: multer.diskStorage({
@@ -143,8 +164,8 @@ const bookingImportUpload = multer({
   limits: { files: 1, fileSize: 2 * 1024 * 1024 },
   fileFilter(req, file, callback) {
     const extension = path.extname(file.originalname || '').toLowerCase();
-    const allowed = new Set(['.xlsx', '.xls', '.csv']);
-    if (!allowed.has(extension)) return callback(badRequest('Only XLSX, XLS, or CSV files are allowed'));
+    const allowed = new Set(['.xlsx', '.csv']);
+    if (!allowed.has(extension)) return callback(badRequest('Only XLSX or CSV files are allowed'));
     return callback(null, true);
   },
 });
@@ -557,6 +578,11 @@ async function linkSupportEventLogs(conn, { organizationId, ticketId, eventLogId
 }
 
 function normalizeCell(value) {
+  if (value && typeof value === 'object') {
+    if (value.text) return String(value.text).trim();
+    if (value.result !== undefined) return normalizeCell(value.result);
+    if (Array.isArray(value.richText)) return value.richText.map((part) => part.text || '').join('').trim();
+  }
   return String(value ?? '').trim();
 }
 
@@ -564,11 +590,13 @@ function normalizeBookingDateCell(value) {
   if (value instanceof Date && !Number.isNaN(value.getTime())) {
     return value.toISOString().slice(0, 10);
   }
+  if (value && typeof value === 'object' && value.result) {
+    return normalizeBookingDateCell(value.result);
+  }
   if (typeof value === 'number' && Number.isFinite(value)) {
-    const parsed = XLSX.SSF.parse_date_code(value);
-    if (parsed?.y && parsed?.m && parsed?.d) {
-      return `${parsed.y}-${String(parsed.m).padStart(2, '0')}-${String(parsed.d).padStart(2, '0')}`;
-    }
+    const excelEpoch = Date.UTC(1899, 11, 30);
+    const parsedDate = new Date(excelEpoch + value * 24 * 60 * 60 * 1000);
+    if (!Number.isNaN(parsedDate.getTime())) return parsedDate.toISOString().slice(0, 10);
   }
   const raw = normalizeCell(value);
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
@@ -585,20 +613,48 @@ function dateOnly(value) {
   return String(value).slice(0, 10);
 }
 
-function bookingImportRowsFromWorkbook(fileBuffer) {
-  const workbook = XLSX.read(fileBuffer, { type: 'buffer', cellDates: true });
-  const firstSheetName = workbook.SheetNames[0];
-  if (!firstSheetName) throw badRequest('Excel file has no sheet');
-  const worksheet = workbook.Sheets[firstSheetName];
-  const rows = XLSX.utils.sheet_to_json(worksheet, { defval: '', raw: false });
-  return rows
-    .map((row, index) => ({
-      rowNumber: index + 2,
-      customerIdentifier: normalizeCell(row.customer_identifier || row.customerIdentifier || row['รหัสลูกค้า/อีเมล/เบอร์โทร']),
-      bookingDate: normalizeBookingDateCell(row.booking_date || row.bookingDate || row['วันที่จอง']),
-      boothCode: normalizeCell(row.booth_code || row.boothCode || row['รหัสบูธ']),
-      productName: normalizeCell(row.product_name || row.productName || row['สินค้า']),
-      note: normalizeCell(row.note || row['หมายเหตุ']),
+function normalizeHeader(value) {
+  return normalizeCell(value).replace(/\s+/g, '_').toLowerCase();
+}
+
+function worksheetRowsToObjects(worksheet) {
+  const headerRow = worksheet.getRow(1);
+  const headers = [];
+  headerRow.eachCell({ includeEmpty: true }, (cell, columnNumber) => {
+    headers[columnNumber] = normalizeHeader(cell.value);
+  });
+
+  const rows = [];
+  worksheet.eachRow({ includeEmpty: false }, (row, rowNumber) => {
+    if (rowNumber === 1) return;
+    const record = {};
+    row.eachCell({ includeEmpty: true }, (cell, columnNumber) => {
+      const key = headers[columnNumber];
+      if (key) record[key] = cell.value;
+    });
+    rows.push({ rowNumber, record });
+  });
+  return rows;
+}
+
+async function bookingImportRowsFromWorkbook(file) {
+  const extension = path.extname(file.originalname || '').toLowerCase();
+  const workbook = new ExcelJS.Workbook();
+  if (extension === '.csv') {
+    await workbook.csv.read(Readable.from([file.buffer]));
+  } else {
+    await workbook.xlsx.load(file.buffer);
+  }
+  const worksheet = workbook.worksheets[0];
+  if (!worksheet) throw badRequest('Excel file has no sheet');
+  return worksheetRowsToObjects(worksheet)
+    .map(({ rowNumber, record }) => ({
+      rowNumber,
+      customerIdentifier: normalizeCell(record.customer_identifier || record.customeridentifier || record['รหัสลูกค้า/อีเมล/เบอร์โทร']),
+      bookingDate: normalizeBookingDateCell(record.booking_date || record.bookingdate || record['วันที่จอง']),
+      boothCode: normalizeCell(record.booth_code || record.boothcode || record['รหัสบูธ']),
+      productName: normalizeCell(record.product_name || record.productname || record['สินค้า']),
+      note: normalizeCell(record.note || record['หมายเหตุ']),
     }))
     .filter((row) => row.customerIdentifier || row.bookingDate || row.boothCode || row.productName);
 }
@@ -673,7 +729,7 @@ async function createMobileNotification(conn, {
   body,
   data,
 }) {
-  await conn.execute(
+  const [result] = await conn.execute(
     `INSERT INTO mobile_notifications (
       organization_id, mobile_user_id, title, body, data_json, channel, status
     ) VALUES (
@@ -687,6 +743,7 @@ async function createMobileNotification(conn, {
       dataJson: toJson(data),
     },
   );
+  return result.insertId;
 }
 
 async function createManagementBooking(conn, {
@@ -796,7 +853,7 @@ async function createManagementBooking(conn, {
   }
 
   if (notify) {
-    await createMobileNotification(conn, {
+    const notificationId = await createMobileNotification(conn, {
       organizationId,
       mobileUserId,
       title: 'มีรายการจองรอชำระเงิน',
@@ -810,6 +867,15 @@ async function createManagementBooking(conn, {
         expiresAt,
       },
     });
+    return {
+      id: booking.insertId,
+      publicId: publicBookingId,
+      expiresAt,
+      ...totals,
+      paymentRequiredInMobile: true,
+      notificationQueued: true,
+      notificationId,
+    };
   }
 
   return {
@@ -818,7 +884,7 @@ async function createManagementBooking(conn, {
     expiresAt,
     ...totals,
     paymentRequiredInMobile: true,
-    notificationQueued: notify,
+    notificationQueued: false,
   };
 }
 
@@ -2336,7 +2402,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const rows = await query(
       `SELECT m.id, m.code, m.name, m.description, m.main_image_url, m.address, m.opening_hours, m.phone, m.line_id, m.email, m.terms,
-              m.status, m.open_date, m.close_date
+              m.status, m.open_date, m.close_date, m.open_days_json
        FROM markets m
        LEFT JOIN admin_market_assignments ama
          ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
@@ -2349,7 +2415,10 @@ router.get(
         hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
       },
     );
-    return ok(res, rows);
+    return ok(res, rows.map((row) => ({
+      ...row,
+      open_days_json: normalizeOpenDays(row.open_days_json),
+    })));
   }),
 );
 
@@ -2376,6 +2445,7 @@ router.patch(
           description: z.string().optional().default(''),
           address: z.string().optional().default(''),
           openingHours: z.string().optional().default(''),
+          openDays: z.any().optional(),
           phone: z.string().optional().default(''),
           lineId: z.string().optional().default(''),
           email: z.string().optional().default(''),
@@ -2394,6 +2464,7 @@ router.patch(
     const current = currentRows[0];
     if (!current) throw notFound('Market not found');
     const mainImageUrl = req.file ? publicUploadUrl(req, req.file.path) : current.main_image_url;
+    const openDays = normalizeOpenDays(body.openDays);
     await query(
       `UPDATE markets
        SET name = COALESCE(:name, name),
@@ -2401,6 +2472,7 @@ router.patch(
            main_image_url = :mainImageUrl,
            address = :address,
            opening_hours = :openingHours,
+           open_days_json = :openDaysJson,
            phone = :phone,
            line_id = :lineId,
            email = :email,
@@ -2414,6 +2486,7 @@ router.patch(
         mainImageUrl,
         address: body.address,
         openingHours: body.openingHours,
+        openDaysJson: JSON.stringify(openDays.length ? openDays : ALL_MARKET_OPEN_DAYS),
         phone: body.phone,
         lineId: body.lineId,
         email: body.email,
@@ -3112,6 +3185,7 @@ router.post(
           description: z.string().optional().default(''),
           openDate: z.string().optional().nullable(),
           closeDate: z.string().optional().nullable(),
+          openDays: z.any().optional(),
         }),
       })
       .parse({ body: req.body });
@@ -3119,9 +3193,10 @@ router.post(
     const code = String(body.code || '').trim() || await buildNextMarketCode(req.auth.organizationId);
     const mainImageUrl = req.file ? publicUploadUrl(req, req.file.path) : null;
     await assertPlanQuota(req.auth.organizationId, 'market_management', 1);
+    const openDays = normalizeOpenDays(body.openDays);
     const result = await query(
-      `INSERT INTO markets (organization_id, code, name, description, main_image_url, open_date, close_date, status)
-       VALUES (:organizationId, :code, :name, :description, :mainImageUrl, :openDate, :closeDate, 'active')`,
+      `INSERT INTO markets (organization_id, code, name, description, main_image_url, open_date, close_date, open_days_json, status)
+       VALUES (:organizationId, :code, :name, :description, :mainImageUrl, :openDate, :closeDate, :openDaysJson, 'active')`,
       {
         organizationId: req.auth.organizationId,
         code,
@@ -3130,6 +3205,7 @@ router.post(
         mainImageUrl,
         openDate: body.openDate || null,
         closeDate: body.closeDate || null,
+        openDaysJson: JSON.stringify(openDays.length ? openDays : ALL_MARKET_OPEN_DAYS),
       },
     );
     clearPublicReadCache();
@@ -3281,6 +3357,9 @@ router.post(
         notify: true,
       });
     });
+    if (result.notificationId) {
+      sendMobilePushNotification(result.notificationId).catch(() => undefined);
+    }
 
     return created(res, result, 'management booking created');
   }),
@@ -3301,7 +3380,7 @@ router.post(
   asyncHandler(async (req, res) => {
     if (!req.file?.buffer) throw badRequest('Excel file is required');
     const marketId = req.validated.params.marketId;
-    const rows = bookingImportRowsFromWorkbook(req.file.buffer);
+    const rows = await bookingImportRowsFromWorkbook(req.file);
     if (!rows.length) throw badRequest('Excel file has no booking rows');
     if (rows.length > 500) throw badRequest('Import supports up to 500 rows per file');
     await assertPlanQuota(req.auth.organizationId, 'booking_management', rows.length);
@@ -3367,6 +3446,9 @@ router.post(
             ...booking,
           };
         });
+        if (result.notificationId) {
+          sendMobilePushNotification(result.notificationId).catch(() => undefined);
+        }
         successes.push(result);
       } catch (error) {
         for (const row of groupRows) {
@@ -4180,7 +4262,8 @@ router.patch(
         `SELECT p.id, p.public_id, p.booking_id, p.audit_check_id, p.amount, p.status,
                 b.status AS booking_status, b.expires_at,
                 ac.fine_payment_status,
-                COALESCE(b.market_id, ac.market_id) AS market_id
+                COALESCE(b.market_id, ac.market_id) AS market_id,
+                COALESCE(b.mobile_user_id, ac_b.mobile_user_id) AS mobile_user_id
          FROM payments p
          LEFT JOIN bookings b
            ON b.id = p.booking_id
@@ -4188,6 +4271,12 @@ router.patch(
          LEFT JOIN audit_checks ac
            ON ac.id = p.audit_check_id
           AND ac.organization_id = p.organization_id
+         LEFT JOIN booking_items ac_bi
+           ON ac_bi.id = ac.booking_item_id
+          AND ac_bi.organization_id = ac.organization_id
+         LEFT JOIN bookings ac_b
+           ON ac_b.id = ac_bi.booking_id
+          AND ac_b.organization_id = ac_bi.organization_id
          LEFT JOIN admin_market_assignments ama
            ON ama.market_id = COALESCE(b.market_id, ac.market_id)
           AND ama.admin_user_id = :adminUserId
@@ -4307,14 +4396,46 @@ router.patch(
         }
       }
 
+      let notificationId = null;
+      if (payment.mobile_user_id) {
+        const paid = req.validated.body.status === 'paid';
+        const [notification] = await conn.execute(
+          `INSERT INTO mobile_notifications (
+            organization_id, mobile_user_id, title, body, data_json, channel, status
+          ) VALUES (
+            :organizationId, :mobileUserId, :title, :body, :dataJson, 'in_app', 'unread'
+          )`,
+          {
+            organizationId: req.auth.organizationId,
+            mobileUserId: payment.mobile_user_id,
+            title: paid ? 'ตรวจสอบการชำระเงินสำเร็จ' : 'หลักฐานการชำระเงินไม่ผ่าน',
+            body: paid
+              ? `รายการชำระเงิน ${payment.public_id} ได้รับการอนุมัติแล้ว`
+              : `รายการชำระเงิน ${payment.public_id} ไม่ผ่านการตรวจสอบ กรุณาดำเนินการใหม่`,
+            dataJson: JSON.stringify({
+              type: paid ? 'payment_approved' : 'payment_rejected',
+              paymentId: payment.id,
+              bookingId: payment.booking_id,
+              auditCheckId: payment.audit_check_id,
+              marketId: payment.market_id,
+            }),
+          },
+        );
+        notificationId = notification.insertId;
+      }
+
       return {
         id: payment.id,
         publicId: payment.public_id,
         bookingId: payment.booking_id,
         auditCheckId: payment.audit_check_id,
         status: req.validated.body.status,
+        notificationId,
       };
     });
+    if (result.notificationId) {
+      sendMobilePushNotification(result.notificationId).catch(() => undefined);
+    }
 
     return ok(res, result, 'payment proof reviewed');
   }),
