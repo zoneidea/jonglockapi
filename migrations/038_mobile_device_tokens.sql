@@ -1,0 +1,21 @@
+CREATE TABLE IF NOT EXISTS mobile_device_tokens (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+  organization_id BIGINT UNSIGNED NOT NULL,
+  mobile_user_id BIGINT UNSIGNED NOT NULL,
+  public_profile_id BIGINT UNSIGNED NULL,
+  fcm_token VARCHAR(512) NOT NULL,
+  platform ENUM('ios','android','unknown') NOT NULL DEFAULT 'unknown',
+  device_id VARCHAR(191) NULL,
+  app_version VARCHAR(50) NULL,
+  status ENUM('active','inactive') NOT NULL DEFAULT 'active',
+  last_seen_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (id),
+  UNIQUE KEY uq_mobile_device_tokens_token (fcm_token),
+  KEY idx_mobile_device_tokens_user (organization_id, mobile_user_id, status, last_seen_at),
+  KEY idx_mobile_device_tokens_profile (public_profile_id, status),
+  CONSTRAINT fk_mobile_device_tokens_org FOREIGN KEY (organization_id) REFERENCES organizations(id),
+  CONSTRAINT fk_mobile_device_tokens_user FOREIGN KEY (mobile_user_id) REFERENCES mobile_users(id),
+  CONSTRAINT fk_mobile_device_tokens_profile FOREIGN KEY (public_profile_id) REFERENCES public_user_profiles(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

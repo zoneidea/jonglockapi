@@ -66,11 +66,18 @@ function getFirebaseAuth() {
   return firebaseAdmin.auth();
 }
 
+function getFirebaseMessaging() {
+  const firebaseAdmin = ensureFirebaseApp();
+  if (!firebaseAdmin) return null;
+  return firebaseAdmin.messaging();
+}
+
 function getFirebaseInitReason() {
   return initSkippedReason || 'Firebase Admin is not initialized';
 }
 
 module.exports = {
   getFirebaseAuth,
+  getFirebaseMessaging,
   getFirebaseInitReason,
 };
