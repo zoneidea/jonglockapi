@@ -4,7 +4,6 @@ const path = require('path');
 const { Readable } = require('stream');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
-const ExcelJS = require('exceljs');
 const { z } = require('zod');
 const { query, transaction } = require('../../config/db');
 const { authenticate } = require('../../middlewares/auth');
@@ -14,7 +13,7 @@ const { clearResponseCache } = require('../../middlewares/response-cache');
 const { ROLES, MENU_ACCESS } = require('../../constants/roles');
 const { asyncHandler } = require('../../utils/async-handler');
 const { ok, created } = require('../../utils/api-response');
-const { badRequest, conflict, notFound } = require('../../utils/errors');
+const { AppError, badRequest, conflict, notFound } = require('../../utils/errors');
 const { encryptField, blindIndex, decryptField } = require('../../utils/crypto');
 const { publicId } = require('../../utils/id');
 const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/password-policy');
@@ -35,6 +34,17 @@ const authService = require('../auth/auth.service');
 const router = express.Router();
 const uploadRoot = path.join(__dirname, '..', '..', '..', 'uploads');
 const allowedImageTypes = new Set(['image/jpeg', 'image/png', 'image/webp', 'image/gif']);
+
+function getExcelJS() {
+  try {
+    return require('exceljs');
+  } catch (error) {
+    if (error?.code === 'MODULE_NOT_FOUND') {
+      throw new AppError(503, 'Excel import/export is not available. Please install backend dependencies with npm install.', 'EXCELJS_NOT_INSTALLED');
+    }
+    throw error;
+  }
+}
 
 function clearPublicReadCache() {
   clearResponseCache('public:markets');
@@ -665,6 +675,7 @@ function worksheetRowsToObjects(worksheet) {
 
 async function bookingImportRowsFromWorkbook(file) {
   const extension = path.extname(file.originalname || '').toLowerCase();
+  const ExcelJS = getExcelJS();
   const workbook = new ExcelJS.Workbook();
   if (extension === '.csv') {
     await workbook.csv.read(Readable.from([file.buffer]));
