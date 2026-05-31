@@ -1,5 +1,6 @@
 const { query } = require('../config/db');
 const { forbidden } = require('../utils/errors');
+const { publicId } = require('../utils/id');
 
 const FEATURE_BY_PATH = [
   [/^\/organization-settings/, 'organization_settings'],
@@ -60,8 +61,57 @@ function resolveFeatureFromPath(path = '') {
   return matched?.[1] || 'dashboard';
 }
 
+async function ensureFreeTierSubscription(organizationId) {
+  const [plan] = await query(
+    `SELECT id, code, currency_code, trial_days, billing_interval_count,
+            included_markets, included_admin_users, included_active_booths, included_monthly_bookings
+     FROM subscription_plans
+     WHERE code = 'free_full_1y'
+       AND status = 'active'
+     LIMIT 1`,
+  );
+  if (!plan) return false;
+
+  await query(
+    `INSERT INTO organization_subscriptions (
+       subscription_code, organization_id, plan_id, status, billing_currency, billing_interval, billing_interval_count,
+       unit_price, setup_fee, discount_amount, vat_rate, subtotal_amount, vat_amount, total_amount,
+       included_markets, included_admin_users, included_active_booths, included_monthly_bookings,
+       trial_starts_at, trial_ends_at, current_period_start, current_period_end, next_billing_at, activated_at, metadata_json
+     )
+     SELECT
+       :subscriptionCode, :organizationId, :planId, 'trialing', :billingCurrency, 'yearly', :billingIntervalCount,
+       0, 0, 0, 0, 0, 0, 0,
+       :includedMarkets, :includedAdminUsers, :includedActiveBooths, :includedMonthlyBookings,
+       NOW(), DATE_ADD(NOW(), INTERVAL :trialDays DAY), NOW(), DATE_ADD(NOW(), INTERVAL :trialDays DAY), DATE_ADD(NOW(), INTERVAL :trialDays DAY), NOW(),
+       :metadataJson
+     FROM DUAL
+     WHERE NOT EXISTS (
+       SELECT 1
+       FROM organization_subscriptions os
+       WHERE os.organization_id = :organizationId
+         AND os.status IN ('pending_activation', 'trialing', 'active', 'past_due')
+     )`,
+    {
+      subscriptionCode: publicId('OSUB'),
+      organizationId,
+      planId: plan.id,
+      billingCurrency: plan.currency_code,
+      billingIntervalCount: Number(plan.billing_interval_count || 1),
+      includedMarkets: Number(plan.included_markets || 0),
+      includedAdminUsers: Number(plan.included_admin_users || 0),
+      includedActiveBooths: Number(plan.included_active_booths || 0),
+      includedMonthlyBookings: Number(plan.included_monthly_bookings || 0),
+      trialDays: Math.max(Number(plan.trial_days || 0), 1),
+      metadataJson: JSON.stringify({ source: 'auto_provision_free_tier', planCode: plan.code }),
+    },
+  );
+
+  return true;
+}
+
 async function getCurrentSubscription(organizationId) {
-  const rows = await query(
+  let rows = await query(
     `SELECT
         os.id, os.subscription_code, os.organization_id, os.status, os.billing_interval,
         os.trial_starts_at, os.trial_ends_at, os.current_period_start, os.current_period_end,
@@ -86,6 +136,35 @@ async function getCurrentSubscription(organizationId) {
      LIMIT 1`,
     { organizationId },
   );
+
+  if (!rows.length) {
+    await ensureFreeTierSubscription(organizationId);
+    rows = await query(
+      `SELECT
+          os.id, os.subscription_code, os.organization_id, os.status, os.billing_interval,
+          os.trial_starts_at, os.trial_ends_at, os.current_period_start, os.current_period_end,
+          os.next_billing_at, os.activated_at, os.cancelled_at,
+          p.id AS plan_id, p.code AS plan_code, p.name AS plan_name, p.description AS plan_description,
+          p.trial_days, p.grace_period_days, p.currency_code, p.base_price, p.price_display_label,
+          p.included_markets, p.included_admin_users, p.included_active_booths, p.included_monthly_bookings,
+          p.is_free_tier, p.is_full_function, p.features_json
+       FROM organization_subscriptions os
+       JOIN subscription_plans p ON p.id = os.plan_id
+       WHERE os.organization_id = :organizationId
+       ORDER BY
+         CASE os.status
+           WHEN 'trialing' THEN 1
+           WHEN 'active' THEN 2
+           WHEN 'pending_activation' THEN 3
+           WHEN 'past_due' THEN 4
+           ELSE 9
+         END,
+         os.current_period_end DESC,
+         os.id DESC
+       LIMIT 1`,
+      { organizationId },
+    );
+  }
 
   if (!rows.length) {
     return {

@@ -23,6 +23,7 @@ const { getAppIconSettings } = require('../platform/platform.service');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
+const PUBLIC_SIGNUP_PLAN_CODE = 'free_full_1y';
 const cachePublicMarkets = cacheResponse({ namespace: 'public:markets', ttlSeconds: 60, maxEntries: 300 });
 const cachePublicAnnouncements = cacheResponse({ namespace: 'public:announcements', ttlSeconds: 30, maxEntries: 100 });
 const cachePublicAppConfig = cacheResponse({ namespace: 'public:app-config', ttlSeconds: 60, maxEntries: 10 });
@@ -2961,7 +2962,7 @@ router.post(
         password: z.string().min(10).refine(assertPasswordPolicy, PASSWORD_POLICY_MESSAGE),
         marketCountEstimate: z.coerce.number().int().min(1).max(999).optional().default(1),
         expectedGoLiveDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().or(z.literal('')).default(''),
-        preferredPlanCode: z.string().min(1).max(50).optional().default('free_full_1y'),
+        preferredPlanCode: z.string().min(1).max(50).optional().default(PUBLIC_SIGNUP_PLAN_CODE),
         preferredBillingInterval: z.enum(['monthly', 'yearly']).optional().default('yearly'),
         notes: z.string().max(2000).optional().or(z.literal('')).default(''),
       }),
@@ -2979,7 +2980,7 @@ router.post(
          WHERE code = :code
            AND status = 'active'
          LIMIT 1`,
-        { code: body.preferredPlanCode },
+        { code: PUBLIC_SIGNUP_PLAN_CODE },
       );
       const plan = plans[0];
       if (!plan) throw conflict('Selected subscription plan is not available');
