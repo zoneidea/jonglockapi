@@ -3067,6 +3067,77 @@ router.patch(
   }),
 );
 
+router.delete(
+  '/markets/:marketId/booths/:boothId',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({}).passthrough(),
+      params: z.object({
+        marketId: z.coerce.number().int().positive(),
+        boothId: z.coerce.number().int().positive(),
+      }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { marketId, boothId } = req.validated.params;
+    await expireStaleBookings({ execute: query }, req.auth.organizationId);
+
+    const boothRows = await query(
+      `SELECT id, status
+       FROM booths
+       WHERE id = :boothId
+         AND organization_id = :organizationId
+         AND market_id = :marketId
+       LIMIT 1`,
+      { organizationId: req.auth.organizationId, marketId, boothId },
+    );
+    if (!boothRows[0]) throw notFound('Booth not found');
+    if (boothRows[0].status === 'deleted') return ok(res, { id: boothId, status: 'deleted' }, 'booth already deleted');
+
+    const blockerRows = await query(
+      `SELECT
+         SUM(CASE WHEN bk.id IS NOT NULL THEN 1 ELSE 0 END) AS blocking_booking_items,
+         SUM(CASE WHEN bdl.id IS NOT NULL THEN 1 ELSE 0 END) AS blocking_locks
+       FROM booths bo
+       LEFT JOIN booking_items bi
+         ON bi.booth_id = bo.id
+        AND bi.organization_id = bo.organization_id
+        AND bi.status IN ('pending_payment', 'payment_processing', 'paid')
+       LEFT JOIN bookings bk
+         ON bk.id = bi.booking_id
+        AND bk.organization_id = bi.organization_id
+        AND bk.status IN ('pending_payment', 'payment_processing', 'paid')
+       LEFT JOIN booth_date_locks bdl
+         ON bdl.booth_id = bo.id
+        AND bdl.organization_id = bo.organization_id
+        AND bdl.status IN ('held', 'processing', 'paid')
+       WHERE bo.id = :boothId
+         AND bo.organization_id = :organizationId
+         AND bo.market_id = :marketId`,
+      { organizationId: req.auth.organizationId, marketId, boothId },
+    );
+    const blockers = blockerRows[0] || {};
+    if (Number(blockers.blocking_booking_items || 0) > 0 || Number(blockers.blocking_locks || 0) > 0) {
+      throw conflict('Booth cannot be deleted because it has paid or in-progress bookings');
+    }
+
+    const result = await query(
+      `UPDATE booths
+       SET status = 'deleted'
+       WHERE id = :boothId
+         AND organization_id = :organizationId
+         AND market_id = :marketId`,
+      { organizationId: req.auth.organizationId, marketId, boothId },
+    );
+    if (!result.affectedRows) throw notFound('Booth not found');
+    clearPublicReadCache();
+    return ok(res, { id: boothId, status: 'deleted' }, 'booth deleted');
+  }),
+);
+
 router.patch(
   '/markets/:marketId/booths/:boothId',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
