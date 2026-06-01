@@ -3048,18 +3048,6 @@ router.post(
         throw conflict('This email already has an active signup request');
       }
 
-      const [existingUsernameRows] = await conn.execute(
-        `SELECT au.id
-         FROM admin_users au
-         JOIN organizations o ON o.id = au.organization_id
-         WHERE au.username_hash = :usernameHash
-         LIMIT 1`,
-        { usernameHash: blindIndex(body.supervisorUsername) },
-      );
-      if (existingUsernameRows.length) {
-        throw conflict('Supervisor username is already in use');
-      }
-
       const requestNo = publicId('SUB');
       const subscriptionCode = publicId('OSUB');
       const organizationCode = await generateOrganizationCode(conn, body.companyName);
