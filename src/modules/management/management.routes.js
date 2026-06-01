@@ -2148,10 +2148,9 @@ router.get(
     const rows = await query(
       `SELECT id, name, status, created_at
        FROM tenant_types
-       WHERE organization_id = :organizationId
-         AND name IN ('บุคคลธรรมดา', 'นิติบุคคล')
+       WHERE name IN ('บุคคลธรรมดา', 'นิติบุคคล')
        ORDER BY FIELD(name, 'บุคคลธรรมดา', 'นิติบุคคล')`,
-      { organizationId: req.auth.organizationId },
+      {},
     );
     return ok(res, rows);
   }),
@@ -2171,25 +2170,25 @@ router.post(
     const existing = await query(
       `SELECT id
        FROM tenant_types
-       WHERE organization_id = :organizationId AND name = :name
+       WHERE name = :name
        LIMIT 1`,
-      { organizationId: req.auth.organizationId, name: req.validated.body.name },
+      { name: req.validated.body.name },
     );
 
     if (existing[0]) {
       await query(
         `UPDATE tenant_types
          SET status = :status
-         WHERE id = :id AND organization_id = :organizationId`,
-        { organizationId: req.auth.organizationId, id: existing[0].id, status: req.validated.body.status },
+         WHERE id = :id`,
+        { id: existing[0].id, status: req.validated.body.status },
       );
       return ok(res, { id: existing[0].id }, 'tenant type updated');
     }
 
     const result = await query(
       `INSERT INTO tenant_types (organization_id, name, status)
-       VALUES (:organizationId, :name, :status)`,
-      { organizationId: req.auth.organizationId, ...req.validated.body },
+       VALUES (NULL, :name, :status)`,
+      req.validated.body,
     );
     return created(res, { id: result.insertId }, 'tenant type created');
   }),
@@ -2204,7 +2203,7 @@ router.get(
               mu.first_name_enc, mu.last_name_enc, mu.phone_enc, mu.email_enc, mu.id_card_enc, mu.address_enc,
               mu.status, mu.accepted_consent_at, mu.created_at
        FROM mobile_users mu
-       LEFT JOIN tenant_types tt ON tt.id = mu.tenant_type_id AND tt.organization_id = mu.organization_id
+       LEFT JOIN tenant_types tt ON tt.id = mu.tenant_type_id
        WHERE mu.organization_id = :organizationId
        ORDER BY mu.created_at DESC
        LIMIT 500`,
@@ -2252,6 +2251,15 @@ router.post(
   ),
   asyncHandler(async (req, res) => {
     const body = req.validated.body;
+    const [tenantType] = await query(
+      `SELECT id
+       FROM tenant_types
+       WHERE id = :tenantTypeId AND status = 'active'
+       LIMIT 1`,
+      { tenantTypeId: body.tenantTypeId },
+    );
+    if (!tenantType) throw badRequest('Invalid tenant type');
+
     const result = await query(
       `INSERT INTO mobile_users (
         organization_id, tenant_type_id, public_id, username_enc, username_hash, password_hash,
@@ -2307,6 +2315,15 @@ router.patch(
   asyncHandler(async (req, res) => {
     const body = req.validated.body;
     const tenantId = req.validated.params.tenantId;
+    const [tenantType] = await query(
+      `SELECT id
+       FROM tenant_types
+       WHERE id = :tenantTypeId AND status = 'active'
+       LIMIT 1`,
+      { tenantTypeId: body.tenantTypeId },
+    );
+    if (!tenantType) throw badRequest('Invalid tenant type');
+
     const passwordSql = body.password ? ', password_hash = :passwordHash' : '';
     const params = {
       organizationId: req.auth.organizationId,

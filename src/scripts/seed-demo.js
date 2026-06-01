@@ -156,10 +156,10 @@ async function upsertTenantType(connection, organizationId, name) {
     connection,
     `SELECT id
      FROM tenant_types
-     WHERE organization_id = :organizationId AND name = :name
+     WHERE name = :name
      ORDER BY id
      LIMIT 1`,
-    { organizationId, name },
+    { name },
   );
 
   if (existing) {
@@ -167,8 +167,8 @@ async function upsertTenantType(connection, organizationId, name) {
       connection,
       `UPDATE tenant_types
        SET status = 'active'
-       WHERE id = :id AND organization_id = :organizationId`,
-      { organizationId, id: existing.id },
+       WHERE id = :id`,
+      { id: existing.id },
     );
     return existing;
   }
@@ -176,17 +176,17 @@ async function upsertTenantType(connection, organizationId, name) {
   await exec(
     connection,
     `INSERT INTO tenant_types (organization_id, name, status)
-     VALUES (:organizationId, :name, 'active')
+     VALUES (NULL, :name, 'active')
      `,
-    { organizationId, name },
+    { name },
   );
 
   return one(
     connection,
     `SELECT id FROM tenant_types
-     WHERE organization_id = :organizationId AND name = :name
+     WHERE name = :name
      LIMIT 1`,
-    { organizationId, name },
+    { name },
   );
 }
 
