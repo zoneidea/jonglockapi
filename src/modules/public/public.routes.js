@@ -124,6 +124,7 @@ function mapMarket(row) {
   return {
     id: row.id,
     organizationId: row.organization_id,
+    organizationCode: row.organization_code || '',
     code: row.code,
     name: row.name,
     description: row.description || '',
@@ -454,7 +455,7 @@ router.get(
 
     const rows = await query(
       `SELECT
-          m.id, m.organization_id, m.code, m.name, m.description, m.terms, m.main_image_url,
+          m.id, m.organization_id, o.code AS organization_code, m.code, m.name, m.description, m.terms, m.main_image_url,
           m.address, m.opening_hours, m.open_days_json, m.phone, m.line_id, m.email, m.open_date, m.close_date,
           EXISTS (
             SELECT 1
@@ -498,7 +499,7 @@ router.get(
     const marketId = Number(req.params.marketId);
     const rows = await query(
       `SELECT
-          m.id, m.organization_id, m.code, m.name, m.description, m.terms, m.main_image_url,
+          m.id, m.organization_id, o.code AS organization_code, m.code, m.name, m.description, m.terms, m.main_image_url,
           m.address, m.opening_hours, m.open_days_json, m.phone, m.line_id, m.email, m.open_date, m.close_date,
           EXISTS (
             SELECT 1
