@@ -3291,14 +3291,25 @@ router.post(
       ? files.map((file, index) => ({
         title: files.length === 1 ? parsed.body.title : parsed.body.title || file.originalname,
         imageUrl: publicUploadUrl(req, file.path),
-        sortOrder: parsed.body.sortOrder + index,
+        sortIndex: index,
         status: parsed.body.status,
       }))
-      : [{ title: parsed.body.title, imageUrl: parsed.body.imageUrl, sortOrder: parsed.body.sortOrder, status: parsed.body.status }];
+      : [{ title: parsed.body.title, imageUrl: parsed.body.imageUrl, sortIndex: 0, status: parsed.body.status }];
 
     const inserted = await transaction(async (connection) => {
+      const [sortRows] = await connection.execute(
+        `SELECT COALESCE(MAX(sort_order), -1) AS max_sort_order
+         FROM market_images
+         WHERE organization_id = :organizationId AND market_id = :marketId`,
+        {
+          organizationId: req.auth.organizationId,
+          marketId: parsed.params.marketId,
+        },
+      );
+      const nextSortOrder = Number(sortRows[0]?.max_sort_order ?? -1) + 1;
       const results = [];
       for (const record of records) {
+        const sortOrder = nextSortOrder + record.sortIndex;
         const [result] = await connection.execute(
           `INSERT INTO market_images (organization_id, market_id, title, image_url, sort_order, status)
            VALUES (:organizationId, :marketId, :title, :imageUrl, :sortOrder, :status)`,
@@ -3307,11 +3318,11 @@ router.post(
             marketId: parsed.params.marketId,
             title: record.title,
             imageUrl: record.imageUrl,
-            sortOrder: record.sortOrder,
+            sortOrder,
             status: record.status,
           },
         );
-        results.push({ id: result.insertId, ...record });
+        results.push({ id: result.insertId, title: record.title, imageUrl: record.imageUrl, sortOrder, status: record.status });
       }
       return results;
     });
