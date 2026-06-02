@@ -22,29 +22,38 @@ const app = express();
 
 app.set('trust proxy', 1);
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
-app.use(
-  cors({
-    origin(origin, callback) {
-      if (!origin) return callback(null, true);
-      if (env.corsOrigins === '*' || env.corsOrigins.includes(origin)) return callback(null, true);
+if (env.CORS_ORIGIN_SOURCE === 'proxy') {
+  app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, X-Cron-Secret');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    return next();
+  });
+} else {
+  app.use(
+    cors({
+      origin(origin, callback) {
+        if (!origin) return callback(null, true);
+        if (env.corsOrigins === '*' || env.corsOrigins.includes(origin)) return callback(null, true);
 
-      try {
-        const hostname = new URL(origin).hostname;
-        if (
-          hostname === 'localhost'
-          || hostname === 'jonglock.com'
-          || hostname.endsWith('.jonglock.com')
-          || hostname.endsWith('.zonedevnode.com')
-        ) return callback(null, true);
-      } catch (error) {
-        return callback(error);
-      }
+        try {
+          const hostname = new URL(origin).hostname;
+          if (
+            hostname === 'localhost'
+            || hostname === 'jonglock.com'
+            || hostname.endsWith('.jonglock.com')
+            || hostname.endsWith('.zonedevnode.com')
+          ) return callback(null, true);
+        } catch (error) {
+          return callback(error);
+        }
 
-      return callback(null, false);
-    },
-    credentials: true,
-  }),
-);
+        return callback(null, false);
+      },
+      credentials: true,
+    }),
+  );
+}
 app.use(compression());
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
