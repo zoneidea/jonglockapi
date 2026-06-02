@@ -30,7 +30,12 @@ app.use(
 
       try {
         const hostname = new URL(origin).hostname;
-        if (hostname === 'localhost' || hostname.endsWith('.zonedevnode.com')) return callback(null, true);
+        if (
+          hostname === 'localhost'
+          || hostname === 'jonglock.com'
+          || hostname.endsWith('.jonglock.com')
+          || hostname.endsWith('.zonedevnode.com')
+        ) return callback(null, true);
       } catch (error) {
         return callback(error);
       }

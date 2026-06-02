@@ -1,0 +1,27 @@
+# Jonglock Backend Domains
+
+## UAT
+
+- API host: `https://jonglockapi.zonedevnode.com`
+- Public API: `https://jonglockapi.zonedevnode.com/api/public`
+- Management API: `https://jonglockapi.zonedevnode.com/management` or `/api/management`
+- Platform API: `https://jonglockapi.zonedevnode.com/platform` or `/api/platform`
+- Allowed app origins: `https://jonglock.zonedevnode.com`, `https://jonglockmng.zonedevnode.com`
+
+## Production
+
+- API host: `https://api.jonglock.com`
+- Public API: `https://api.jonglock.com/api/public`
+- Management API: `https://api.jonglock.com/management` or `/api/management`
+- Platform API: `https://api.jonglock.com/platform` or `/api/platform`
+- Allowed app origins: `https://jonglock.com`, `https://mng.jonglock.com`, `https://platform.jonglock.com`
+
+## CORS
+
+Production example:
+
+```bash
+CORS_ORIGINS=https://jonglock.com,https://mng.jonglock.com,https://platform.jonglock.com
+```
+
+The server also allows `localhost`, `*.zonedevnode.com`, `jonglock.com`, and `*.jonglock.com` as a guarded fallback in `src/app.js`.
