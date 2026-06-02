@@ -1,6 +1,7 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 const multer = require('multer');
 const { z } = require('zod');
@@ -52,6 +53,12 @@ const profileUpload = multer({
     return callback(null, true);
   },
 });
+
+function hashText(value) {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  return crypto.createHash('sha256').update(text).digest('hex');
+}
 
 const storeProfileUpload = multer({
   storage: multer.diskStorage({
@@ -2934,6 +2941,56 @@ router.get(
   }),
 );
 
+router.post(
+  '/subscription/page-view',
+  validate(
+    z.object({
+      body: z.object({
+        visitorKey: z.string().min(12).max(120).regex(/^[A-Za-z0-9._:-]+$/),
+        path: z.string().max(255).optional().or(z.literal('')).default('/'),
+        referrer: z.string().max(500).optional().or(z.literal('')).default(''),
+      }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const visitorKey = req.body.visitorKey;
+    const pagePath = String(req.body.path || '/').slice(0, 255);
+    const referrer = String(req.body.referrer || '').slice(0, 500);
+    const forwardedFor = String(req.get('x-forwarded-for') || '').split(',')[0].trim();
+    const ipAddress = forwardedFor || req.ip || '';
+    const userAgent = req.get('user-agent') || '';
+
+    try {
+      await query(
+        `INSERT INTO landing_page_views (
+            view_date, visitor_key, path, referrer, user_agent_hash, ip_hash, view_count, first_seen_at, last_seen_at
+         ) VALUES (
+            CURRENT_DATE(), :visitorKey, :path, :referrer, :userAgentHash, :ipHash, 1, NOW(), NOW()
+         )
+         ON DUPLICATE KEY UPDATE
+            path = VALUES(path),
+            referrer = COALESCE(NULLIF(VALUES(referrer), ''), referrer),
+            user_agent_hash = VALUES(user_agent_hash),
+            ip_hash = VALUES(ip_hash),
+            view_count = view_count + 1,
+            last_seen_at = NOW()`,
+        {
+          visitorKey,
+          path: pagePath,
+          referrer,
+          userAgentHash: hashText(userAgent),
+          ipHash: hashText(ipAddress),
+        },
+      );
+    } catch (error) {
+      if (error?.code !== 'ER_NO_SUCH_TABLE') throw error;
+      return ok(res, { tracked: false });
+    }
+
+    return ok(res, { tracked: true });
+  }),
+);
+
 router.get(
   '/subscription/overview',
   asyncHandler(async (req, res) => {
@@ -2952,6 +3009,22 @@ router.get(
               AND booking_date = CURRENT_DATE()) AS occupied_booths_today`,
     );
 
+    let landingMetrics = {
+      landing_visitors_today: 0,
+      landing_views_today: 0,
+      landing_visitors_total: 0,
+    };
+    try {
+      [landingMetrics] = await query(
+        `SELECT
+            (SELECT COUNT(*) FROM landing_page_views WHERE view_date = CURRENT_DATE()) AS landing_visitors_today,
+            (SELECT COALESCE(SUM(view_count), 0) FROM landing_page_views WHERE view_date = CURRENT_DATE()) AS landing_views_today,
+            (SELECT COUNT(*) FROM landing_page_views) AS landing_visitors_total`,
+      );
+    } catch (error) {
+      if (error?.code !== 'ER_NO_SUCH_TABLE') throw error;
+    }
+
     const activeBooths = Number(summary?.active_booths || 0);
     const occupiedBoothsToday = Number(summary?.occupied_booths_today || 0);
     const occupancyRateToday = activeBooths > 0
@@ -2968,6 +3041,9 @@ router.get(
       paidAmountToday: Number(summary?.paid_amount_today || 0),
       occupiedBoothsToday,
       occupancyRateToday,
+      landingVisitorsToday: Number(landingMetrics?.landing_visitors_today || 0),
+      landingViewsToday: Number(landingMetrics?.landing_views_today || 0),
+      landingVisitorsTotal: Number(landingMetrics?.landing_visitors_total || 0),
     });
   }),
 );
