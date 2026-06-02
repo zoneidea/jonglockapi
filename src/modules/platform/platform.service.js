@@ -316,6 +316,7 @@ async function listOrganizations(filters = {}) {
        SELECT organization_id, COUNT(*) AS admin_count
        FROM admin_users
        WHERE status <> 'inactive'
+         AND role <> 'supervisor'
        GROUP BY organization_id
      ) ac ON ac.organization_id = o.id
      LEFT JOIN (
@@ -410,6 +411,7 @@ async function getOrganizationDetail(organizationId) {
        SELECT organization_id, COUNT(*) AS admin_count
        FROM admin_users
        WHERE status <> 'inactive'
+         AND role <> 'supervisor'
        GROUP BY organization_id
      ) ac ON ac.organization_id = o.id
      LEFT JOIN (
@@ -578,6 +580,7 @@ async function listSubscriptions(filters = {}) {
        SELECT organization_id, COUNT(*) AS admin_count
        FROM admin_users
        WHERE status = 'active'
+         AND role <> 'supervisor'
        GROUP BY organization_id
      ) ac ON ac.organization_id = os.organization_id
      LEFT JOIN (
@@ -756,7 +759,7 @@ async function getSubscriptionDetail(subscriptionId) {
   const [usage] = await query(
     `SELECT
         (SELECT COUNT(*) FROM markets WHERE organization_id = :organizationId AND status = 'active') AS market_count,
-        (SELECT COUNT(*) FROM admin_users WHERE organization_id = :organizationId AND status = 'active') AS admin_count,
+        (SELECT COUNT(*) FROM admin_users WHERE organization_id = :organizationId AND status = 'active' AND role <> 'supervisor') AS admin_count,
         (SELECT COUNT(*) FROM booths WHERE organization_id = :organizationId AND status = 'active') AS active_booth_count,
         (
           SELECT COUNT(bi.id)

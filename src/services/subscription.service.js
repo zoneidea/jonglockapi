@@ -293,7 +293,8 @@ async function getQuotaUsage(organizationId, featureKey) {
       `SELECT COUNT(*) AS total
        FROM admin_users
        WHERE organization_id = :organizationId
-         AND status = 'active'`,
+         AND status = 'active'
+         AND role <> 'supervisor'`,
       { organizationId },
     );
     return Number(rows[0]?.total || 0);

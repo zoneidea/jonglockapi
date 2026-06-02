@@ -3023,13 +3023,15 @@ router.post(
     const body = req.validated.body;
     const supervisorName = `${body.supervisorFirstName} ${body.supervisorLastName}`.trim();
     const result = await transaction(async (conn) => {
+      const selectedPlanCode = body.preferredPlanCode || PUBLIC_SIGNUP_PLAN_CODE;
       const [plans] = await conn.execute(
         `SELECT *
          FROM subscription_plans
          WHERE code = :code
            AND status = 'active'
+           AND public_visible = 1
          LIMIT 1`,
-        { code: PUBLIC_SIGNUP_PLAN_CODE },
+        { code: selectedPlanCode },
       );
       const plan = plans[0];
       if (!plan) throw conflict('Selected subscription plan is not available');
@@ -3054,7 +3056,12 @@ router.post(
       const organizationCode = await generateOrganizationCode(conn, body.companyName);
       const now = new Date();
       const trialEndsAt = new Date(now.getTime() + Number(plan.trial_days || 0) * 24 * 60 * 60 * 1000);
-      const basePrice = Number(plan.base_price || 0);
+      const billingInterval = body.preferredBillingInterval;
+      const billingIntervalCount = billingInterval === 'yearly' ? 12 : 1;
+      const monthlyBasePrice = Number(plan.base_price || 0);
+      const basePrice = billingInterval === 'yearly'
+        ? Math.round(monthlyBasePrice * 12 * 0.85 * 100) / 100
+        : monthlyBasePrice;
       const setupFee = Number(plan.setup_fee || 0);
       const subtotalAmount = basePrice + setupFee;
       const vatRate = Number(plan.vat_applicable || 0) === 1 ? 7 : 0;
@@ -3163,7 +3170,7 @@ router.post(
           planId: plan.id,
           billingCurrency: plan.currency_code,
           billingInterval: body.preferredBillingInterval,
-          billingIntervalCount: plan.billing_interval_count,
+          billingIntervalCount,
           unitPrice: basePrice,
           setupFee,
           vatRate,
