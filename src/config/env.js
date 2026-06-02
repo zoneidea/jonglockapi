@@ -19,7 +19,7 @@ const envSchema = z.object({
   MOBILE_JWT_EXPIRES_IN: z.string().default('30d'),
   FIELD_ENCRYPTION_KEY: z.string().min(32),
   FIELD_HASH_SECRET: z.string().min(16),
-  CORS_ORIGIN_SOURCE: z.enum(['app', 'proxy']).default('app'),
+  CORS_ORIGIN_SOURCE: z.enum(['app', 'proxy']).optional(),
   CORS_ORIGINS: z.string().default('*'),
   RATE_LIMIT_WINDOW_MS: z.coerce.number().default(15 * 60 * 1000),
   RATE_LIMIT_MAX: z.coerce.number().default(300),
@@ -40,8 +40,10 @@ if (!parsed.success) {
 }
 
 const env = parsed.data;
+const corsOriginSource = env.CORS_ORIGIN_SOURCE || (env.NODE_ENV === 'production' ? 'proxy' : 'app');
 
 module.exports = {
   ...env,
+  CORS_ORIGIN_SOURCE: corsOriginSource,
   corsOrigins: env.CORS_ORIGINS === '*' ? '*' : env.CORS_ORIGINS.split(',').map((origin) => origin.trim()),
 };

@@ -27,5 +27,6 @@ CORS_ORIGIN_SOURCE=proxy
 
 Use `CORS_ORIGIN_SOURCE=proxy` on production when nginx/Plesk already injects `Access-Control-Allow-Origin`.
 In this mode Express does not emit `Access-Control-Allow-Origin`; it only answers CORS methods/headers for preflight requests.
+If the variable is omitted, production defaults to `proxy` and development/test defaults to `app`.
 
 The server also allows `localhost`, `*.zonedevnode.com`, `jonglock.com`, and `*.jonglock.com` as a guarded fallback in `src/app.js`.
