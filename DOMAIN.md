@@ -14,14 +14,14 @@
 - Public API: `https://api.jonglock.com/api/public`
 - Management API: `https://api.jonglock.com/management` or `/api/management`
 - Platform API: `https://api.jonglock.com/platform` or `/api/platform`
-- Allowed app origins: `https://jonglock.com`, `https://mng.jonglock.com`, `https://platform.jonglock.com`
+- Allowed app origins: `https://jonglock.com`, `https://management.jonglock.com`, `https://platform.jonglock.com`
 
 ## CORS
 
 Production example:
 
 ```bash
-CORS_ORIGINS=https://jonglock.com,https://mng.jonglock.com,https://platform.jonglock.com
+CORS_ORIGINS=https://jonglock.com,https://management.jonglock.com,https://platform.jonglock.com
 CORS_ORIGIN_SOURCE=proxy
 ```
 
