@@ -5,15 +5,12 @@ const { encryptField, blindIndex } = require('../utils/crypto');
 const { isStrongPassword, PASSWORD_POLICY_MESSAGE } = require('../utils/password-policy');
 
 async function main() {
-  const username = process.env.PLATFORM_ADMIN_USERNAME;
-  const password = process.env.PLATFORM_ADMIN_PASSWORD;
+  const username = process.env.PLATFORM_ADMIN_USERNAME || 'platform_admin';
+  const password = process.env.PLATFORM_ADMIN_PASSWORD || 'Platform@123456';
   const name = process.env.PLATFORM_ADMIN_NAME || 'Platform Superadmin';
   const email = process.env.PLATFORM_ADMIN_EMAIL || '';
   const role = process.env.PLATFORM_ADMIN_ROLE || 'platform_superadmin';
 
-  if (!username || !password) {
-    throw new Error('PLATFORM_ADMIN_USERNAME and PLATFORM_ADMIN_PASSWORD are required');
-  }
   if (!isStrongPassword(password)) {
     throw new Error(PASSWORD_POLICY_MESSAGE);
   }
