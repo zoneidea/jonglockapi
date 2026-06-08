@@ -64,6 +64,35 @@ const appIconSettingsSchema = z.object({
   params: z.object({}).optional(),
 });
 
+const notificationTestSchema = z.object({
+  body: z.object({
+    targetType: z.enum(['all', 'user', 'topic']),
+    title: z.string().trim().min(1).max(120),
+    body: z.string().trim().min(1).max(500),
+    mobileUserId: z.coerce.number().int().positive().optional(),
+    userKeyword: z.string().trim().max(120).optional(),
+    topic: z.string().trim().regex(/^[A-Za-z0-9\-_.~%]+$/).max(900).optional(),
+    data: z.record(z.string(), z.union([z.string(), z.number(), z.boolean(), z.null()])).optional(),
+  }).superRefine((body, ctx) => {
+    if (body.targetType === 'user' && !body.mobileUserId && !body.userKeyword) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['userKeyword'],
+        message: 'ต้องระบุ Mobile User ID หรือคำค้นหาผู้ใช้',
+      });
+    }
+    if (body.targetType === 'topic' && !body.topic) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['topic'],
+        message: 'ต้องระบุ topic',
+      });
+    }
+  }),
+  query: z.object({}).optional(),
+  params: z.object({}).optional(),
+});
+
 function requirePlatform(req, res, next) {
   if (req.auth?.userType !== 'platform') {
     return next(forbidden('Platform route only'));
@@ -115,6 +144,18 @@ router.patch(
       platformUserId: req.auth.sub,
     });
     return ok(res, settings, 'app icon settings updated');
+  }),
+);
+
+router.post(
+  '/notifications/test',
+  validate(notificationTestSchema),
+  asyncHandler(async (req, res) => {
+    const result = await platformService.sendPlatformTestNotification({
+      ...req.validated.body,
+      platformUserId: req.auth.sub,
+    });
+    return ok(res, result, result.skipped ? 'notification test skipped' : 'notification test sent');
   }),
 );
 

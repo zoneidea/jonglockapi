@@ -1,8 +1,10 @@
 const bcrypt = require('bcryptjs');
 const { query } = require('../../config/db');
+const { logger } = require('../../config/logger');
 const { signToken } = require('../../middlewares/auth');
 const { decryptField, blindIndex } = require('../../utils/crypto');
 const { unauthorized, notFound } = require('../../utils/errors');
+const { getFirebaseMessaging, getFirebaseInitReason } = require('../../services/firebase-admin.service');
 const {
   PLATFORM_MENU_ACCESS,
   PLATFORM_NAVIGATION,
@@ -97,6 +99,43 @@ function buildUsageLimits(values = {}) {
 
 function getAppIconVariant(iconKey) {
   return APP_ICON_VARIANTS.find((item) => item.key === iconKey) || APP_ICON_VARIANTS[0];
+}
+
+function stringData(data) {
+  return Object.entries(data || {}).reduce((result, [key, value]) => {
+    if (value !== undefined && value !== null) result[key] = String(value);
+    return result;
+  }, {});
+}
+
+function isInvalidFcmTokenError(code) {
+  return code === 'messaging/registration-token-not-registered'
+    || code === 'messaging/invalid-registration-token';
+}
+
+function buildTestNotificationPayload({ title, body, data }) {
+  return {
+    notification: { title, body },
+    data: stringData({
+      source: 'platform-test',
+      sentAt: new Date().toISOString(),
+      ...(data || {}),
+    }),
+    android: {
+      priority: 'high',
+      notification: {
+        channelId: 'jonglock-default',
+        sound: 'default',
+      },
+    },
+    apns: {
+      payload: {
+        aps: {
+          sound: 'default',
+        },
+      },
+    },
+  };
 }
 
 async function ensureAppIconSetting() {
@@ -850,6 +889,151 @@ async function getSubscriptionDetail(subscriptionId) {
   };
 }
 
+async function getAllActiveMobileTokens() {
+  return query(
+    `SELECT id AS token_id, fcm_token
+     FROM mobile_device_tokens
+     WHERE status = 'active'
+       AND fcm_token IS NOT NULL
+       AND fcm_token <> ''
+     ORDER BY last_seen_at DESC, id DESC
+     LIMIT 500`,
+    {},
+  );
+}
+
+async function getUserActiveMobileTokens({ mobileUserId, userKeyword }) {
+  const rawKeyword = String(userKeyword || '').trim();
+  const lowerKeyword = rawKeyword.toLowerCase();
+  const digitKeyword = rawKeyword.replace(/\D/g, '');
+  const keywordCandidates = [...new Set([rawKeyword, lowerKeyword, digitKeyword].filter(Boolean))];
+  const hashCandidates = keywordCandidates.map((value) => blindIndex(value));
+  const numericUserId = Number(mobileUserId || 0);
+
+  if (!numericUserId && !rawKeyword) return [];
+
+  return query(
+    `SELECT mdt.id AS token_id, mdt.fcm_token, mu.id AS mobile_user_id, mu.public_id
+     FROM mobile_users mu
+     JOIN mobile_device_tokens mdt
+       ON mdt.mobile_user_id = mu.id
+      AND mdt.organization_id = mu.organization_id
+      AND mdt.status = 'active'
+      AND mdt.fcm_token IS NOT NULL
+      AND mdt.fcm_token <> ''
+     WHERE mu.status <> 'deleted'
+       AND (
+         (:mobileUserId > 0 AND mu.id = :mobileUserId)
+         OR (:rawKeyword <> '' AND mu.public_id = :rawKeyword)
+         OR mu.username_hash IN (:hash0, :hash1, :hash2)
+         OR mu.email_hash IN (:hash0, :hash1, :hash2)
+         OR mu.phone_hash IN (:hash0, :hash1, :hash2)
+       )
+     ORDER BY mdt.last_seen_at DESC, mdt.id DESC
+     LIMIT 20`,
+    {
+      mobileUserId: numericUserId,
+      rawKeyword,
+      hash0: hashCandidates[0] || '__no_hash_0__',
+      hash1: hashCandidates[1] || '__no_hash_1__',
+      hash2: hashCandidates[2] || '__no_hash_2__',
+    },
+  );
+}
+
+async function deactivateInvalidMobileTokens(rows, response) {
+  const invalidTokenIds = [];
+  response.responses.forEach((item, index) => {
+    if (isInvalidFcmTokenError(item.error?.code || '')) {
+      invalidTokenIds.push(rows[index].token_id);
+    }
+  });
+
+  if (!invalidTokenIds.length) return;
+  const placeholders = invalidTokenIds.map((_, index) => `:id${index}`).join(', ');
+  const params = invalidTokenIds.reduce((result, id, index) => ({ ...result, [`id${index}`]: id }), {});
+  await query(
+    `UPDATE mobile_device_tokens
+     SET status = 'inactive'
+     WHERE id IN (${placeholders})`,
+    params,
+  );
+}
+
+async function sendPlatformTestNotification({
+  targetType,
+  title,
+  body,
+  mobileUserId,
+  userKeyword,
+  topic,
+  data,
+  platformUserId,
+}) {
+  const messaging = getFirebaseMessaging();
+  if (!messaging) {
+    const reason = getFirebaseInitReason() || 'Firebase Admin is not configured';
+    logger.warn({ platformUserId, targetType, reason }, 'Platform test notification skipped');
+    return {
+      targetType,
+      sent: 0,
+      failed: 0,
+      tokenCount: 0,
+      skipped: true,
+      reason,
+    };
+  }
+
+  const payload = buildTestNotificationPayload({ title, body, data });
+
+  if (targetType === 'topic') {
+    const messageId = await messaging.send({
+      ...payload,
+      topic,
+    });
+    return {
+      targetType,
+      topic,
+      sent: 1,
+      failed: 0,
+      tokenCount: 0,
+      skipped: false,
+      messageId,
+    };
+  }
+
+  const tokenRows = targetType === 'all'
+    ? await getAllActiveMobileTokens()
+    : await getUserActiveMobileTokens({ mobileUserId, userKeyword });
+
+  if (!tokenRows.length) {
+    return {
+      targetType,
+      sent: 0,
+      failed: 0,
+      tokenCount: 0,
+      skipped: true,
+      reason: targetType === 'all'
+        ? 'ไม่พบ device token ที่ active'
+        : 'ไม่พบผู้ใช้หรือ device token ที่ active',
+    };
+  }
+
+  const response = await messaging.sendEachForMulticast({
+    ...payload,
+    tokens: tokenRows.map((item) => item.fcm_token),
+  });
+  await deactivateInvalidMobileTokens(tokenRows, response);
+
+  return {
+    targetType,
+    sent: response.successCount,
+    failed: response.failureCount,
+    tokenCount: tokenRows.length,
+    skipped: false,
+  };
+}
+
 module.exports = {
   APP_ICON_VARIANTS,
   getAppIconSettings,
@@ -860,5 +1044,6 @@ module.exports = {
   listOrganizations,
   listSubscriptions,
   loginPlatform,
+  sendPlatformTestNotification,
   updateAppIconSettings,
 };

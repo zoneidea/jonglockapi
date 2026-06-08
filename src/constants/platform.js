@@ -7,10 +7,10 @@ const PLATFORM_ROLES = Object.freeze({
 });
 
 const PLATFORM_MENU_ACCESS = Object.freeze({
-  [PLATFORM_ROLES.SUPERADMIN]: ['dashboard', 'organizations', 'subscriptions', 'billing', 'support', 'monitoring', 'settings'],
+  [PLATFORM_ROLES.SUPERADMIN]: ['dashboard', 'organizations', 'subscriptions', 'billing', 'support', 'monitoring', 'notificationTest', 'settings'],
   [PLATFORM_ROLES.SUPPORT]: ['dashboard', 'organizations', 'support'],
   [PLATFORM_ROLES.BILLING]: ['dashboard', 'subscriptions', 'billing'],
-  [PLATFORM_ROLES.OPS]: ['dashboard', 'organizations', 'monitoring'],
+  [PLATFORM_ROLES.OPS]: ['dashboard', 'organizations', 'monitoring', 'notificationTest'],
   [PLATFORM_ROLES.AUDIT]: ['dashboard', 'monitoring'],
 });
 
@@ -34,6 +34,7 @@ const PLATFORM_NAVIGATION = Object.freeze([
     items: [
       { key: 'support', label: 'ช่วยเหลือ', path: '/support' },
       { key: 'monitoring', label: 'สถานะระบบ', path: '/monitoring' },
+      { key: 'notificationTest', label: 'ทดสอบแจ้งเตือน', path: '/notification-test' },
       { key: 'settings', label: 'ตั้งค่าไอคอนแอป', path: '/settings' },
     ],
   },
