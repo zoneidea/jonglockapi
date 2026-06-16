@@ -52,6 +52,19 @@ function clearPublicReadCache() {
 }
 
 const ALL_MARKET_OPEN_DAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+const MARKET_LAYOUT_ITEM_TYPE_LABELS = {
+  booth: 'บูธ',
+  entrance: 'ทางเข้า',
+  exit: 'ทางออก',
+  toilet: 'ห้องน้ำ',
+  tree: 'ต้นไม้',
+  rest_area: 'จุดพัก',
+  stage: 'เวที',
+  parking: 'ที่จอดรถ',
+  text: 'ข้อความ',
+  custom: 'วัตถุอิสระ',
+};
+const MARKET_LAYOUT_ITEM_TYPES = new Set(Object.keys(MARKET_LAYOUT_ITEM_TYPE_LABELS));
 
 function normalizeOpenDays(value) {
   if (Array.isArray(value)) {
@@ -68,6 +81,124 @@ function normalizeOpenDays(value) {
     return normalizeOpenDays(text.split(','));
   }
   return [];
+}
+
+function createDefaultMarketLayoutJson(rowsCount, columnsCount, cellSize) {
+  return {
+    version: 1,
+    rows: rowsCount,
+    columns: columnsCount,
+    cellSize,
+    items: [],
+  };
+}
+
+function parseLayoutJson(value) {
+  if (!value) return null;
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
+  }
+  return value;
+}
+
+function normalizeMarketLayoutRow(row, includeLayoutJson = false) {
+  const payload = {
+    id: Number(row.id),
+    marketId: Number(row.market_id),
+    organizationId: Number(row.organization_id),
+    name: row.name,
+    description: row.description || '',
+    rowsCount: Number(row.rows_count || 0),
+    columnsCount: Number(row.columns_count || 0),
+    cellSize: Number(row.cell_size || 0),
+    status: row.status,
+    isActive: Number(row.is_active || 0) === 1,
+    createdBy: row.created_by ? Number(row.created_by) : null,
+    updatedBy: row.updated_by ? Number(row.updated_by) : null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+  if (includeLayoutJson) {
+    payload.layoutJson = parseLayoutJson(row.layout_json) || createDefaultMarketLayoutJson(payload.rowsCount, payload.columnsCount, payload.cellSize);
+  }
+  return payload;
+}
+
+function normalizeMarketLayoutJson(layoutJsonInput, { rowsCount, columnsCount, cellSize, boothsById }) {
+  const layoutJson = parseLayoutJson(layoutJsonInput) || {};
+  const items = Array.isArray(layoutJson.items) ? layoutJson.items : [];
+  const normalizedItems = [];
+  const occupiedCells = new Map();
+  const usedBoothIds = new Set();
+
+  for (const [index, rawItem] of items.entries()) {
+    const item = rawItem && typeof rawItem === 'object' ? rawItem : {};
+    const id = String(item.id || '').trim();
+    const type = String(item.type || '').trim();
+    const label = String(item.label || '').trim();
+    const row = Number(item.row);
+    const col = Number(item.col);
+    const rowSpan = Number(item.rowSpan || 1);
+    const colSpan = Number(item.colSpan || 1);
+
+    if (!id) throw badRequest(`Layout item #${index + 1}: missing id`);
+    if (!MARKET_LAYOUT_ITEM_TYPES.has(type)) throw badRequest(`Layout item #${index + 1}: invalid type`);
+    if (!Number.isInteger(row) || row < 1) throw badRequest(`Layout item #${index + 1}: invalid row`);
+    if (!Number.isInteger(col) || col < 1) throw badRequest(`Layout item #${index + 1}: invalid col`);
+    if (!Number.isInteger(rowSpan) || rowSpan < 1) throw badRequest(`Layout item #${index + 1}: invalid rowSpan`);
+    if (!Number.isInteger(colSpan) || colSpan < 1) throw badRequest(`Layout item #${index + 1}: invalid colSpan`);
+    if ((row + rowSpan - 1) > rowsCount) throw badRequest(`Layout item #${index + 1}: row out of bounds`);
+    if ((col + colSpan - 1) > columnsCount) throw badRequest(`Layout item #${index + 1}: col out of bounds`);
+
+    let normalizedItem = {
+      id,
+      type,
+      label: label || MARKET_LAYOUT_ITEM_TYPE_LABELS[type],
+      row,
+      col,
+      rowSpan,
+      colSpan,
+    };
+
+    if (type === 'booth') {
+      const boothId = Number(item.boothId);
+      if (!Number.isInteger(boothId) || boothId <= 0) throw badRequest(`Layout item #${index + 1}: boothId is required`);
+      const booth = boothsById.get(boothId);
+      if (!booth) throw badRequest(`Layout item #${index + 1}: booth does not belong to this market`);
+      if (usedBoothIds.has(boothId)) throw badRequest(`Layout item #${index + 1}: duplicate booth in layout`);
+      usedBoothIds.add(boothId);
+      normalizedItem = {
+        ...normalizedItem,
+        boothId,
+        boothCode: booth.code,
+        label: booth.code || normalizedItem.label || booth.name || `Booth ${boothId}`,
+      };
+    }
+
+    for (let currentRow = row; currentRow < row + rowSpan; currentRow += 1) {
+      for (let currentCol = col; currentCol < col + colSpan; currentCol += 1) {
+        const key = `${currentRow}:${currentCol}`;
+        if (occupiedCells.has(key)) {
+          throw badRequest(`Layout item #${index + 1}: overlaps with item ${occupiedCells.get(key)}`);
+        }
+        occupiedCells.set(key, id);
+      }
+    }
+
+    normalizedItems.push(normalizedItem);
+  }
+
+  return {
+    version: 1,
+    rows: rowsCount,
+    columns: columnsCount,
+    cellSize,
+    items: normalizedItems,
+  };
 }
 const imageUpload = multer({
   storage: multer.diskStorage({
@@ -2925,6 +3056,314 @@ router.post(
 
     clearPublicReadCache();
     return created(res, result, 'booth type copied');
+  }),
+);
+
+router.get(
+  '/markets/:marketId/layouts',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  asyncHandler(async (req, res) => {
+    const rows = await query(
+      `SELECT id, organization_id, market_id, name, description, rows_count, columns_count, cell_size,
+              status, is_active, created_by, updated_by, created_at, updated_at
+       FROM market_layouts
+       WHERE organization_id = :organizationId
+         AND market_id = :marketId
+         AND is_active = 1
+       ORDER BY CASE status WHEN 'published' THEN 0 WHEN 'draft' THEN 1 ELSE 2 END, updated_at DESC, id DESC`,
+      { organizationId: req.auth.organizationId, marketId: Number(req.params.marketId) },
+    );
+    return ok(res, rows.map((row) => normalizeMarketLayoutRow(row)));
+  }),
+);
+
+router.post(
+  '/markets/:marketId/layouts',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  validate(
+    z.object({
+      body: z.object({
+        name: z.string().min(1),
+        description: z.string().max(500).optional().default(''),
+        rowsCount: z.coerce.number().int().min(1).max(200).default(20),
+        columnsCount: z.coerce.number().int().min(1).max(200).default(30),
+        cellSize: z.coerce.number().int().min(16).max(120).default(48),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({ marketId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { marketId } = req.validated.params;
+    const body = req.validated.body;
+    const layoutJson = createDefaultMarketLayoutJson(body.rowsCount, body.columnsCount, body.cellSize);
+    const result = await query(
+      `INSERT INTO market_layouts (
+        organization_id, market_id, name, description, rows_count, columns_count, cell_size,
+        layout_json, status, is_active, created_by, updated_by
+      ) VALUES (
+        :organizationId, :marketId, :name, :description, :rowsCount, :columnsCount, :cellSize,
+        :layoutJson, 'draft', 1, :adminUserId, :adminUserId
+      )`,
+      {
+        organizationId: req.auth.organizationId,
+        marketId,
+        name: body.name.trim(),
+        description: body.description || '',
+        rowsCount: body.rowsCount,
+        columnsCount: body.columnsCount,
+        cellSize: body.cellSize,
+        layoutJson: JSON.stringify(layoutJson),
+        adminUserId: req.auth.sub || null,
+      },
+    );
+    clearPublicReadCache();
+    return created(res, {
+      id: result.insertId,
+      marketId,
+      name: body.name.trim(),
+      description: body.description || '',
+      rowsCount: body.rowsCount,
+      columnsCount: body.columnsCount,
+      cellSize: body.cellSize,
+      status: 'draft',
+      isActive: true,
+      layoutJson,
+    }, 'market layout created');
+  }),
+);
+
+router.get(
+  '/markets/:marketId/layouts/:layoutId',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  validate(
+    z.object({
+      query: z.object({}).passthrough(),
+      params: z.object({
+        marketId: z.coerce.number().int().positive(),
+        layoutId: z.coerce.number().int().positive(),
+      }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const row = await query(
+      `SELECT id, organization_id, market_id, name, description, rows_count, columns_count, cell_size,
+              layout_json, status, is_active, created_by, updated_by, created_at, updated_at
+       FROM market_layouts
+       WHERE id = :layoutId
+         AND organization_id = :organizationId
+         AND market_id = :marketId
+         AND is_active = 1
+       LIMIT 1`,
+      {
+        organizationId: req.auth.organizationId,
+        marketId: req.validated.params.marketId,
+        layoutId: req.validated.params.layoutId,
+      },
+    );
+    if (!row[0]) throw notFound('Market layout not found');
+    return ok(res, normalizeMarketLayoutRow(row[0], true));
+  }),
+);
+
+router.patch(
+  '/markets/:marketId/layouts/:layoutId',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  validate(
+    z.object({
+      body: z.object({
+        name: z.string().min(1),
+        description: z.string().max(500).optional().default(''),
+        rowsCount: z.coerce.number().int().min(1).max(200),
+        columnsCount: z.coerce.number().int().min(1).max(200),
+        cellSize: z.coerce.number().int().min(16).max(120),
+        layoutJson: z.any(),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({
+        marketId: z.coerce.number().int().positive(),
+        layoutId: z.coerce.number().int().positive(),
+      }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { marketId, layoutId } = req.validated.params;
+    const body = req.validated.body;
+    const [layout] = await query(
+      `SELECT id, status
+       FROM market_layouts
+       WHERE id = :layoutId
+         AND organization_id = :organizationId
+         AND market_id = :marketId
+         AND is_active = 1
+       LIMIT 1`,
+      { organizationId: req.auth.organizationId, marketId, layoutId },
+    );
+    if (!layout) throw notFound('Market layout not found');
+
+    const boothRows = await query(
+      `SELECT id, code, name
+       FROM booths
+       WHERE organization_id = :organizationId
+         AND market_id = :marketId
+         AND status <> 'deleted'`,
+      { organizationId: req.auth.organizationId, marketId },
+    );
+    const boothsById = new Map(boothRows.map((row) => [Number(row.id), row]));
+    const normalizedLayoutJson = normalizeMarketLayoutJson(body.layoutJson, {
+      rowsCount: body.rowsCount,
+      columnsCount: body.columnsCount,
+      cellSize: body.cellSize,
+      boothsById,
+    });
+
+    await query(
+      `UPDATE market_layouts
+       SET name = :name,
+           description = :description,
+           rows_count = :rowsCount,
+           columns_count = :columnsCount,
+           cell_size = :cellSize,
+           layout_json = :layoutJson,
+           updated_by = :adminUserId
+       WHERE id = :layoutId
+         AND organization_id = :organizationId
+         AND market_id = :marketId
+         AND is_active = 1`,
+      {
+        organizationId: req.auth.organizationId,
+        marketId,
+        layoutId,
+        name: body.name.trim(),
+        description: body.description || '',
+        rowsCount: body.rowsCount,
+        columnsCount: body.columnsCount,
+        cellSize: body.cellSize,
+        layoutJson: JSON.stringify(normalizedLayoutJson),
+        adminUserId: req.auth.sub || null,
+      },
+    );
+    clearPublicReadCache();
+    return ok(res, {
+      id: layoutId,
+      marketId,
+      name: body.name.trim(),
+      description: body.description || '',
+      rowsCount: body.rowsCount,
+      columnsCount: body.columnsCount,
+      cellSize: body.cellSize,
+      status: layout.status,
+      isActive: true,
+      layoutJson: normalizedLayoutJson,
+    }, 'market layout updated');
+  }),
+);
+
+router.post(
+  '/markets/:marketId/layouts/:layoutId/publish',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({}).passthrough(),
+      params: z.object({
+        marketId: z.coerce.number().int().positive(),
+        layoutId: z.coerce.number().int().positive(),
+      }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { marketId, layoutId } = req.validated.params;
+    const result = await transaction(async (connection) => {
+      const [rows] = await connection.execute(
+        `SELECT id
+         FROM market_layouts
+         WHERE id = :layoutId
+           AND organization_id = :organizationId
+           AND market_id = :marketId
+           AND is_active = 1
+         LIMIT 1`,
+        { organizationId: req.auth.organizationId, marketId, layoutId },
+      );
+      if (!rows[0]) throw notFound('Market layout not found');
+
+      await connection.execute(
+        `UPDATE market_layouts
+         SET status = CASE WHEN status = 'published' THEN 'draft' ELSE status END,
+             updated_by = :adminUserId
+         WHERE organization_id = :organizationId
+           AND market_id = :marketId
+           AND is_active = 1
+           AND id <> :layoutId`,
+        {
+          organizationId: req.auth.organizationId,
+          marketId,
+          layoutId,
+          adminUserId: req.auth.sub || null,
+        },
+      );
+      await connection.execute(
+        `UPDATE market_layouts
+         SET status = 'published',
+             is_active = 1,
+             updated_by = :adminUserId
+         WHERE id = :layoutId
+           AND organization_id = :organizationId
+           AND market_id = :marketId`,
+        {
+          organizationId: req.auth.organizationId,
+          marketId,
+          layoutId,
+          adminUserId: req.auth.sub || null,
+        },
+      );
+      return { id: layoutId, status: 'published' };
+    });
+    clearPublicReadCache();
+    return ok(res, result, 'market layout published');
+  }),
+);
+
+router.delete(
+  '/markets/:marketId/layouts/:layoutId',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  validate(
+    z.object({
+      body: z.object({}).passthrough().optional().default({}),
+      query: z.object({}).passthrough(),
+      params: z.object({
+        marketId: z.coerce.number().int().positive(),
+        layoutId: z.coerce.number().int().positive(),
+      }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { marketId, layoutId } = req.validated.params;
+    const result = await query(
+      `UPDATE market_layouts
+       SET is_active = 0,
+           status = 'archived',
+           updated_by = :adminUserId
+       WHERE id = :layoutId
+         AND organization_id = :organizationId
+         AND market_id = :marketId
+         AND is_active = 1`,
+      {
+        organizationId: req.auth.organizationId,
+        marketId,
+        layoutId,
+        adminUserId: req.auth.sub || null,
+      },
+    );
+    if (!result.affectedRows) throw notFound('Market layout not found');
+    clearPublicReadCache();
+    return ok(res, { id: layoutId, status: 'archived', isActive: false }, 'market layout archived');
   }),
 );
 
