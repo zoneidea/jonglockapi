@@ -3097,7 +3097,7 @@ router.get(
        WHERE ml.organization_id = :organizationId
          AND ml.market_id = :marketId
          AND ml.is_active = 1
-       ORDER BY CASE status WHEN 'published' THEN 0 WHEN 'draft' THEN 1 ELSE 2 END, updated_at DESC, id DESC`,
+       ORDER BY CASE ml.status WHEN 'published' THEN 0 WHEN 'draft' THEN 1 ELSE 2 END, ml.updated_at DESC, ml.id DESC`,
       { organizationId: req.auth.organizationId, marketId: Number(req.params.marketId) },
     );
     return ok(res, rows.map((row) => normalizeMarketLayoutRow(row)));
