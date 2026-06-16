@@ -106,15 +106,30 @@ function parseLayoutJson(value) {
 }
 
 function normalizeMarketLayoutRow(row, includeLayoutJson = false) {
+  const layoutJson = includeLayoutJson
+    ? (parseLayoutJson(row.layout_json) || createDefaultMarketLayoutJson(Number(row.rows_count || 0), Number(row.columns_count || 0), Number(row.cell_size || 0)))
+    : null;
+  const layoutItems = Array.isArray(layoutJson?.items) ? layoutJson.items : [];
+  const placedBoothCount = Number(
+    row.placed_booth_count
+      ?? layoutItems.filter((item) => item && item.type === 'booth').length
+      ?? 0,
+  );
+  const boothCount = Number(row.booth_count || 0);
   const payload = {
     id: Number(row.id),
     marketId: Number(row.market_id),
     organizationId: Number(row.organization_id),
+    floorPlanId: row.floor_plan_id ? Number(row.floor_plan_id) : null,
+    floorPlanName: row.floor_plan_name || '',
     name: row.name,
     description: row.description || '',
     rowsCount: Number(row.rows_count || 0),
     columnsCount: Number(row.columns_count || 0),
     cellSize: Number(row.cell_size || 0),
+    boothCount,
+    placedBoothCount,
+    unplacedBoothCount: Math.max(0, boothCount - placedBoothCount),
     status: row.status,
     isActive: Number(row.is_active || 0) === 1,
     createdBy: row.created_by ? Number(row.created_by) : null,
@@ -123,7 +138,7 @@ function normalizeMarketLayoutRow(row, includeLayoutJson = false) {
     updatedAt: row.updated_at,
   };
   if (includeLayoutJson) {
-    payload.layoutJson = parseLayoutJson(row.layout_json) || createDefaultMarketLayoutJson(payload.rowsCount, payload.columnsCount, payload.cellSize);
+    payload.layoutJson = layoutJson;
   }
   return payload;
 }
@@ -3065,12 +3080,23 @@ router.get(
   requireMarketAccess(),
   asyncHandler(async (req, res) => {
     const rows = await query(
-      `SELECT id, organization_id, market_id, name, description, rows_count, columns_count, cell_size,
-              status, is_active, created_by, updated_by, created_at, updated_at
-       FROM market_layouts
-       WHERE organization_id = :organizationId
-         AND market_id = :marketId
-         AND is_active = 1
+      `SELECT ml.id, ml.organization_id, ml.market_id, ml.floor_plan_id, fp.name AS floor_plan_name,
+              ml.name, ml.description, ml.rows_count, ml.columns_count, ml.cell_size, ml.layout_json,
+              ml.status, ml.is_active, ml.created_by, ml.updated_by, ml.created_at, ml.updated_at,
+              (
+                SELECT COUNT(*)
+                FROM booths b
+                WHERE b.organization_id = ml.organization_id
+                  AND b.market_id = ml.market_id
+                  AND (ml.floor_plan_id IS NULL OR b.floor_plan_id = ml.floor_plan_id)
+                  AND b.status <> 'deleted'
+              ) AS booth_count
+       FROM market_layouts ml
+       LEFT JOIN floor_plans fp
+         ON fp.id = ml.floor_plan_id
+       WHERE ml.organization_id = :organizationId
+         AND ml.market_id = :marketId
+         AND ml.is_active = 1
        ORDER BY CASE status WHEN 'published' THEN 0 WHEN 'draft' THEN 1 ELSE 2 END, updated_at DESC, id DESC`,
       { organizationId: req.auth.organizationId, marketId: Number(req.params.marketId) },
     );
@@ -3087,6 +3113,7 @@ router.post(
       body: z.object({
         name: z.string().min(1),
         description: z.string().max(500).optional().default(''),
+        floorPlanId: z.coerce.number().int().positive().optional().nullable(),
         rowsCount: z.coerce.number().int().min(1).max(200).default(20),
         columnsCount: z.coerce.number().int().min(1).max(200).default(30),
         cellSize: z.coerce.number().int().min(16).max(120).default(48),
@@ -3098,18 +3125,37 @@ router.post(
   asyncHandler(async (req, res) => {
     const { marketId } = req.validated.params;
     const body = req.validated.body;
+    let floorPlanName = '';
+    if (body.floorPlanId) {
+      const floorPlanRows = await query(
+        `SELECT id, name
+         FROM floor_plans
+         WHERE id = :floorPlanId
+           AND organization_id = :organizationId
+           AND market_id = :marketId
+         LIMIT 1`,
+        {
+          floorPlanId: body.floorPlanId,
+          organizationId: req.auth.organizationId,
+          marketId,
+        },
+      );
+      if (!floorPlanRows[0]) throw badRequest('Floor plan not found for this market');
+      floorPlanName = floorPlanRows[0].name || '';
+    }
     const layoutJson = createDefaultMarketLayoutJson(body.rowsCount, body.columnsCount, body.cellSize);
     const result = await query(
       `INSERT INTO market_layouts (
-        organization_id, market_id, name, description, rows_count, columns_count, cell_size,
+        organization_id, market_id, floor_plan_id, name, description, rows_count, columns_count, cell_size,
         layout_json, status, is_active, created_by, updated_by
       ) VALUES (
-        :organizationId, :marketId, :name, :description, :rowsCount, :columnsCount, :cellSize,
+        :organizationId, :marketId, :floorPlanId, :name, :description, :rowsCount, :columnsCount, :cellSize,
         :layoutJson, 'draft', 1, :adminUserId, :adminUserId
       )`,
       {
         organizationId: req.auth.organizationId,
         marketId,
+        floorPlanId: body.floorPlanId || null,
         name: body.name.trim(),
         description: body.description || '',
         rowsCount: body.rowsCount,
@@ -3123,11 +3169,16 @@ router.post(
     return created(res, {
       id: result.insertId,
       marketId,
+      floorPlanId: body.floorPlanId || null,
+      floorPlanName,
       name: body.name.trim(),
       description: body.description || '',
       rowsCount: body.rowsCount,
       columnsCount: body.columnsCount,
       cellSize: body.cellSize,
+      boothCount: 0,
+      placedBoothCount: 0,
+      unplacedBoothCount: 0,
       status: 'draft',
       isActive: true,
       layoutJson,
@@ -3150,13 +3201,24 @@ router.get(
   ),
   asyncHandler(async (req, res) => {
     const row = await query(
-      `SELECT id, organization_id, market_id, name, description, rows_count, columns_count, cell_size,
-              layout_json, status, is_active, created_by, updated_by, created_at, updated_at
-       FROM market_layouts
-       WHERE id = :layoutId
-         AND organization_id = :organizationId
-         AND market_id = :marketId
-         AND is_active = 1
+      `SELECT ml.id, ml.organization_id, ml.market_id, ml.floor_plan_id, fp.name AS floor_plan_name,
+              ml.name, ml.description, ml.rows_count, ml.columns_count, ml.cell_size,
+              ml.layout_json, ml.status, ml.is_active, ml.created_by, ml.updated_by, ml.created_at, ml.updated_at,
+              (
+                SELECT COUNT(*)
+                FROM booths b
+                WHERE b.organization_id = ml.organization_id
+                  AND b.market_id = ml.market_id
+                  AND (ml.floor_plan_id IS NULL OR b.floor_plan_id = ml.floor_plan_id)
+                  AND b.status <> 'deleted'
+              ) AS booth_count
+       FROM market_layouts ml
+       LEFT JOIN floor_plans fp
+         ON fp.id = ml.floor_plan_id
+       WHERE ml.id = :layoutId
+         AND ml.organization_id = :organizationId
+         AND ml.market_id = :marketId
+         AND ml.is_active = 1
        LIMIT 1`,
       {
         organizationId: req.auth.organizationId,
@@ -3194,7 +3256,7 @@ router.patch(
     const { marketId, layoutId } = req.validated.params;
     const body = req.validated.body;
     const [layout] = await query(
-      `SELECT id, status
+      `SELECT id, status, floor_plan_id
        FROM market_layouts
        WHERE id = :layoutId
          AND organization_id = :organizationId
@@ -3210,8 +3272,9 @@ router.patch(
        FROM booths
        WHERE organization_id = :organizationId
          AND market_id = :marketId
+         AND (:floorPlanId IS NULL OR floor_plan_id = :floorPlanId)
          AND status <> 'deleted'`,
-      { organizationId: req.auth.organizationId, marketId },
+      { organizationId: req.auth.organizationId, marketId, floorPlanId: layout.floor_plan_id || null },
     );
     const boothsById = new Map(boothRows.map((row) => [Number(row.id), row]));
     const normalizedLayoutJson = normalizeMarketLayoutJson(body.layoutJson, {
