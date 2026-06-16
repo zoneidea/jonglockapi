@@ -2811,6 +2811,63 @@ router.post(
 );
 
 router.post(
+  '/profile/device-token/remove',
+  validate(
+    z.object({
+      body: z.object({
+        user: z.object({
+          email: z.string().email(),
+          name: z.string().optional().default(''),
+        }),
+        organizationId: z.coerce.number().int().positive(),
+        fcmToken: z.string().min(20).max(512),
+      }),
+      query: z.object({}).passthrough(),
+      params: z.object({}).passthrough(),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const body = req.validated.body;
+    const email = String(body.user.email || '').trim().toLowerCase();
+    const emailHash = blindIndex(email);
+
+    const result = await transaction(async (conn) => {
+      const [profileRows] = await conn.execute(
+        `SELECT id
+         FROM public_user_profiles
+         WHERE email_hash = :emailHash
+         LIMIT 1`,
+        { emailHash },
+      );
+
+      const publicProfileId = profileRows[0]?.id || null;
+      const [deleteResult] = await conn.execute(
+        `UPDATE mobile_device_tokens
+         SET status = 'inactive',
+             last_seen_at = NOW()
+         WHERE organization_id = :organizationId
+           AND fcm_token = :fcmToken
+           AND (
+             public_profile_id = :publicProfileId
+             OR :publicProfileId IS NULL
+           )`,
+        {
+          organizationId: body.organizationId,
+          fcmToken: body.fcmToken,
+          publicProfileId,
+        },
+      );
+
+      return {
+        removed: Number(deleteResult.affectedRows || 0) > 0,
+      };
+    });
+
+    return ok(res, result, 'device token removed');
+  }),
+);
+
+router.post(
   '/booths/:boothId/availability',
   validate(
     z.object({
