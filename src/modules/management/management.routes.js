@@ -61,6 +61,8 @@ const MARKET_LAYOUT_ITEM_TYPE_LABELS = {
   rest_area: 'จุดพัก',
   stage: 'เวที',
   parking: 'ที่จอดรถ',
+  walkway: 'ทางเดิน',
+  road: 'ถนน',
   text: 'ข้อความ',
   custom: 'วัตถุอิสระ',
 };
@@ -3238,12 +3240,12 @@ router.patch(
   validate(
     z.object({
       body: z.object({
-        name: z.string().min(1),
-        description: z.string().max(500).optional().default(''),
-        rowsCount: z.coerce.number().int().min(1).max(200),
-        columnsCount: z.coerce.number().int().min(1).max(200),
-        cellSize: z.coerce.number().int().min(16).max(120),
-        layoutJson: z.any(),
+        name: z.string().min(1).optional(),
+        description: z.string().max(500).optional(),
+        rowsCount: z.coerce.number().int().min(1).max(200).optional(),
+        columnsCount: z.coerce.number().int().min(1).max(200).optional(),
+        cellSize: z.coerce.number().int().min(16).max(120).optional(),
+        layoutJson: z.any().optional(),
       }),
       query: z.object({}).passthrough(),
       params: z.object({
@@ -3256,7 +3258,7 @@ router.patch(
     const { marketId, layoutId } = req.validated.params;
     const body = req.validated.body;
     const [layout] = await query(
-      `SELECT id, status, floor_plan_id
+      `SELECT id, status, floor_plan_id, name, description, rows_count, columns_count, cell_size, layout_json
        FROM market_layouts
        WHERE id = :layoutId
          AND organization_id = :organizationId
@@ -3266,6 +3268,21 @@ router.patch(
       { organizationId: req.auth.organizationId, marketId, layoutId },
     );
     if (!layout) throw notFound('Market layout not found');
+
+    const existingLayoutJson = parseLayoutJson(layout.layout_json) || createDefaultMarketLayoutJson(
+      Number(layout.rows_count || 0),
+      Number(layout.columns_count || 0),
+      Number(layout.cell_size || 0),
+    );
+    const incomingLayoutJson = body.layoutJson === undefined ? null : (parseLayoutJson(body.layoutJson) || {});
+    const rowsCount = body.rowsCount ?? Number(incomingLayoutJson?.rows || existingLayoutJson.rows || layout.rows_count || 0);
+    const columnsCount = body.columnsCount ?? Number(incomingLayoutJson?.columns || existingLayoutJson.columns || layout.columns_count || 0);
+    const cellSize = body.cellSize ?? Number(incomingLayoutJson?.cellSize || existingLayoutJson.cellSize || layout.cell_size || 0);
+    const layoutJsonInput = body.layoutJson === undefined
+      ? existingLayoutJson
+      : { ...existingLayoutJson, ...incomingLayoutJson };
+    const name = body.name === undefined ? layout.name : body.name.trim();
+    const description = body.description === undefined ? (layout.description || '') : (body.description || '');
 
     const boothRows = await query(
       `SELECT id, code, name
@@ -3277,10 +3294,10 @@ router.patch(
       { organizationId: req.auth.organizationId, marketId, floorPlanId: layout.floor_plan_id || null },
     );
     const boothsById = new Map(boothRows.map((row) => [Number(row.id), row]));
-    const normalizedLayoutJson = normalizeMarketLayoutJson(body.layoutJson, {
-      rowsCount: body.rowsCount,
-      columnsCount: body.columnsCount,
-      cellSize: body.cellSize,
+    const normalizedLayoutJson = normalizeMarketLayoutJson(layoutJsonInput, {
+      rowsCount,
+      columnsCount,
+      cellSize,
       boothsById,
     });
 
@@ -3301,11 +3318,11 @@ router.patch(
         organizationId: req.auth.organizationId,
         marketId,
         layoutId,
-        name: body.name.trim(),
-        description: body.description || '',
-        rowsCount: body.rowsCount,
-        columnsCount: body.columnsCount,
-        cellSize: body.cellSize,
+        name,
+        description,
+        rowsCount,
+        columnsCount,
+        cellSize,
         layoutJson: JSON.stringify(normalizedLayoutJson),
         adminUserId: req.auth.sub || null,
       },
@@ -3314,11 +3331,11 @@ router.patch(
     return ok(res, {
       id: layoutId,
       marketId,
-      name: body.name.trim(),
-      description: body.description || '',
-      rowsCount: body.rowsCount,
-      columnsCount: body.columnsCount,
-      cellSize: body.cellSize,
+      name,
+      description,
+      rowsCount,
+      columnsCount,
+      cellSize,
       status: layout.status,
       isActive: true,
       layoutJson: normalizedLayoutJson,
