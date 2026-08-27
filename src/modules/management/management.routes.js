@@ -821,6 +821,13 @@ function worksheetRowsToObjects(worksheet) {
   return rows;
 }
 
+function isBookingImportHeaderRow(row) {
+  return normalizeHeader(row.customerIdentifier) === 'customer_identifier'
+    && normalizeHeader(row.bookingDate) === 'booking_date'
+    && normalizeHeader(row.boothCode) === 'booth_code'
+    && normalizeHeader(row.productName) === 'product_name';
+}
+
 async function bookingImportRowsFromWorkbook(file) {
   const extension = path.extname(file.originalname || '').toLowerCase();
   const ExcelJS = getExcelJS();
@@ -841,7 +848,7 @@ async function bookingImportRowsFromWorkbook(file) {
       productName: normalizeCell(record.product_name || record.productname || record['สินค้า']),
       note: normalizeCell(record.note || record['หมายเหตุ']),
     }))
-    .filter((row) => row.customerIdentifier || row.bookingDate || row.boothCode || row.productName);
+    .filter((row) => (row.customerIdentifier || row.bookingDate || row.boothCode || row.productName) && !isBookingImportHeaderRow(row));
 }
 
 async function resolveImportMobileUser(conn, organizationId, identifier) {
@@ -873,20 +880,22 @@ async function resolveImportMobileUser(conn, organizationId, identifier) {
   return rows[0] || null;
 }
 
-async function resolveImportBooth(conn, organizationId, marketId, boothCode) {
+async function resolveImportBooth(conn, organizationId, marketId, boothCode, { lock = false } = {}) {
   const [rows] = await conn.execute(
     `SELECT b.id, b.floor_plan_id, b.category_id, b.code, b.name, b.price,
+            c.name AS category_name,
             fp.start_date AS floor_plan_start_date,
             fp.end_date AS floor_plan_end_date,
             fp.status AS floor_plan_status
      FROM booths b
      LEFT JOIN floor_plans fp ON fp.id = b.floor_plan_id AND fp.organization_id = b.organization_id
+     LEFT JOIN product_categories c ON c.id = b.category_id AND c.organization_id = b.organization_id
      WHERE b.organization_id = :organizationId
        AND b.market_id = :marketId
        AND b.code = :boothCode
        AND b.status = 'active'
      LIMIT 1
-     FOR UPDATE`,
+     ${lock ? 'FOR UPDATE' : ''}`,
     { organizationId, marketId, boothCode },
   );
   return rows[0] || null;
@@ -905,6 +914,117 @@ async function resolveImportProduct(conn, organizationId, marketId, productName)
     { organizationId, marketId, productName },
   );
   return rows[0] || null;
+}
+
+function importRowBase(row) {
+  return {
+    rowNumber: row.rowNumber,
+    customerIdentifier: row.customerIdentifier,
+    bookingDate: row.bookingDate,
+    boothCode: row.boothCode,
+    productName: row.productName,
+    note: row.note,
+  };
+}
+
+function bookingImportSyntaxError(row) {
+  if (!row.customerIdentifier) return 'customer_identifier is required';
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(row.bookingDate)) return 'booking_date must be YYYY-MM-DD';
+  if (!row.boothCode) return 'booth_code is required';
+  if (!row.productName) return 'product_name is required';
+  return '';
+}
+
+async function inspectBookingImportRow(conn, { organizationId, marketId, row, lock = false }) {
+  const syntaxError = bookingImportSyntaxError(row);
+  if (syntaxError) return { ...importRowBase(row), status: 'error', message: `Row ${row.rowNumber}: ${syntaxError}` };
+
+  const user = await resolveImportMobileUser(conn, organizationId, row.customerIdentifier);
+  if (!user) return { ...importRowBase(row), status: 'error', message: `Customer not found: ${row.customerIdentifier}` };
+
+  const booth = await resolveImportBooth(conn, organizationId, marketId, row.boothCode, { lock });
+  if (!booth) return { ...importRowBase(row), status: 'error', message: `Row ${row.rowNumber}: Booth ${row.boothCode} not found` };
+  if (booth.floor_plan_status && booth.floor_plan_status !== 'active') {
+    return { ...importRowBase(row), status: 'error', message: `Row ${row.rowNumber}: Booth ${row.boothCode} floor plan is inactive` };
+  }
+  const startDate = dateOnly(booth.floor_plan_start_date);
+  const endDate = dateOnly(booth.floor_plan_end_date);
+  if ((startDate && row.bookingDate < startDate) || (endDate && row.bookingDate > endDate)) {
+    return { ...importRowBase(row), status: 'error', message: `Row ${row.rowNumber}: booking date is outside booth floor plan date range` };
+  }
+
+  const product = await resolveImportProduct(conn, organizationId, marketId, row.productName);
+  if (!product) {
+    return {
+      ...importRowBase(row),
+      status: 'missing_product',
+      message: `Product ${row.productName} not found`,
+      mobileUserId: user.id,
+      boothId: booth.id,
+      categoryId: booth.category_id,
+      categoryName: booth.category_name || '',
+    };
+  }
+  if (booth.category_id && Number(product.category_id || 0) !== Number(booth.category_id)) {
+    return { ...importRowBase(row), status: 'error', message: `Row ${row.rowNumber}: Product category does not match Booth category` };
+  }
+
+  return {
+    ...importRowBase(row),
+    status: 'ready',
+    message: '',
+    mobileUserId: user.id,
+    boothId: booth.id,
+    productId: product.id,
+    categoryId: booth.category_id,
+    categoryName: booth.category_name || '',
+  };
+}
+
+async function createMissingImportProduct(conn, { organizationId, marketId, productName, categoryId }) {
+  const [categoryRows] = await conn.execute(
+    `SELECT id
+     FROM product_categories
+     WHERE id = :categoryId
+       AND organization_id = :organizationId
+       AND market_id = :marketId
+       AND status = 'active'
+     LIMIT 1`,
+    { categoryId, organizationId, marketId },
+  );
+  if (!categoryRows[0]) throw badRequest(`Product category is required for ${productName}`);
+
+  const [existingRows] = await conn.execute(
+    `SELECT id, category_id, status
+     FROM products
+     WHERE organization_id = :organizationId
+       AND market_id = :marketId
+       AND name = :productName
+     ORDER BY id ASC
+     LIMIT 1
+     FOR UPDATE`,
+    { organizationId, marketId, productName },
+  );
+  const existing = existingRows[0];
+  if (existing) {
+    if (Number(existing.category_id) !== Number(categoryId)) {
+      throw badRequest(`Product ${productName} exists in a different category`);
+    }
+    if (existing.status !== 'active') {
+      await conn.execute(
+        `UPDATE products SET status = 'active' WHERE id = :productId AND organization_id = :organizationId`,
+        { productId: existing.id, organizationId },
+      );
+    }
+    return { id: existing.id, created: false, reactivated: existing.status !== 'active' };
+  }
+
+  const [result] = await conn.execute(
+    `INSERT INTO products (organization_id, market_id, category_id, group_id, name, status)
+     VALUES (:organizationId, :marketId, :categoryId, NULL, :productName, 'active')`,
+    { organizationId, marketId, categoryId, productName },
+  );
+  return { id: result.insertId, created: true, reactivated: false };
 }
 
 async function createMobileNotification(conn, {
@@ -4170,7 +4290,22 @@ router.post(
   bookingImportUpload.single('file'),
   validate(
     z.object({
-      body: z.object({}).passthrough().optional().default({}),
+      body: z.object({
+        action: z.enum(['preview', 'confirm']).default('preview'),
+        createMissingProducts: z.preprocess(
+          (value) => value === true || value === 'true',
+          z.boolean(),
+        ).default(false),
+        productCategories: z.preprocess((value) => {
+          if (!value) return {};
+          if (typeof value !== 'string') return value;
+          try {
+            return JSON.parse(value);
+          } catch {
+            return {};
+          }
+        }, z.record(z.string(), z.coerce.number().int().positive())).default({}),
+      }).passthrough().optional().default({}),
       query: z.object({}).passthrough(),
       params: z.object({ marketId: z.coerce.number().int().positive() }),
     }),
@@ -4178,69 +4313,128 @@ router.post(
   asyncHandler(async (req, res) => {
     if (!req.file?.buffer) throw badRequest('Excel file is required');
     const marketId = req.validated.params.marketId;
+    const { action, createMissingProducts, productCategories } = req.validated.body;
     const rows = await bookingImportRowsFromWorkbook(req.file);
     if (!rows.length) throw badRequest('Excel file has no booking rows');
     if (rows.length > 500) throw badRequest('Import supports up to 500 rows per file');
+
+    if (action === 'preview') {
+      const previewRows = await transaction(async (conn) => {
+        const inspectedRows = [];
+        for (const row of rows) {
+          inspectedRows.push(await inspectBookingImportRow(conn, {
+            organizationId: req.auth.organizationId,
+            marketId,
+            row,
+          }));
+        }
+        return inspectedRows;
+      });
+      const missingProductsByKey = new Map();
+      for (const row of previewRows.filter((item) => item.status === 'missing_product')) {
+        const key = `${row.productName.toLowerCase()}::${row.categoryId}`;
+        if (!missingProductsByKey.has(key)) {
+          missingProductsByKey.set(key, {
+            name: row.productName,
+            categoryId: row.categoryId,
+            categoryName: row.categoryName,
+            rowNumbers: [],
+          });
+        }
+        missingProductsByKey.get(key).rowNumbers.push(row.rowNumber);
+      }
+      const [availableCategories] = await transaction(async (conn) => conn.execute(
+        `SELECT id, name
+         FROM product_categories
+         WHERE organization_id = :organizationId
+           AND market_id = :marketId
+           AND status = 'active'
+         ORDER BY FIELD(name, 'อาหาร', 'ไม่ใช่อาหาร'), name`,
+        { organizationId: req.auth.organizationId, marketId },
+      ));
+      return ok(res, {
+        mode: 'preview',
+        totalRows: previewRows.length,
+        readyCount: previewRows.filter((item) => item.status === 'ready').length,
+        missingProductCount: previewRows.filter((item) => item.status === 'missing_product').length,
+        errorCount: previewRows.filter((item) => item.status === 'error').length,
+        availableCategories,
+        missingProducts: [...missingProductsByKey.values()],
+        rows: previewRows,
+      }, 'booking import preview ready');
+    }
+
     await assertPlanQuota(req.auth.organizationId, 'booking_management', rows.length);
 
     const groups = new Map();
     for (const row of rows) {
-      if (!row.customerIdentifier) throw badRequest(`Row ${row.rowNumber}: customer_identifier is required`);
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(row.bookingDate)) throw badRequest(`Row ${row.rowNumber}: booking_date must be YYYY-MM-DD`);
-      if (!row.boothCode) throw badRequest(`Row ${row.rowNumber}: booth_code is required`);
-      if (!row.productName) throw badRequest(`Row ${row.rowNumber}: product_name is required`);
-      const key = row.customerIdentifier.toLowerCase();
+      const key = row.customerIdentifier.toLowerCase() || `__row_${row.rowNumber}`;
       if (!groups.has(key)) groups.set(key, []);
       groups.get(key).push(row);
     }
 
     const successes = [];
     const errors = [];
+    const createdProductsById = new Map();
     for (const groupRows of groups.values()) {
       try {
         const result = await transaction(async (conn) => {
-          const user = await resolveImportMobileUser(conn, req.auth.organizationId, groupRows[0].customerIdentifier);
-          if (!user) throw notFound(`Customer not found: ${groupRows[0].customerIdentifier}`);
-
+          let mobileUserId = null;
           const items = [];
+          const createdProducts = [];
           for (const row of groupRows) {
-            const booth = await resolveImportBooth(conn, req.auth.organizationId, marketId, row.boothCode);
-            if (!booth) throw notFound(`Row ${row.rowNumber}: Booth ${row.boothCode} not found`);
-            if (booth.floor_plan_status && booth.floor_plan_status !== 'active') {
-              throw badRequest(`Row ${row.rowNumber}: Booth ${row.boothCode} floor plan is inactive`);
+            const inspected = await inspectBookingImportRow(conn, {
+              organizationId: req.auth.organizationId,
+              marketId,
+              row,
+              lock: true,
+            });
+            if (inspected.status === 'error') throw badRequest(inspected.message);
+            let productId = inspected.productId;
+            if (inspected.status === 'missing_product') {
+              if (!createMissingProducts) throw badRequest(`Row ${row.rowNumber}: ${inspected.message}`);
+              const categoryKey = `${row.productName.toLowerCase()}::${inspected.categoryId || 'unassigned'}`;
+              const categoryId = inspected.categoryId || productCategories[categoryKey];
+              const product = await createMissingImportProduct(conn, {
+                organizationId: req.auth.organizationId,
+                marketId,
+                productName: row.productName,
+                categoryId,
+              });
+              productId = product.id;
+              if (product.created || product.reactivated) {
+                createdProducts.push({
+                  id: product.id,
+                  name: row.productName,
+                  categoryId,
+                  categoryName: inspected.categoryName || '',
+                  created: product.created,
+                  reactivated: product.reactivated,
+                });
+              }
             }
-            const startDate = dateOnly(booth.floor_plan_start_date);
-            const endDate = dateOnly(booth.floor_plan_end_date);
-            if ((startDate && row.bookingDate < startDate) || (endDate && row.bookingDate > endDate)) {
-              throw badRequest(`Row ${row.rowNumber}: booking date is outside booth floor plan date range`);
-            }
-
-            const product = await resolveImportProduct(conn, req.auth.organizationId, marketId, row.productName);
-            if (!product) throw notFound(`Row ${row.rowNumber}: Product ${row.productName} not found`);
-            if (Number(product.category_id || 0) !== Number(booth.category_id || 0)) {
-              throw badRequest(`Row ${row.rowNumber}: Product category does not match Booth category`);
-            }
-
+            mobileUserId = inspected.mobileUserId;
             items.push({
-              boothId: booth.id,
+              boothId: inspected.boothId,
               bookingDate: row.bookingDate,
-              productIds: [product.id],
+              productIds: [productId],
             });
           }
 
           const booking = await createManagementBooking(conn, {
             organizationId: req.auth.organizationId,
             marketId,
-            mobileUserId: user.id,
+            mobileUserId,
             items,
             adminUserId: req.auth.sub,
             notify: true,
           });
           return {
             customerIdentifier: groupRows[0].customerIdentifier,
-            mobileUserId: user.id,
+            mobileUserId,
             rowNumbers: groupRows.map((row) => row.rowNumber),
             itemCount: items.length,
+            createdProducts,
             ...booking,
           };
         });
@@ -4248,24 +4442,41 @@ router.post(
           sendMobilePushNotification(result.notificationId).catch(() => undefined);
         }
         successes.push(result);
+        for (const product of result.createdProducts || []) createdProductsById.set(product.id, product);
       } catch (error) {
         for (const row of groupRows) {
           errors.push({
-            rowNumber: row.rowNumber,
-            customerIdentifier: row.customerIdentifier,
+            ...importRowBase(row),
+            status: 'error',
             message: error.message || 'Import failed',
           });
         }
       }
     }
 
+    const successRows = successes.flatMap((booking) => booking.rowNumbers.map((rowNumber) => {
+      const row = rows.find((item) => item.rowNumber === rowNumber);
+      return {
+        ...importRowBase(row),
+        status: 'imported',
+        message: '',
+        bookingId: booking.id,
+        publicId: booking.publicId,
+      };
+    }));
+    const resultRows = [...successRows, ...errors].sort((a, b) => a.rowNumber - b.rowNumber);
+
     return created(
       res,
       {
+        mode: 'confirmed',
         totalRows: rows.length,
         totalGroups: groups.size,
         successCount: successes.length,
         errorCount: errors.length,
+        createdProductCount: createdProductsById.size,
+        createdProducts: [...createdProductsById.values()],
+        rows: resultRows,
         successes,
         errors,
       },
