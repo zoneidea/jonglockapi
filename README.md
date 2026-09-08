@@ -32,6 +32,15 @@ GET /api/locations/subdistricts?amphureId=30&q=จอมพล
 GET /api/locations/address/:districtId
 ```
 
+## Master data cache
+
+- Uses `node-cache` in the existing response-cache middleware for location master data (24-hour TTL). Existing public market, announcement and app-config caches retain their 60/30/60-second TTLs.
+- Only anonymous GET responses with HTTP 200 are cached. Authenticated/cookie requests, errors, private responses and responses setting cookies bypass the cache.
+- Query strings are part of cache keys. Each namespace has a bounded entry count. Values are cloned to avoid mutation of cached data.
+- `X-Cache: HIT` / `MISS` can be used to verify repeated location requests. No payload or API contract changes are required.
+- Management writes retain existing public-cache invalidation. After importing location master data, restart all API workers (or clear `locations` in every worker).
+- Cache is per Node process, not shared across workers. TTL bounds staleness; invalidation affects only the current worker. Do not apply this cache to bookings, payments, permissions or account data.
+
 ## Notes
 
 - Database schema อยู่ที่ `migrations/001_init.sql`

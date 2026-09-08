@@ -1,28 +1,18 @@
+const NodeCache = require('node-cache');
 const { logger } = require('../config/logger');
 
 const DEFAULT_MAX_ENTRIES = 500;
-const store = new Map();
+const store = new NodeCache({ stdTTL: 60, checkperiod: 60, useClones: true });
+let generation = 0;
 
 function normalizeTtl(ttlSeconds) {
   const ttl = Number(ttlSeconds);
-  return Number.isFinite(ttl) && ttl > 0 ? ttl * 1000 : 60 * 1000;
+  return Number.isFinite(ttl) && ttl > 0 ? ttl : 60;
 }
 
-function pruneExpired(now = Date.now()) {
-  for (const [key, entry] of store.entries()) {
-    if (entry.expiresAt <= now) store.delete(key);
-  }
-}
-
-function enforceMaxEntries(maxEntries) {
-  if (store.size <= maxEntries) return;
-  const deleteCount = store.size - maxEntries;
-  const keys = store.keys();
-  for (let index = 0; index < deleteCount; index += 1) {
-    const next = keys.next();
-    if (next.done) break;
-    store.delete(next.value);
-  }
+function enforceMaxEntries(maxEntries, namespace) {
+  const keys = store.keys().filter((key) => store.get(key)?.namespace === namespace);
+  if (keys.length > maxEntries) store.del(keys.slice(0, keys.length - maxEntries));
 }
 
 function buildDefaultKey(req, namespace) {
@@ -30,38 +20,40 @@ function buildDefaultKey(req, namespace) {
 }
 
 function cacheResponse(options = {}) {
-  const ttlMs = normalizeTtl(options.ttlSeconds);
+  const ttlSeconds = normalizeTtl(options.ttlSeconds);
   const namespace = options.namespace || 'default';
-  const maxEntries = Number(options.maxEntries || DEFAULT_MAX_ENTRIES);
+  const configuredMax = Number(options.maxEntries);
+  const maxEntries = Number.isInteger(configuredMax) && configuredMax > 0 ? configuredMax : DEFAULT_MAX_ENTRIES;
   const keyBuilder = typeof options.key === 'function' ? options.key : (req) => buildDefaultKey(req, namespace);
 
   return function responseCacheMiddleware(req, res, next) {
     if (req.method !== 'GET') return next();
-
-    const now = Date.now();
-    pruneExpired(now);
+    // Only explicitly public master data may use a shared HTTP response cache.
+    if (req.auth || req.headers?.authorization || req.headers?.cookie) return next();
+    const requestGeneration = generation;
 
     const key = keyBuilder(req);
     const cached = store.get(key);
-    if (cached && cached.expiresAt > now) {
+    if (cached) {
       res.setHeader('X-Cache', 'HIT');
-      res.setHeader('Cache-Control', `public, max-age=${Math.floor(ttlMs / 1000)}`);
+      const remainingTtl = Math.max(0, Math.floor((store.getTtl(key) - Date.now()) / 1000));
+      res.setHeader('Cache-Control', `public, max-age=${remainingTtl}`);
       return res.status(cached.statusCode).json(cached.body);
     }
 
     const originalJson = res.json.bind(res);
     res.json = (body) => {
       const statusCode = res.statusCode || 200;
-      if (statusCode >= 200 && statusCode < 300 && !res.getHeader('Set-Cookie')) {
+      if (statusCode === 200 && requestGeneration === generation && !res.getHeader('Set-Cookie')
+        && !/private|no-store/i.test(String(res.getHeader('Cache-Control') || ''))) {
         store.set(key, {
           statusCode,
           body,
-          expiresAt: Date.now() + ttlMs,
           namespace,
-        });
-        enforceMaxEntries(maxEntries);
+        }, ttlSeconds);
+        enforceMaxEntries(maxEntries, namespace);
         res.setHeader('X-Cache', 'MISS');
-        res.setHeader('Cache-Control', `public, max-age=${Math.floor(ttlMs / 1000)}`);
+        res.setHeader('Cache-Control', `public, max-age=${Math.floor(ttlSeconds)}`);
       }
       return originalJson(body);
     };
@@ -71,10 +63,12 @@ function cacheResponse(options = {}) {
 }
 
 function clearResponseCache(namespacePrefix = '') {
+  generation += 1;
   let cleared = 0;
-  for (const [key, entry] of store.entries()) {
-    if (!namespacePrefix || entry.namespace.startsWith(namespacePrefix) || key.startsWith(namespacePrefix)) {
-      store.delete(key);
+  for (const key of store.keys()) {
+    const entry = store.get(key);
+    if (entry && (!namespacePrefix || entry.namespace.startsWith(namespacePrefix) || key.startsWith(namespacePrefix))) {
+      store.del(key);
       cleared += 1;
     }
   }
@@ -83,8 +77,8 @@ function clearResponseCache(namespacePrefix = '') {
 }
 
 function getResponseCacheStats() {
-  pruneExpired();
-  return { size: store.size };
+  const size = store.keys().filter((key) => store.has(key)).length;
+  return { size };
 }
 
 module.exports = {
