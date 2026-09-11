@@ -18,6 +18,7 @@ const { encryptField, blindIndex, decryptField } = require('../../utils/crypto')
 const { publicId } = require('../../utils/id');
 const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/password-policy');
 const { expireStaleBookings } = require('../../utils/booking-status');
+const { deleteBooths } = require('../../services/booth-deletion.service');
 const { PAYMENT_EXPIRES_MINUTES } = require('../../constants/booking');
 const {
   attachBookingItemToLock,
@@ -3720,6 +3721,30 @@ router.patch(
     );
     clearPublicReadCache();
     return ok(res, { updatedCount: result.affectedRows }, 'booths bulk updated');
+  }),
+);
+
+router.delete(
+  '/markets/:marketId/booths/bulk',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  validate(
+    z.object({
+      body: z.object({ boothIds: z.array(z.coerce.number().int().positive()).min(1).max(1000) }),
+      query: z.object({}).passthrough(),
+      params: z.object({ marketId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const organizationId = req.auth.organizationId;
+    await expireStaleBookings({ execute: query }, organizationId);
+    const result = await transaction((connection) => deleteBooths(connection, {
+      organizationId,
+      marketId: req.validated.params.marketId,
+      boothIds: req.validated.body.boothIds,
+    }));
+    clearPublicReadCache();
+    return ok(res, result, 'booths bulk deleted');
   }),
 );
 
