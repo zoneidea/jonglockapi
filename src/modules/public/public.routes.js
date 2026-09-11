@@ -17,6 +17,7 @@ const { badRequest, conflict } = require('../../utils/errors');
 const { expireStaleBookings } = require('../../utils/booking-status');
 const { attachBookingItemToLock, insertBoothDateLock, updateBookingLocksStatus } = require('../../utils/booth-locks');
 const { PAYMENT_EXPIRES_MINUTES } = require('../../constants/booking');
+const BOOTH_HOLD_EXPIRES_SECONDS = 30;
 const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
 const { getFirebaseAuth, getFirebaseInitReason } = require('../../services/firebase-admin.service');
 const { deleteBoothTempLocksByBoothDates } = require('../../services/firestore-locks.service');
@@ -920,7 +921,7 @@ router.post(
         ) VALUES (
           :organizationId, :publicId, :marketId, :mobileUserId, 'mobile', 0, 'draft',
           :subtotalAmount, :discountAmount, :vatAmount, :totalAmount,
-          DATE_ADD(NOW(), INTERVAL ${PAYMENT_EXPIRES_MINUTES} MINUTE)
+          DATE_ADD(NOW(), INTERVAL ${BOOTH_HOLD_EXPIRES_SECONDS} SECOND)
         )`,
         {
           organizationId: booth.organization_id,
