@@ -201,6 +201,13 @@ router.get(
         AND bdl.market_id = b.market_id
         AND bdl.booking_date = :bookingDate
         AND bdl.status IN ('held', 'processing', 'paid')
+        AND EXISTS (
+          SELECT 1 FROM bookings booking
+          WHERE booking.id = bdl.booking_id
+            AND booking.organization_id = bdl.organization_id
+            AND booking.market_id = bdl.market_id
+            AND booking.status <> 'draft'
+        )
        WHERE b.organization_id = :organizationId
          AND b.market_id = :marketId
          AND b.status = 'active'

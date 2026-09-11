@@ -669,6 +669,11 @@ router.get(
                   ELSE 0
                 END) AS availability_rank
          FROM booth_date_locks bdl
+         JOIN bookings booking
+           ON booking.id = bdl.booking_id
+          AND booking.organization_id = bdl.organization_id
+          AND booking.market_id = bdl.market_id
+          AND booking.status <> 'draft'
          WHERE bdl.organization_id = :organizationId
            AND bdl.market_id = :marketId
            AND bdl.floor_plan_id = :floorPlanId
@@ -677,6 +682,7 @@ router.get(
          GROUP BY bdl.booth_id
        ) booking_state ON booking_state.booth_id = b.id
        WHERE b.organization_id = :organizationId
+         AND b.status = 'active'
          AND b.market_id = :marketId
          AND b.floor_plan_id = :floorPlanId
        ORDER BY b.sort_order ASC, b.code ASC, b.name ASC`,
@@ -736,6 +742,7 @@ router.post(
        FROM booths b
        LEFT JOIN product_categories c ON c.id = b.category_id
        WHERE b.organization_id = :organizationId
+         AND b.status = 'active'
          AND b.market_id = :marketId
          AND b.floor_plan_id = :floorPlanId
        ORDER BY b.sort_order ASC, b.code ASC, b.name ASC`,
@@ -754,6 +761,11 @@ router.post(
                 ELSE 0
               END) AS availability_rank
        FROM booth_date_locks bdl
+       JOIN bookings booking
+         ON booking.id = bdl.booking_id
+        AND booking.organization_id = bdl.organization_id
+        AND booking.market_id = bdl.market_id
+        AND booking.status <> 'draft'
        WHERE bdl.organization_id = :organizationId
          AND bdl.market_id = :marketId
          AND bdl.floor_plan_id = :floorPlanId
@@ -2891,6 +2903,7 @@ router.post(
        JOIN organizations o ON o.id = b.organization_id
        LEFT JOIN product_categories c ON c.id = b.category_id
        WHERE b.id = :boothId
+         AND b.status = 'active'
          AND m.status = 'active'
          AND o.status = 'active'
        LIMIT 1`,
@@ -2909,6 +2922,11 @@ router.post(
                 ELSE 0
               END) AS availability_rank
        FROM booth_date_locks bdl
+       JOIN bookings booking
+         ON booking.id = bdl.booking_id
+        AND booking.organization_id = bdl.organization_id
+        AND booking.market_id = bdl.market_id
+        AND booking.status <> 'draft'
        WHERE bdl.organization_id = :organizationId
          AND bdl.market_id = :marketId
          AND bdl.booth_id = :boothId
