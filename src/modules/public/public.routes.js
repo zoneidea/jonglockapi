@@ -580,6 +580,37 @@ router.get(
 );
 
 router.get(
+  '/markets/:marketId/holidays',
+  validate(
+    z.object({
+      body: z.any().optional(),
+      query: z.object({ organizationId: z.coerce.number().int().positive() }),
+      params: z.object({ marketId: z.coerce.number().int().positive() }),
+    }),
+  ),
+  asyncHandler(async (req, res) => {
+    const { marketId } = req.validated.params;
+    const { organizationId } = req.validated.query;
+    const rows = await query(
+      `SELECT mh.id, mh.organization_id, mh.market_id, mh.title,
+          DATE_FORMAT(mh.start_date, '%Y-%m-%d') AS start_date,
+          DATE_FORMAT(mh.end_date, '%Y-%m-%d') AS end_date
+       FROM market_holidays mh
+       JOIN markets m ON m.id = mh.market_id AND m.organization_id = mh.organization_id
+       JOIN organizations o ON o.id = mh.organization_id
+       WHERE mh.organization_id = :organizationId
+         AND mh.market_id = :marketId
+         AND mh.status = 'active'
+         AND m.status = 'active'
+         AND o.status = 'active'
+       ORDER BY mh.start_date ASC, mh.id ASC`,
+      { organizationId, marketId },
+    );
+    return ok(res, rows);
+  }),
+);
+
+router.get(
   '/markets/:marketId/accessories',
   cachePublicMarkets,
   validate(
