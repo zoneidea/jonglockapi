@@ -110,6 +110,7 @@ router.post(
 );
 
 router.use(authenticate, requirePlatform);
+router.use('/organizations', require('./organization.routes'));
 
 router.get(
   '/me',
