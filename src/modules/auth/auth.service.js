@@ -14,7 +14,16 @@ async function getAssignedMarketIds(adminUserId) {
   return rows.map((row) => row.market_id);
 }
 
-async function loginManagement({ organizationCode, username, password, rememberMe = false }) {
+async function findMatchingUser(rows, password) {
+  for (const user of rows) {
+    if (user.status === 'active' && await bcrypt.compare(password, user.password_hash)) {
+      return user;
+    }
+  }
+  throw unauthorized('Username or password is incorrect');
+}
+
+async function loginManagement({ username, password, rememberMe = false }) {
   const usernameHash = blindIndex(username);
   const rows = await query(
     `SELECT au.id, au.organization_id, au.role, au.username_hash, au.password_hash, au.name_enc, au.email_enc, au.status,
@@ -22,16 +31,11 @@ async function loginManagement({ organizationCode, username, password, rememberM
      FROM admin_users au
      JOIN organizations o ON o.id = au.organization_id
      WHERE au.username_hash = :usernameHash
-       AND o.code = :organizationCode
-     LIMIT 1`,
-    { usernameHash, organizationCode },
+     ORDER BY au.id`,
+    { usernameHash },
   );
 
-  const user = rows[0];
-  if (!user || user.status !== 'active') throw unauthorized('Username or password is incorrect');
-
-  const valid = await bcrypt.compare(password, user.password_hash);
-  if (!valid) throw unauthorized('Username or password is incorrect');
+  const user = await findMatchingUser(rows, password);
 
   if (user.role === ROLES.AUDIT) {
     throw forbidden('Audit role must use mobile audit route');
@@ -64,21 +68,17 @@ async function loginManagement({ organizationCode, username, password, rememberM
   };
 }
 
-async function loginMobile({ organizationId, username, password }) {
+async function loginMobile({ username, password }) {
   const usernameHash = blindIndex(username);
   const rows = await query(
     `SELECT id, organization_id, password_hash, first_name_enc, last_name_enc, status
      FROM mobile_users
-     WHERE organization_id = :organizationId AND username_hash = :usernameHash
-     LIMIT 1`,
-    { organizationId, usernameHash },
+     WHERE username_hash = :usernameHash
+     ORDER BY id`,
+    { usernameHash },
   );
 
-  const user = rows[0];
-  if (!user || user.status !== 'active') throw unauthorized('Username or password is incorrect');
-
-  const valid = await bcrypt.compare(password, user.password_hash);
-  if (!valid) throw unauthorized('Username or password is incorrect');
+  const user = await findMatchingUser(rows, password);
 
   const token = signToken(
     {

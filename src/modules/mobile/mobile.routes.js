@@ -54,7 +54,6 @@ function isDuplicateKeyError(error) {
 
 const loginSchema = z.object({
   body: z.object({
-    organizationId: z.coerce.number().int().positive(),
     username: z.string().min(1),
     password: z.string().min(1),
   }),
