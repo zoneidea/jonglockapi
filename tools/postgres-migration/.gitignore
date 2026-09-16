@@ -1,0 +1,8 @@
+*.local.*
+*.dump
+*.backup
+*.csv
+*.log
+*.reject
+*.dat
+artifacts/

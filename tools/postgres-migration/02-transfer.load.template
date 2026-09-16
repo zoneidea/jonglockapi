@@ -1,0 +1,15 @@
+-- PREPARATION ONLY: not approved to execute. All connection values are placeholders.
+-- Use a RESTORED, immutable MySQL snapshot and a NEW EMPTY PostgreSQL database.
+-- Confirm version-specific casts against the inventory and preflight first.
+-- Do not put real credentials in this tracked template.
+LOAD DATABASE
+  FROM mysql://READ_ONLY_USER:REPLACE_PASSWORD@source.invalid:3306/REPLACE_SOURCE_DB
+  INTO postgresql://MIGRATION_USER:REPLACE_PASSWORD@target.invalid:5432/REPLACE_EMPTY_TARGET_DB
+  WITH include no drop, no truncate, create tables, create indexes,
+       reset sequences, foreign keys, uniquify index names,
+       workers = 2, concurrency = 1
+;
+-- All source tables are included. No filter; source schema name is retained.
+-- Defaults are a starting point, NOT an approved application schema mapping.
+-- Do not add data-altering casts (zero-date -> NULL, enum -> text, etc.)
+-- without an explicit per-column decision and reconciliation test.
