@@ -34,11 +34,11 @@ function createOrganizationService({ query, transaction, decryptField, hashPassw
     const paging = pagination(filters);
     const params = { organizationId, limit: paging.limit, offset: paging.offset };
     const [[total], rows] = await Promise.all([
-      query('SELECT COUNT(*) AS total FROM markets WHERE organization_id = :organizationId', params),
+      query('SELECT COUNT(*) AS total FROM markets WHERE organization_id = :organizationId AND deleted_at IS NULL', params),
       query(`SELECT m.id, m.code, m.name, m.status,
         (SELECT COUNT(*) FROM floor_plans fp WHERE fp.organization_id = :organizationId AND fp.market_id = m.id) AS zone_count,
         (SELECT COUNT(*) FROM booths b WHERE b.organization_id = :organizationId AND b.market_id = m.id AND b.status <> 'deleted') AS booth_count
-        FROM markets m WHERE m.organization_id = :organizationId ORDER BY m.id DESC LIMIT :limit OFFSET :offset`, params),
+        FROM markets m WHERE m.organization_id = :organizationId AND m.deleted_at IS NULL ORDER BY m.id DESC LIMIT :limit OFFSET :offset`, params),
     ]);
     return pageResult(rows.map((r) => ({ id: r.id, code: r.code, name: r.name, status: r.status, zoneCount: Number(r.zone_count), boothCount: Number(r.booth_count) })), total, paging);
   }

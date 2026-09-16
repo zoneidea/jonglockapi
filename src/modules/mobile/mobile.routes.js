@@ -251,7 +251,7 @@ router.post(
     const vatSettings = await getOrganizationVatSettings({ execute: query }, req.auth.organizationId);
     const result = await transaction(async (conn) => {
       const [marketRows] = await conn.execute(
-        `SELECT id FROM markets WHERE id = :marketId AND organization_id = :organizationId AND status = 'active' LIMIT 1`,
+        `SELECT id FROM markets WHERE id = :marketId AND organization_id = :organizationId AND status = 'active' LIMIT 1 FOR UPDATE`,
         { marketId, organizationId: req.auth.organizationId },
       );
       if (!marketRows.length) throw notFound('Market not found');

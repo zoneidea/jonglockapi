@@ -1060,6 +1060,12 @@ async function createManagementBooking(conn, {
   adminUserId,
   notify = false,
 }) {
+  const [availableMarkets] = await conn.execute(
+    `SELECT id FROM markets WHERE organization_id = :organizationId AND id = :marketId
+     AND status = 'active' AND deleted_at IS NULL FOR UPDATE`,
+    { organizationId, marketId },
+  );
+  if (!availableMarkets.length) throw notFound('ตลาดปิดใช้งานหรือถูกลบแล้ว');
   await expireStaleBookings(conn, organizationId);
   const [users] = await conn.execute(
     `SELECT id
@@ -2730,6 +2736,7 @@ router.get(
        LEFT JOIN admin_market_assignments ama
          ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE m.organization_id = :organizationId
+         AND m.deleted_at IS NULL
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
        ORDER BY m.name`,
       {
@@ -2751,6 +2758,37 @@ router.get(
   asyncHandler(async (req, res) => {
     const code = await buildNextMarketCode(req.auth.organizationId);
     return ok(res, { code });
+  }),
+);
+
+router.patch(
+  '/markets/:marketId/basic',
+  requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(),
+  validate(z.object({
+    params: z.object({ marketId: z.coerce.number().int().positive() }),
+    query: z.object({}).passthrough(),
+    body: z.object({ name: z.string().trim().min(1).max(255), status: z.enum(['active', 'inactive']) }).strict(),
+  })),
+  asyncHandler(async (req, res) => {
+    const { updateMarketBasics } = require('../../services/market-management.service');
+    const result = await transaction((conn) => updateMarketBasics(conn,
+      { organizationId: req.auth.organizationId, marketId: req.validated.params.marketId }, req.validated.body));
+    clearPublicReadCache();
+    return ok(res, result, 'market updated');
+  }),
+);
+
+router.delete(
+  '/markets/:marketId',
+  requireRoles(ROLES.SUPERVISOR),
+  validate(z.object({ params: z.object({ marketId: z.coerce.number().int().positive() }), query: z.object({}).passthrough(), body: z.object({}).optional() })),
+  asyncHandler(async (req, res) => {
+    const { softDeleteMarket } = require('../../services/market-management.service');
+    const result = await transaction((conn) => softDeleteMarket(conn,
+      { organizationId: req.auth.organizationId, marketId: req.validated.params.marketId }));
+    clearPublicReadCache();
+    return ok(res, result, 'market deleted');
   }),
 );
 
@@ -2780,7 +2818,7 @@ router.patch(
     const currentRows = await query(
       `SELECT main_image_url
        FROM markets
-       WHERE id = :marketId AND organization_id = :organizationId
+       WHERE id = :marketId AND organization_id = :organizationId AND deleted_at IS NULL
        LIMIT 1`,
       { organizationId: req.auth.organizationId, marketId: parsed.params.marketId },
     );
@@ -2800,7 +2838,7 @@ router.patch(
            line_id = :lineId,
            email = :email,
            terms = :terms
-       WHERE id = :marketId AND organization_id = :organizationId`,
+       WHERE id = :marketId AND organization_id = :organizationId AND deleted_at IS NULL`,
       {
         organizationId: req.auth.organizationId,
         marketId: parsed.params.marketId,
