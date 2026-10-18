@@ -102,7 +102,7 @@ async function loginMobile({ username, password }) {
   };
 }
 
-async function loginAudit({ organizationCode, username, password }) {
+async function loginAudit({ username, password }) {
   const usernameHash = blindIndex(username);
   const rows = await query(
     `SELECT au.id, au.organization_id, au.role, au.password_hash, au.name_enc, au.status,
@@ -111,16 +111,11 @@ async function loginAudit({ organizationCode, username, password }) {
      JOIN organizations o ON o.id = au.organization_id
      WHERE au.username_hash = :usernameHash
        AND au.role = 'audit'
-       AND o.code = :organizationCode
-     LIMIT 1`,
-    { usernameHash, organizationCode },
+     ORDER BY au.id`,
+    { usernameHash },
   );
 
-  const user = rows[0];
-  if (!user || user.status !== 'active') throw unauthorized('Username or password is incorrect');
-
-  const valid = await bcrypt.compare(password, user.password_hash);
-  if (!valid) throw unauthorized('Username or password is incorrect');
+  const user = await findMatchingUser(rows, password);
 
   const marketIds = await getAssignedMarketIds(user.id);
   const token = signToken(

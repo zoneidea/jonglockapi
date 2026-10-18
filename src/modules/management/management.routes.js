@@ -17,6 +17,7 @@ const { AppError, badRequest, conflict, notFound } = require('../../utils/errors
 const { encryptField, blindIndex, decryptField } = require('../../utils/crypto');
 const { publicId } = require('../../utils/id');
 const { assertPasswordPolicy, PASSWORD_POLICY_MESSAGE } = require('../../utils/password-policy');
+const { assertAdminCredentialPairAvailable } = require('../../utils/admin-credentials');
 const { expireStaleBookings } = require('../../utils/booking-status');
 const { deleteBooths } = require('../../services/booth-deletion.service');
 const { PAYMENT_EXPIRES_MINUTES } = require('../../constants/booking');
@@ -6939,6 +6940,9 @@ router.post(
     }
     await assertPlanQuota(req.auth.organizationId, 'admin_management', 1);
 
+    const usernameHash = blindIndex(body.username);
+    await assertAdminCredentialPairAvailable({ query, usernameHash, password: body.password });
+
     const result = await query(
       `INSERT INTO admin_users (
         organization_id, username_hash, password_hash, role,
@@ -6949,7 +6953,7 @@ router.post(
       )`,
       {
         organizationId: req.auth.organizationId,
-        usernameHash: blindIndex(body.username),
+        usernameHash,
         passwordHash: await bcrypt.hash(body.password, 12),
         role: body.role,
         nameEnc: encryptField(body.name),
@@ -7001,7 +7005,7 @@ router.patch(
 
     const result = await transaction(async (conn) => {
       const [admins] = await conn.execute(
-        `SELECT id
+        `SELECT id, username_hash
          FROM admin_users
          WHERE id = :adminUserId
            AND organization_id = :organizationId
@@ -7010,6 +7014,18 @@ router.patch(
         { adminUserId, organizationId: req.auth.organizationId },
       );
       if (!admins.length) throw notFound('Admin not found');
+
+      if (body.password) {
+        await assertAdminCredentialPairAvailable({
+          query: async (sql, params) => {
+            const [rows] = await conn.execute(sql, params);
+            return rows;
+          },
+          usernameHash: admins[0].username_hash,
+          password: body.password,
+          excludeAdminUserId: adminUserId,
+        });
+      }
 
       const updates = [
         'role = :role',

@@ -70,6 +70,29 @@ for (const method of ['loginManagement', 'loginMobile']) {
   });
 }
 
+test('loginAudit selects the matching audit account without organization input', async () => {
+  const h = harness([
+    account(1, { role: 'audit', password_hash: otherHash }),
+    account(2, { role: 'audit' }),
+  ]);
+  const result = await h.service.loginAudit({ username: 'shared', password: 'correct-password' });
+  assert.equal(result.user.id, 2);
+  assert.equal(result.user.organizationId, 20);
+  assert.equal(h.tokens[0].payload.userType, 'audit');
+  assert.equal(h.tokens[0].payload.organizationId, 20);
+  assert.equal(h.calls[1].params.adminUserId, 2);
+  assert.equal(Object.keys(h.calls[0].params).join(), 'usernameHash');
+  assert.doesNotMatch(h.calls[0].sql, /LIMIT 1|:organizationId|:organizationCode/);
+});
+
+test('loginAudit rejects wrong password and inactive-only matches', async () => {
+  for (const rows of [[account(1, { role: 'audit', password_hash: otherHash })], [account(1, { role: 'audit', status: 'inactive' })]]) {
+    const h = harness(rows);
+    await assert.rejects(h.service.loginAudit({ username: 'shared', password: 'correct-password' }), { statusCode: 401 });
+    assert.equal(h.tokens.length, 0);
+  }
+});
+
 test('management still rejects audit accounts', async () => {
   const h = harness([account(1, { role: 'audit' })]);
   await assert.rejects(h.service.loginManagement({ username: 'audit', password: 'correct-password' }), { statusCode: 403 });

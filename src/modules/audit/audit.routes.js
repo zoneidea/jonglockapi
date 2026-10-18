@@ -19,7 +19,6 @@ router.post(
   validate(
     z.object({
       body: z.object({
-        organizationCode: z.string().min(1),
         username: z.string().min(1),
         password: z.string().min(1),
       }),
