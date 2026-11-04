@@ -28,6 +28,15 @@ const envSchema = z.object({
   FIREBASE_PROJECT_ID: z.string().default(''),
   FIREBASE_CLIENT_EMAIL: z.string().default(''),
   FIREBASE_PRIVATE_KEY: z.string().default(''),
+  // ReservePay payment gateway. RESERVEPAY_API_KEY is secret: keep it in the server env only.
+  RESERVEPAY_API_URL: z.string().url().default('https://api.reservepay.com'),
+  RESERVEPAY_API_KEY: z.string().default(''),
+  RESERVEPAY_WEBHOOK_KEY: z.string().default(''),
+  RESERVEPAY_MERCHANT_ID: z.string().default(''),
+  RESERVEPAY_INSTALLATION_ID_IOS: z.string().default(''),
+  RESERVEPAY_INSTALLATION_ID_ANDROID: z.string().default(''),
+  // Keep false until payments update bookings (webhook / find-payment) end to end.
+  RESERVEPAY_CHECKOUT_ENABLED: z.enum(['true', 'false']).default('false').transform((value) => value === 'true'),
 });
 
 const parsed = envSchema.safeParse(process.env);

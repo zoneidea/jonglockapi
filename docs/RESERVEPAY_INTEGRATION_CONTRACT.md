@@ -1,6 +1,6 @@
 # ReservePay integration proposal and API contract
 
-สถานะ: แบบเสนอสำหรับอนุมัติโครงสร้างก่อนเขียน migration และ implementation
+สถานะ: อนุมัติโครงสร้างแล้ว มี backend implementation และ migration 051–053; เปิด checkout หลังทดสอบ staging, provider sandbox และแอปรองรับ JWT contract แล้วเท่านั้น
 
 ขอบเขตแรกคือชำระค่าจองหลาย booking ในองค์กรเดียว ผ่าน ReservePay โดยใช้ customer JWT ของ backend การจ่ายข้ามองค์กร บัตร ค่าปรับ refund และ payout แยกองค์กรยังไม่อยู่ในขอบเขตเปิดใช้ครั้งแรก เก็บ `RESERVEPAY_CHECKOUT_ENABLED=false` จนผ่าน acceptance tests และยืนยันข้อตกลงรับเงินแทนองค์กร
 
@@ -207,8 +207,10 @@ webhook route ที่วางก่อน global logger ต้องมี sa
 | webhook หายหรือปิด checkout flag ขณะมีรายการค้าง | cron/status recover และ settle ต่อได้ |
 | existing manual/ksher/mock rows และรายงานบัญชี | แถวเดิมยังใช้ได้; manual proof route ไม่อนุมัติ gateway payment |
 
-## Approval required for implementation
+## Approved implementation scope
 
-ขออนุมัติเพิ่ม payment_attempts, FK/index และ callback inbox fields ตามแบบนี้ พร้อมเปลี่ยน app-facing ReservePay contract เป็น customer JWT ภายใต้ mobile prefix เหตุผลคือรองรับหนึ่ง gateway payment ต่อหลาย booking โดยรักษารายงานเดิม ป้องกันจ่ายซ้ำ และกู้ผลหลัง timeout/webhook retry ได้
+อนุมัติเพิ่ม payment_attempts, FK/index และ callback inbox fields ตามแบบนี้ พร้อมเปลี่ยน app-facing ReservePay contract เป็น customer JWT ภายใต้ mobile prefix เพื่อรองรับหนึ่ง gateway payment ต่อหลาย booking โดยรักษารายงานเดิม ป้องกันจ่ายซ้ำ และกู้ผลหลัง timeout/webhook retry ได้ ใช้ lease_token เพิ่มจาก lease_until เพื่อกัน worker เก่าเขียนทับ worker ใหม่
 
 การออกแบบ login bridge สำหรับ public profile และการจ่ายข้ามองค์กรต้องแยกอนุมัติหากจำเป็น ไม่ถือว่า contract นี้อนุมัติให้ขยาย authentication ทั้งระบบหรือแก้ app/frontend/landing
+
+ขั้นตอน deploy, recovery ของ migration และคำสั่งทดสอบอยู่ใน [ReservePay rollout](RESERVEPAY_ROLLOUT.md)

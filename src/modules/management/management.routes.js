@@ -4847,6 +4847,9 @@ router.delete(
       const booking = bookings[0];
       if (!booking) throw notFound('Booking not found');
       if (booking.status !== 'pending_payment') throw badRequest('Only pending_payment bookings can be deleted');
+      await require('../../services/reservepay-store.service').assertNoGatewayPayment(
+        conn, req.auth.organizationId, booking.id, { preserveHistory: true },
+      );
 
       const [items] = await conn.execute(
         `SELECT id
@@ -5368,6 +5371,11 @@ router.patch(
       );
       const payment = rows[0];
       if (!payment) throw notFound('Payment proof not found');
+      if (payment.booking_id) {
+        await require('../../services/reservepay-store.service').assertNoGatewayPayment(
+          conn, req.auth.organizationId, payment.booking_id,
+        );
+      }
       if (!['waiting', 'failed'].includes(payment.status)) throw badRequest('Payment proof is not reviewable');
       if (payment.audit_check_id && !['waiting', 'pending'].includes(payment.fine_payment_status)) {
         throw badRequest('Fine payment is not waiting for review');

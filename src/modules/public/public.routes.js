@@ -23,6 +23,7 @@ const { getFirebaseAuth, getFirebaseInitReason } = require('../../services/fireb
 const { deleteBoothTempLocksByBoothDates } = require('../../services/firestore-locks.service');
 const { getAppIconSettings } = require('../platform/platform.service');
 const authService = require('../auth/auth.service');
+const { assertNoGatewayPayment } = require('../../services/reservepay-store.service');
 
 const router = express.Router();
 const PUBLIC_SIGNUP_PLAN_CODE = 'free_full_1y';
@@ -1483,6 +1484,7 @@ router.post(
       const booking = bookingRows[0];
       if (!booking) throw badRequest('Booking not found');
       if (emailHash !== booking.email_hash) throw badRequest('Booking owner does not match');
+      await assertNoGatewayPayment(conn, booking.organization_id, booking.id);
       if (!['pending_payment', 'payment_processing'].includes(booking.status)) throw badRequest('Booking is not payable');
       if (!booking.expires_at || new Date(booking.expires_at).getTime() <= Date.now()) throw badRequest('Booking has expired');
 
@@ -1492,6 +1494,7 @@ router.post(
          FROM payments
          WHERE organization_id = :organizationId
            AND booking_id = :bookingId
+           AND provider <> 'reservepay'
            AND status IN ('created', 'waiting', 'failed')
          ORDER BY id DESC
          LIMIT 1

@@ -10,6 +10,7 @@ const { badRequest, notFound } = require('../../utils/errors');
 const { publicId } = require('../../utils/id');
 const { expireStaleBookings } = require('../../utils/booking-status');
 const { updateBookingLocksStatus } = require('../../utils/booth-locks');
+const { assertNoGatewayPayment } = require('../../services/reservepay-store.service');
 
 const router = express.Router();
 
@@ -44,6 +45,7 @@ router.post(
       );
       const booking = bookings[0];
       if (!booking) throw notFound('Booking not found');
+      await assertNoGatewayPayment(conn, req.auth.organizationId, booking.id);
       if (booking.status !== 'pending_payment') throw badRequest('Booking is not payable');
 
       const publicPaymentId = publicId('PAY');
@@ -96,6 +98,8 @@ router.post(
 router.post(
   '/callbacks/:provider',
   asyncHandler(async (req, res) => {
+    // ReservePay is handled exclusively by the raw-body signature-verifying route.
+    if (String(req.params.provider).toLowerCase() === 'reservepay') return res.sendStatus(404);
     await query(
       `INSERT INTO payment_callbacks (organization_id, provider, payload_json, received_at)
        VALUES (NULL, :provider, :payloadJson, NOW())`,

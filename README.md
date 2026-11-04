@@ -46,6 +46,7 @@ GET /api/locations/address/:districtId
 - Database schema อยู่ที่ `migrations/001_init.sql`
 - รายละเอียด requirement, legacy mapping, RBAC และ security rules อยู่ที่ `AGENT.md`
 - Deployment checklist สำหรับ MVP อยู่ที่ `docs/MVP_DEPLOYMENT_CHECKLIST.md`
+- ReservePay API contract: `docs/RESERVEPAY_INTEGRATION_CONTRACT.md`; migration/webhook/cron rollout: `docs/RESERVEPAY_ROLLOUT.md`
 
 ## Quality Gates
 

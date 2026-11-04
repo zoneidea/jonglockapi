@@ -6,8 +6,15 @@ const { ok } = require('../../utils/api-response');
 const { forbidden } = require('../../utils/errors');
 const { expireStaleBookings } = require('../../utils/booking-status');
 const { cleanupExpiredBoothTempLocks } = require('../../services/firestore-locks.service');
+const { recover } = require('../../services/reservepay-recovery.service');
 
 const router = express.Router();
+
+router.post('/reservepay-reconcile', asyncHandler(async (req, res) => {
+  // Fail closed; do not inherit the legacy cron fallback when no secret is set.
+  if (!env.CRON_SECRET || req.get('x-cron-secret') !== env.CRON_SECRET) throw forbidden('Invalid cron secret');
+  return ok(res, await recover());
+}));
 
 function requireCronSecret(req) {
   if (!env.CRON_SECRET) return;

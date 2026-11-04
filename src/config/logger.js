@@ -5,6 +5,7 @@ const logger = pino({
   redact: {
     paths: [
       'req.headers.authorization',
+      'req.headers["x-cron-secret"]',
       'password',
       '*.password',
       '*.token',
