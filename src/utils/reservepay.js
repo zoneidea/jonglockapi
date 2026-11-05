@@ -33,6 +33,7 @@ function unixDate(value) {
 }
 
 function publicAttempt(row, bookingIds) {
+  const minimum = /^AMOUNT_BELOW_MINIMUM:(\d{1,14})$/.exec(String(row.last_error_code || ''));
   return {
     attemptId: row.public_id,
     paymentId: row.provider_reference || null,
@@ -40,6 +41,7 @@ function publicAttempt(row, bookingIds) {
     paymentMethod: row.payment_method || null,
     status: row.state,
     providerStatus: row.provider_status || null,
+    ...(minimum ? { failureCode: 'AMOUNT_BELOW_MINIMUM', minimumAmount: minimum[1] } : {}),
     amount: String(row.amount_minor),
     currency: row.currency,
     ...(bookingIds ? { bookingIds } : {}),

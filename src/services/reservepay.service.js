@@ -46,6 +46,14 @@ async function requestMerchantApi(endpoint, body = {}) {
     const code = /^[A-Z0-9_]{1,80}$/.test(String(candidate || '')) ? candidate : `HTTP_${response.status}`;
     const error = new AppError(502, `Payment provider error (${code})`, 'PAYMENT_PROVIDER_ERROR');
     error.providerCode = code;
+    // Keep only a numeric payment limit; never retain arbitrary provider messages or PII.
+    const details = Array.isArray(json?.[2]) ? json[2] : [];
+    const amountError = details.find((detail) => detail.argument === 'amount' && detail.type === 'invalid_amount');
+    const minimum = /\bbelow minimum (\d{1,12}(?:\.\d{1,2})?)\b/.exec(String(amountError?.message || ''));
+    if (code === 'INVALID_ARGUMENTS' && minimum) {
+      const { minorUnits } = require('../utils/reservepay');
+      error.amountConstraintCode = `AMOUNT_BELOW_MINIMUM:${minorUnits(minimum[1])}`;
+    }
     // Do not attach provider payloads to errors: the shared error handler logs them.
     throw error;
   }
