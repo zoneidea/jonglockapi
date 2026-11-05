@@ -48,6 +48,7 @@ async function migrate() {
       }
     }
 
+    await new (require('../services/organization-payment-settings-initializer').OrganizationPaymentSettingsInitializer)().initialize(connection);
     logger.info('Migrations completed');
   } finally {
     connection.release();

@@ -1,3 +1,5 @@
+> Superseded by [organization-wide settings](ORGANIZATION_PAYMENT_SETTINGS.md) and migration 056.
+
 # Market booking payment settings and payment status delivery
 
 ## Contract

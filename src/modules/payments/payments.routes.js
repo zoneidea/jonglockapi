@@ -45,7 +45,7 @@ router.post(
       );
       const booking = bookings[0];
       if (!booking) throw notFound('Booking not found');
-      await require('../../services/market-payment-settings.service').assertManualAllowed(conn, req.auth.organizationId, booking.market_id);
+      await require('../../services/organization-payment-settings.service').assertManualAllowed(conn, req.auth.organizationId);
       await assertNoGatewayPayment(conn, req.auth.organizationId, booking.id);
       if (booking.status !== 'pending_payment') throw badRequest('Booking is not payable');
 

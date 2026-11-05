@@ -1417,9 +1417,10 @@ router.post(
     if (!(booking.status === 'payment_processing' && booking.provider === 'reservepay')
       && (!booking.expires_at || new Date(booking.expires_at).getTime() <= Date.now())) throw badRequest('Booking has expired');
 
-    const paymentOptions = await require('../../services/market-payment-settings.service').paymentOptions(booking.organization_id, booking.market_id);
+    const paymentOptions = await require('../../services/organization-payment-settings.service').paymentOptions(booking.organization_id);
     return ok(res, {
       paymentMode: paymentOptions.mode,
+      paymentSettingsScope: paymentOptions.scope,
       bookingId: booking.id,
       publicId: booking.public_id,
       organizationId: booking.organization_id,
@@ -1449,7 +1450,7 @@ router.post(
           promptpayId: paymentOptions.details.promptpayId || '', bankName: paymentOptions.details.bankName || '',
           bankAccountName: paymentOptions.details.accountName || '', bankAccountNo: paymentOptions.details.accountNumber || '',
           qrCodeImageUrl: paymentOptions.details.qrCodeImageUrl || '', instructions: paymentOptions.details.instructions || '',
-        } : paymentOptions.mode === 'gateway' ? {
+        } : paymentOptions.mode !== 'legacy' ? {
           promptpayId: '', bankName: '', bankAccountName: '', bankAccountNo: '', qrCodeImageUrl: '', instructions: '',
         } : {}),
       },
@@ -1494,7 +1495,7 @@ router.post(
       const booking = bookingRows[0];
       if (!booking) throw badRequest('Booking not found');
       if (emailHash !== booking.email_hash) throw badRequest('Booking owner does not match');
-      await require('../../services/market-payment-settings.service').assertManualAllowed(conn, booking.organization_id, booking.market_id);
+      await require('../../services/organization-payment-settings.service').assertManualAllowed(conn, booking.organization_id);
       await assertNoGatewayPayment(conn, booking.organization_id, booking.id);
       if (!['pending_payment', 'payment_processing'].includes(booking.status)) throw badRequest('Booking is not payable');
       if (!booking.expires_at || new Date(booking.expires_at).getTime() <= Date.now()) throw badRequest('Booking has expired');

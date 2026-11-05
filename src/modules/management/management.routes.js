@@ -1886,6 +1886,9 @@ router.get(
   }),
 );
 
+router.use('/organization-settings/payments', requireRoles(ROLES.SUPERVISOR),
+  paymentAssetUpload.single('paymentQrCodeImage'), require('../payments/organization-payment-settings.routes'));
+
 router.get(
   '/organization-settings',
   requireRoles(ROLES.SUPERVISOR),
@@ -1941,13 +1944,21 @@ router.put(
   ),
   asyncHandler(async (req, res) => {
     const body = req.validated.body;
+    if (req.file || Object.keys(req.body || {}).some(key => key.startsWith('payment'))) {
+      throw new AppError(409, 'กรุณาใช้ฟอร์มช่องทางรับชำระเงินขององค์กร และโหลดเว็บใหม่ก่อนบันทึก', 'PAYMENT_SETTINGS_MOVED');
+    }
     const existingRows = await query(
-      `SELECT payment_qrcode_image_url
+      `SELECT payment_qrcode_image_url, payment_promptpay_id, payment_bank_name, payment_bank_account_name, payment_bank_account_no, payment_instructions
        FROM organizations
        WHERE id = :organizationId
        LIMIT 1`,
       { organizationId: req.auth.organizationId },
     );
+    Object.assign(body, {
+      paymentPromptpayId: existingRows[0]?.payment_promptpay_id || '', paymentBankName: existingRows[0]?.payment_bank_name || '',
+      paymentBankAccountName: existingRows[0]?.payment_bank_account_name || '', paymentBankAccountNo: existingRows[0]?.payment_bank_account_no || '',
+      paymentInstructions: existingRows[0]?.payment_instructions || '',
+    });
     const paymentQrCodeImageUrl = req.file
       ? publicUploadUrl(req, req.file.path)
       : existingRows[0]?.payment_qrcode_image_url || null;

@@ -24,6 +24,8 @@ test('MySQL migrations, tenant FKs, concurrent checkout, duplicate event and ato
     // Minimal pre-expansion schema: exercises actual MySQL DDL, row locks and rollback.
     const base = [
       'CREATE TABLE organizations (id BIGINT UNSIGNED PRIMARY KEY)',
+      'CREATE TABLE markets (id BIGINT UNSIGNED PRIMARY KEY, organization_id BIGINT UNSIGNED)',
+      `CREATE TABLE mobile_notifications (id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY, organization_id BIGINT UNSIGNED, mobile_user_id BIGINT UNSIGNED, title VARCHAR(255), body TEXT, data_json JSON)`,
       'CREATE TABLE mobile_users (id BIGINT UNSIGNED PRIMARY KEY, organization_id BIGINT UNSIGNED, status VARCHAR(20), email_enc TEXT, first_name_enc TEXT, last_name_enc TEXT)',
       `CREATE TABLE bookings (id BIGINT UNSIGNED PRIMARY KEY, organization_id BIGINT UNSIGNED, mobile_user_id BIGINT UNSIGNED,
         status VARCHAR(40), total_amount DECIMAL(12,2), expires_at DATETIME, paid_at DATETIME, cart_visible TINYINT)`,
@@ -38,11 +40,12 @@ test('MySQL migrations, tenant FKs, concurrent checkout, duplicate event and ato
         provider VARCHAR(80), payload_json JSON, received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`,
     ];
     for (const sql of base) await pool.query(sql);
-    for (const file of ['051_reservepay_attempts.sql', '052_reservepay_payment_mapping.sql', '053_reservepay_callback_inbox.sql', '054_reservepay_payment_channel.sql']) {
+    for (const file of ['051_reservepay_attempts.sql', '052_reservepay_payment_mapping.sql', '053_reservepay_callback_inbox.sql', '054_reservepay_payment_channel.sql', '055_market_payment_settings.sql', '056_organization_payment_settings.sql']) {
       const sql = fs.readFileSync(path.join(__dirname, '../migrations', file), 'utf8');
       for (const statement of sql.split(/;\s*$/m).map((s) => s.trim()).filter(Boolean)) await pool.query(statement);
     }
     await pool.query('INSERT INTO organizations VALUES (7),(8)');
+    await pool.query("INSERT INTO organization_payment_settings (organization_id,mode,sync_state) VALUES (7,'gateway','ready'),(8,'manual','inactive')");
     await pool.query("INSERT INTO mobile_users VALUES (9,7,'active',NULL,NULL,NULL)");
     await pool.query("INSERT INTO bookings VALUES (101,7,9,'pending_payment',100,NOW() + INTERVAL 10 MINUTE,NULL,1),(102,7,9,'pending_payment',250,NOW() + INTERVAL 10 MINUTE,NULL,1)");
     await pool.query("INSERT INTO booking_items VALUES (1,7,101,1,'2026-11-04','pending_payment'),(2,7,102,2,'2026-11-04','pending_payment')");

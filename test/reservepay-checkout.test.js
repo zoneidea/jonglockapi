@@ -16,11 +16,11 @@ let invalidLock;
 function reset() {
   attempt = null; allocations = []; gatewayCalls = 0; transactions = 0; gatewayFailure = false; invalidLock = false;
   env.RESERVEPAY_CHECKOUT_ENABLED = true;
-  bookings = [101, 102].map((id, i) => ({ id, organization_id: 7, mobile_user_id: 9, status: 'pending_payment', total_amount: ['100.00', '250.00'][i], expires_at: new Date(Date.now() + 600000) }));
+  bookings = [101, 102].map((id, i) => ({ id, market_id: 31 + i, organization_id: 7, mobile_user_id: 9, status: 'pending_payment', total_amount: ['100.00', '250.00'][i], expires_at: new Date(Date.now() + 600000) }));
 }
 async function execute(sql, p) {
   const q = sql.replace(/\s+/g, ' ').trim();
-  if (q.includes('FROM market_payment_settings')) return [[]];
+  if (q.includes('FROM organization_payment_settings')) return [[{mode: 'gateway', sync_state: 'ready'}]];
   if (q.startsWith('SELECT * FROM bookings')) return [bookings.filter((b) => b.id === p.bookingId && b.organization_id === p.organizationId && b.mobile_user_id === p.userId)];
   if (q.startsWith('SELECT * FROM payment_attempts')) return [[...(attempt ? [attempt] : [])]];
   if (q.startsWith('SELECT id FROM payments')) return [[]];
