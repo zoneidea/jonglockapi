@@ -59,7 +59,7 @@ test('collection mode persists with defaults, supervisor access and customer dis
     const hidden=await (await fetch(`${base}/public/markets/2`)).json(); assert.equal(hidden.data,null);
     const plans=await (await fetch(`${base}/public/markets/2/floor-plans`)).json(); assert.deepEqual(plans.data,[]);
     const hold=await fetch(`${base}/public/booths/20/hold`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dates:['2026-12-01'],user:{email:'test@example.test'}})});
-    assert.equal(hold.status,404);
+    assert.equal(hold.status,400); assert.equal((await hold.json()).message,'Booth is not available');
     const news=await (await fetch(`${base}/public/announcements?type=news`)).json(); assert.deepEqual(news.data.map(n=>n.id),[1,3]);
   } finally {await new Promise(resolve=>server.close(resolve));}
 });
