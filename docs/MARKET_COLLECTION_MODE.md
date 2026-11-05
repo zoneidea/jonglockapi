@@ -25,3 +25,20 @@ Collection mode is independent of organization payment settings (`manual`/`gatew
 System collection still follows the organization's configured payment channels;
 this does not register/unregister ReservePay recipients or alter financial history.
 Request/response/activity logging continues through existing event logging middleware.
+
+## Production rollout — 2026-11-05
+
+Backend ce9309a deployed through Plesk; migration 059 applied successfully and API
+restarted. Frontend 22b976c built locally and on server. Prior dist backed up to
+`.management-releases/before-collection-059-20261105`; build staged at
+`.management-releases/collection-059-20261105`. New assets copied before atomic
+index activation; original .htaccess and prior hashed assets retained. Live index
+references `/assets/index-ClFGc9lD.js`. Live /markets shows the collection column;
+Add Market modal shows both choices, defaults to system, and switching to self
+updates selection correctly. No production test market was created or saved.
+Public markets returned HTTP 200 (four existing markets), banner feed HTTP 200
+(two existing banners). Backend suite: 104 passed, one optional MySQL integration
+skipped; lint passed. Route regression tests cover multipart self/system/default,
+invalid modes, supervisor-only creation, hidden detail/list/floor plans, holds denied
+with existing HTTP 400 response, and global announcements retained. No native app
+source changes or native build needed for this server-enforced visibility rule.
