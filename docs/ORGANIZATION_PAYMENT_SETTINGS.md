@@ -69,3 +69,29 @@ requires explicit gateway cancellation before a new registration.
 Rollback: retain both tables and encrypted copies, restore compatible application
 versions only after reviewing the chosen organization policy. Do not drop data or
 remove provider contacts to roll back the code.
+
+## Production deployment — 5 November 2026
+
+- Plesk pulled backend source `f25bddc` and management source `c006b1b`.
+- Before migration, payment configuration was backed up with `encryptField` to
+  `/var/www/vhosts/jonglock.com/.organization-payment-migration/before-1793871036425.enc`
+  (private directory, file mode 0600). The snapshot contained 11 organizations
+  and zero market-specific settings; there was no account-selection conflict.
+- `npm run migrate` applied `056_organization_payment_settings.sql` and completed
+  the initializer successfully. Only api.jonglock.com was restarted; Plesk
+  confirmed the Express application was running.
+- Management was built in production mode under
+  `/var/www/vhosts/jonglock.com/.management-releases/organization-056-20261105`.
+  Previous served files were copied to `before-org-056-20261105` in the same
+  private release directory. Activation verified the organization API path,
+  copied 12 assets while retaining old assets, then renamed the new index into
+  place. Existing `.htaccess` was preserved.
+- Live browser verification on `/organization-settings` showed the organization
+  payment heading, the all-markets scope message, both payment mode choices,
+  and the existing transfer QR image loaded through the new API without errors.
+  No real bank details were entered and no gateway registration/cancellation
+  or payment transaction was submitted during deployment.
+- App source `31b2c1b27` was pushed. Native iOS/Android builds were not run.
+  App verification covers TypeScript and 41 Jest checks, including mixed-market
+  checkout and manual/gateway channel visibility; device/payment verification
+  remains separate from this configuration deployment.
