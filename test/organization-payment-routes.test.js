@@ -9,6 +9,11 @@ require.cache[id] = { id, filename: id, loaded: true, exports: {
   disableGateway: async organizationId => {calls.push(['disable', organizationId]); return {mode: 'manual'};},
   adoptMarketSettings: async (organizationId, marketId) => {calls.push(['adopt', organizationId, marketId]); return {mode: 'gateway'};},
 } };
+const bankId = require.resolve('../src/services/bank-master.service');
+require.cache[bankId] = {id:bankId,filename:bankId,loaded:true,exports:{findActiveBank:async code => {
+  if (code !== '004') throw new (require('../src/utils/errors').AppError)(400, 'Invalid bank', 'INVALID_BANK_CODE');
+  return {code:'004',nameTh:'Kasikornbank'};
+}}};
 const { requireRoles } = require('../src/middlewares/rbac');
 const app = express();
 app.use(express.json());
@@ -22,11 +27,16 @@ test('organization settings require supervisor and never accept a frontend tenan
   try {
     const admin = await fetch(base, {headers: {'x-test-role': 'admin'}});
     assert.equal(admin.status, 403); assert.equal(calls.length, 0);
-    const body = {mode: 'manual', details: {accountNumber: '1234567890'}};
+    const body = {mode: 'manual', details: {bankCode:'004', bankName:'Caller supplied name', accountNumber: '1234567890'}};
     const rejected = await fetch(base, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({...body, organizationId: 99})});
     assert.equal(rejected.status, 400); assert.equal(calls.length, 0);
     const saved = await fetch(base, {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
     assert.equal(saved.status, 200); assert.equal(calls.at(-1)[1], 7);
+    assert.equal(calls.at(-1)[2].details.bankName, 'Kasikornbank');
+    const countBeforeBadBank = calls.filter(call => call[0] === 'save').length;
+    const invalid = await fetch(base, {method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'gateway',details:{bankCode:'999',accountName:'Recipient',accountNumber:'1234567890',email:'recipient@example.test'}})});
+    assert.equal(invalid.status,400); assert.equal((await invalid.json()).code,'INVALID_BANK_CODE');
+    assert.equal(calls.filter(call => call[0] === 'save').length,countBeforeBadBank);
     const cancelled = await fetch(`${base}/disable`, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({confirmed: false})});
     assert.equal(cancelled.status, 400);
     assert.ok(!calls.some(call => call[0] === 'disable'));

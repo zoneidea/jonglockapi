@@ -6,6 +6,7 @@ const { ok } = require('../../utils/api-response');
 const settings = require('../../services/organization-payment-settings.service');
 const router = express.Router({ mergeParams: true });
 const manual = z.object({
+  bankCode: z.string().regex(/^\d{3}$/).or(z.literal('')).optional().default(''),
   bankName: z.string().trim().max(120).default(''), accountName: z.string().trim().max(255).default(''),
   accountNumber: z.string().trim().max(40).default(''), promptpayId: z.string().trim().max(40).default(''),
   qrCodeImageUrl: z.string().max(1000).default(''), instructions: z.string().max(1000).default(''),
@@ -37,6 +38,24 @@ router.put('/', asyncHandler(async (req, res) => {
     const previous = await settings.getSettings(req.auth.organizationId);
     if (!req.file && parsed.data.details.qrCodeImageUrl !== (previous.mode === 'manual' ? previous.details.qrCodeImageUrl || '' : '')) {
       throw new AppError(400, 'กรุณาอัปโหลดรูป QR Code ผ่านฟอร์ม', 'INVALID_QR_IMAGE');
+    }
+  }
+  const bankCode = parsed.data.details.bankCode;
+  if (bankCode) {
+    let bank;
+    try { bank = await require('../../services/bank-master.service').findActiveBank(bankCode); }
+    catch (error) {
+      // Preserve an immutable, already registered recipient if its bank is retired.
+      const previous = await settings.getSettings(req.auth.organizationId);
+      if (error.code !== 'INVALID_BANK_CODE' || parsed.data.mode !== 'gateway' || !previous.contactId
+        || previous.recipientDetails?.bankCode !== bankCode) throw error;
+    }
+    if (bank && parsed.data.mode === 'manual') parsed.data.details.bankName = bank.nameTh;
+  } else if (parsed.data.mode === 'manual' && (parsed.data.details.bankName || parsed.data.details.accountNumber)) {
+    const previous = await settings.getSettings(req.auth.organizationId);
+    if (previous.mode !== 'manual' || previous.details.bankName !== parsed.data.details.bankName
+      || previous.details.accountNumber !== parsed.data.details.accountNumber) {
+      throw new AppError(400, 'กรุณาเลือกธนาคารจากรายการก่อนบันทึกบัญชีใหม่', 'BANK_SELECTION_REQUIRED');
     }
   }
   return ok(res, await settings.saveSettings(req.auth.organizationId, parsed.data));

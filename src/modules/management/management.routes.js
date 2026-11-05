@@ -1886,6 +1886,9 @@ router.get(
   }),
 );
 
+router.get('/master-data/banks', requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  asyncHandler(async (_req, res) => ok(res, await require('../../services/bank-master.service').listActiveBanks())));
+
 router.use('/organization-settings/payments', requireRoles(ROLES.SUPERVISOR),
   paymentAssetUpload.single('paymentQrCodeImage'), require('../payments/organization-payment-settings.routes'));
 

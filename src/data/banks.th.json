@@ -1,0 +1,22 @@
+[
+  {"code":"002","nameTh":"ธนาคารกรุงเทพ","nameEn":"Bangkok Bank","shortName":"BBL"},
+  {"code":"004","nameTh":"ธนาคารกสิกรไทย","nameEn":"Kasikornbank","shortName":"KBANK"},
+  {"code":"006","nameTh":"ธนาคารกรุงไทย","nameEn":"Krung Thai Bank","shortName":"KTB"},
+  {"code":"011","nameTh":"ธนาคารทหารไทยธนชาต","nameEn":"TMBThanachart Bank","shortName":"TTB"},
+  {"code":"014","nameTh":"ธนาคารไทยพาณิชย์","nameEn":"Siam Commercial Bank","shortName":"SCB"},
+  {"code":"020","nameTh":"ธนาคารสแตนดาร์ดชาร์เตอร์ด (ไทย)","nameEn":"Standard Chartered Bank (Thai)","shortName":"SCBT"},
+  {"code":"022","nameTh":"ธนาคารซีไอเอ็มบี ไทย","nameEn":"CIMB Thai Bank","shortName":"CIMBT"},
+  {"code":"024","nameTh":"ธนาคารยูโอบี","nameEn":"United Overseas Bank (Thai)","shortName":"UOB"},
+  {"code":"025","nameTh":"ธนาคารกรุงศรีอยุธยา","nameEn":"Bank of Ayudhya","shortName":"BAY"},
+  {"code":"030","nameTh":"ธนาคารออมสิน","nameEn":"Government Savings Bank","shortName":"GSB"},
+  {"code":"033","nameTh":"ธนาคารอาคารสงเคราะห์","nameEn":"Government Housing Bank","shortName":"GHB"},
+  {"code":"034","nameTh":"ธนาคารเพื่อการเกษตรและสหกรณ์การเกษตร","nameEn":"Bank for Agriculture and Agricultural Cooperatives","shortName":"BAAC"},
+  {"code":"035","nameTh":"ธนาคารเพื่อการส่งออกและนำเข้าแห่งประเทศไทย","nameEn":"Export-Import Bank of Thailand","shortName":"EXIM"},
+  {"code":"066","nameTh":"ธนาคารอิสลามแห่งประเทศไทย","nameEn":"Islamic Bank of Thailand","shortName":"IBANK"},
+  {"code":"067","nameTh":"ธนาคารทิสโก้","nameEn":"Tisco Bank","shortName":"TISCO"},
+  {"code":"069","nameTh":"ธนาคารเกียรตินาคินภัทร","nameEn":"Kiatnakin Phatra Bank","shortName":"KKP"},
+  {"code":"070","nameTh":"ธนาคารไอซีบีซี (ไทย)","nameEn":"Industrial and Commercial Bank of China (Thai)","shortName":"ICBC"},
+  {"code":"071","nameTh":"ธนาคารไทยเครดิต","nameEn":"Thai Credit Bank","shortName":"THAICREDIT"},
+  {"code":"073","nameTh":"ธนาคารแลนด์ แอนด์ เฮ้าส์","nameEn":"Land and Houses Bank","shortName":"LHBANK"},
+  {"code":"098","nameTh":"ธนาคารพัฒนาวิสาหกิจขนาดกลางและขนาดย่อมแห่งประเทศไทย","nameEn":"Small and Medium Enterprise Development Bank of Thailand","shortName":"SME D BANK"}
+]
