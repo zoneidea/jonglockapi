@@ -45,3 +45,23 @@ No live financial transaction or recipient registration is part of deployment.
 Rollout: pull backend, run `npm run migrate`, restart API, then build/deploy the
 management frontend. No mobile-app or native build is required. Keep existing
 organization payment data encrypted; no account data is migrated by 057.
+
+## Production rollout — 5 November 2026
+
+Backend source `26ea329` and management source `25ce24a` were pulled in Plesk.
+`npm run migrate` applied 057 and seeded the bank master successfully, then only
+the API application was restarted. The bank master contains 20 initial banks.
+
+Management production build output was staged at
+`/var/www/vhosts/jonglock.com/.management-releases/banks-057-20261105` with backup
+`before-banks-057-20261105` in the same private directory. Activation checked the
+bank API reference and policy text in the bundle, published 12 assets while
+retaining old assets, and replaced index.html by rename. `.htaccess` was retained.
+
+Live UI verification at organization settings confirmed the manual bank dropdown
+loaded all 20 names/codes (including leading zeros), and selecting Gateway showed
+the three requested red numbered statements plus the recipient bank dropdown.
+Only unsaved UI choices were inspected; no account information, provider
+registration, withdrawal, or real payment was submitted. Native app builds were
+not run. Backend tests: 101 passed, one opt-in MySQL suite skipped; management
+production build and focused UI render/interaction checks passed.
