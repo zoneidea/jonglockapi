@@ -2746,7 +2746,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const rows = await query(
       `SELECT m.id, m.code, m.name, m.description, m.main_image_url, m.address, m.opening_hours, m.phone, m.line_id, m.email, m.terms,
-              m.status, m.open_date, m.close_date, m.open_days_json, m.latitude, m.longitude
+              m.status, m.open_date, m.close_date, m.open_days_json, m.latitude, m.longitude, m.collection_mode
        FROM markets m
        LEFT JOIN admin_market_assignments ama
          ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
@@ -4190,6 +4190,7 @@ router.post(
           name: z.string().min(1),
           description: z.string().optional().default(''),
           openDays: z.any().optional(),
+          collectionMode: z.enum(['self', 'system']).default('system'),
         }),
       })
       .parse({ body: req.body });
@@ -4199,12 +4200,13 @@ router.post(
     await assertPlanQuota(req.auth.organizationId, 'market_management', 1);
     const openDays = normalizeOpenDays(body.openDays);
     const result = await query(
-      `INSERT INTO markets (organization_id, code, name, description, main_image_url, open_date, close_date, open_days_json, status)
-       VALUES (:organizationId, :code, :name, :description, :mainImageUrl, :openDate, :closeDate, :openDaysJson, 'active')`,
+      `INSERT INTO markets (organization_id, code, name, description, main_image_url, open_date, close_date, open_days_json, collection_mode, status)
+       VALUES (:organizationId, :code, :name, :description, :mainImageUrl, :openDate, :closeDate, :openDaysJson, :collectionMode, 'active')`,
       {
         organizationId: req.auth.organizationId,
         code,
         name: body.name,
+        collectionMode: body.collectionMode,
         description: body.description,
         mainImageUrl,
         openDate: null,
@@ -4213,7 +4215,7 @@ router.post(
       },
     );
     clearPublicReadCache();
-    return created(res, { id: result.insertId, mainImageUrl, code }, 'market created');
+    return created(res, { id: result.insertId, mainImageUrl, code, collectionMode: body.collectionMode }, 'market created');
   }),
 );
 

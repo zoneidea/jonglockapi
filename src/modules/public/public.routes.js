@@ -457,7 +457,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const search = String(req.query.q || '').trim();
     const params = {};
-    const where = [`m.status = 'active'`, `o.status = 'active'`];
+    const where = [`m.status = 'active'`, `m.deleted_at IS NULL`, `m.collection_mode = 'system'`, `o.status = 'active'`];
 
     if (search) {
       where.push(`(m.name LIKE :search OR m.code LIKE :search OR o.name LIKE :search)`);
@@ -539,6 +539,8 @@ router.get(
         AND mi.status = 'active'
        WHERE m.id = :marketId
          AND m.status = 'active'
+         AND m.deleted_at IS NULL
+         AND m.collection_mode = 'system'
          AND o.status = 'active'
        GROUP BY m.id
        LIMIT 1`,
@@ -572,6 +574,8 @@ router.get(
        WHERE fp.market_id = :marketId
          AND fp.status = 'active'
          AND m.status = 'active'
+         AND m.deleted_at IS NULL
+         AND m.collection_mode = 'system'
          AND o.status = 'active'
        GROUP BY fp.id
        ORDER BY fp.start_date DESC, fp.id DESC`,
@@ -605,6 +609,8 @@ router.get(
          AND mh.market_id = :marketId
          AND mh.status = 'active'
          AND m.status = 'active'
+         AND m.deleted_at IS NULL
+         AND m.collection_mode = 'system'
          AND o.status = 'active'
        ORDER BY mh.start_date ASC, mh.id ASC`,
       { organizationId, marketId },
@@ -637,6 +643,8 @@ router.get(
        WHERE a.market_id = :marketId
          AND a.status = 'active'
          AND m.status = 'active'
+         AND m.deleted_at IS NULL
+         AND m.collection_mode = 'system'
          AND o.status = 'active'
        ORDER BY a.name ASC`,
       { marketId },
@@ -675,6 +683,8 @@ router.get(
        WHERE fp.id = :floorPlanId
          AND fp.status = 'active'
          AND m.status = 'active'
+         AND m.deleted_at IS NULL
+         AND m.collection_mode = 'system'
          AND o.status = 'active'
        LIMIT 1`,
       { floorPlanId },
@@ -761,6 +771,8 @@ router.post(
        WHERE fp.id = :floorPlanId
          AND fp.status = 'active'
          AND m.status = 'active'
+         AND m.deleted_at IS NULL
+         AND m.collection_mode = 'system'
          AND o.status = 'active'
        LIMIT 1`,
       { floorPlanId },
@@ -896,6 +908,8 @@ router.post(
            AND b.status = 'active'
            AND fp.status = 'active'
            AND m.status = 'active'
+         AND m.deleted_at IS NULL
+         AND m.collection_mode = 'system'
            AND o.status = 'active'
          LIMIT 1
          FOR UPDATE`,
@@ -2957,6 +2971,8 @@ router.post(
        WHERE b.id = :boothId
          AND b.status = 'active'
          AND m.status = 'active'
+         AND m.deleted_at IS NULL
+         AND m.collection_mode = 'system'
          AND o.status = 'active'
        LIMIT 1`,
       { boothId },
@@ -3053,8 +3069,11 @@ router.get(
          ON m.id = ai.market_id
         AND m.organization_id = ai.organization_id
         AND m.status = 'active'
+         AND m.deleted_at IS NULL
+         AND m.collection_mode = 'system'
        JOIN organizations o ON o.id = ai.organization_id
        WHERE ai.status = 'active'
+         AND (ai.market_id IS NULL OR m.id IS NOT NULL)
          AND o.status = 'active'
          AND (:type IS NULL OR ai.type = :type)
          AND (ai.start_date IS NULL OR ai.start_date <= CURRENT_DATE())

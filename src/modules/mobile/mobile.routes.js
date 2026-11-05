@@ -157,6 +157,7 @@ router.get(
       `SELECT id, code, name, description, open_date, close_date, status
        FROM markets
        WHERE organization_id = :organizationId AND status = 'active'
+         AND deleted_at IS NULL AND collection_mode = 'system'
        ORDER BY name`,
       { organizationId: req.auth.organizationId },
     );
@@ -174,6 +175,9 @@ router.get(
        WHERE organization_id = :organizationId
          AND market_id = :marketId
          AND status = 'active'
+         AND EXISTS (SELECT 1 FROM markets m WHERE m.id = floor_plans.market_id
+           AND m.organization_id = :organizationId AND m.status = 'active'
+           AND m.deleted_at IS NULL AND m.collection_mode = 'system')
        ORDER BY start_date DESC, id DESC`,
       { organizationId: req.auth.organizationId, marketId },
     );
@@ -216,6 +220,9 @@ router.get(
        WHERE b.organization_id = :organizationId
          AND b.market_id = :marketId
          AND b.status = 'active'
+         AND EXISTS (SELECT 1 FROM markets m WHERE m.id = b.market_id
+           AND m.organization_id = b.organization_id AND m.status = 'active'
+           AND m.deleted_at IS NULL AND m.collection_mode = 'system')
          AND (:categoryId IS NULL OR b.category_id = :categoryId)
        ORDER BY b.sort_order ASC, b.name ASC`,
       { organizationId: req.auth.organizationId, marketId, bookingDate, categoryId },
@@ -256,7 +263,7 @@ router.post(
     const vatSettings = await getOrganizationVatSettings({ execute: query }, req.auth.organizationId);
     const result = await transaction(async (conn) => {
       const [marketRows] = await conn.execute(
-        `SELECT id FROM markets WHERE id = :marketId AND organization_id = :organizationId AND status = 'active' LIMIT 1 FOR UPDATE`,
+        `SELECT id FROM markets WHERE id = :marketId AND organization_id = :organizationId AND status = 'active' AND deleted_at IS NULL AND collection_mode = 'system' LIMIT 1 FOR UPDATE`,
         { marketId, organizationId: req.auth.organizationId },
       );
       if (!marketRows.length) throw notFound('Market not found');
