@@ -136,6 +136,7 @@ function findPayment(paymentId) {
 }
 
 module.exports = {
+  callMerchantApi,
   API_VERSION,
   isConfigured,
   installationIdForPlatform,

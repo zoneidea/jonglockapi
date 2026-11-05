@@ -56,6 +56,10 @@ async function prepare(auth, body, key) {
         WHERE organization_id = :organizationId AND mobile_user_id = :userId AND idempotency_key = :key FOR UPDATE`,
       { organizationId, userId: auth.sub, key });
       if (duplicates[0]) return { attempt: sameRequest(duplicates[0], hash), created: false };
+      if (new Set(bookings.map(booking => booking.market_id)).size > 1) throw new AppError(409, 'กรุณาชำระรายการจากตลาดเดียวกัน', 'PAYMENT_MARKET_MISMATCH');
+      for (const marketId of [...new Set(bookings.map(booking => booking.market_id))].sort((a, b) => a - b)) {
+        await require('./market-payment-settings.service').assertGatewayAllowed(conn, organizationId, marketId);
+      }
       let total = 0n;
       for (const booking of bookings) {
         if (booking.status !== 'pending_payment' || !booking.expires_at || new Date(booking.expires_at) <= new Date()) {

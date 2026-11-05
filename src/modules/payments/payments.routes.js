@@ -34,7 +34,7 @@ router.post(
     const result = await transaction(async (conn) => {
       await expireStaleBookings(conn, req.auth.organizationId);
       const [bookings] = await conn.execute(
-        `SELECT id, subtotal_amount, discount_amount, vat_amount, total_amount, status
+        `SELECT id, market_id, subtotal_amount, discount_amount, vat_amount, total_amount, status
          FROM bookings
          WHERE id = :bookingId
            AND organization_id = :organizationId
@@ -45,6 +45,7 @@ router.post(
       );
       const booking = bookings[0];
       if (!booking) throw notFound('Booking not found');
+      await require('../../services/market-payment-settings.service').assertManualAllowed(conn, req.auth.organizationId, booking.market_id);
       await assertNoGatewayPayment(conn, req.auth.organizationId, booking.id);
       if (booking.status !== 'pending_payment') throw badRequest('Booking is not payable');
 

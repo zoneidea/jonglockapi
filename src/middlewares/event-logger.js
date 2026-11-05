@@ -5,6 +5,18 @@ const { blindIndex } = require('../utils/crypto');
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 const REDACTED = '[REDACTED]';
 const SENSITIVE_KEYS = new Set([
+  'recipientdetails',
+  'details',
+  'settings',
+  'bankaccountno',
+  'bankaccountname',
+  'promptpayid',
+  'payment_bank_account_no',
+  'payment_bank_account_name',
+  'accountnumber',
+  'accountname',
+  'contact_email',
+  'contact_mobile',
   'authorization',
   'cookie',
   'password',

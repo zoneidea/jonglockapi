@@ -2761,6 +2761,9 @@ router.get(
   }),
 );
 
+router.use('/markets/:marketId/payment-settings', requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
+  requireMarketAccess(), paymentAssetUpload.single('paymentQrCodeImage'), require('../payments/market-payment-settings.routes'));
+
 router.patch(
   '/markets/:marketId/basic',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),

@@ -65,6 +65,7 @@ async function recover({ limit = 20 } = {}) {
     AND (lease_until IS NULL OR lease_until < NOW()) AND (next_retry_at IS NULL OR next_retry_at <= NOW())
     ORDER BY id LIMIT :limit`, { merchantId: env.RESERVEPAY_MERCHANT_ID, limit });
   for (const callback of callbacks) await processCallback(callback);
+  await require('./payment-status-notification.service').flush(limit);
   return { attemptsChecked: checked, callbacksChecked: callbacks.length };
 }
 

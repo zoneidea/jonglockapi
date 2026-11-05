@@ -40,6 +40,19 @@ router.post('/', express.raw({ type: 'application/json', limit: '64kb' }), async
     { merchantId: env.RESERVEPAY_MERCHANT_ID, eventId: event.event_id, eventType: event.event,
       paymentId: event.payment_id, payload: JSON.stringify(event), processingStatus: ignored ? 'ignored' : 'pending' });
     await activity('reservepay_webhook_received', { eventId: event.event_id });
+    if (!ignored) {
+      // Respond after durable storage; process immediately without waiting for the cron tick.
+      res.once('finish', () => setImmediate(async () => {
+        try {
+          const callbacks = await query(`SELECT * FROM payment_callbacks WHERE provider = 'reservepay'
+            AND merchant_id = :merchantId AND event_id = :eventId AND processing_status = 'pending' LIMIT 1`,
+          { merchantId: env.RESERVEPAY_MERCHANT_ID, eventId: event.event_id });
+          if (callbacks[0]) await require('../../services/reservepay-recovery.service').processCallback(callbacks[0]);
+        } catch (_error) {
+          await activity('reservepay_callback_retry', { eventId: event.event_id, code: 'IMMEDIATE_PROCESSING_RETRY', status: 202 }).catch(() => {});
+        }
+      }));
+    }
     return res.status(200).json({ accepted: true });
   } catch (_error) { return reject(503, 'WEBHOOK_STORAGE_UNAVAILABLE'); }
 });

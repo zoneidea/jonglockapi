@@ -24,7 +24,7 @@ function providerMatches(attempt, payment) {
 }
 
 async function applyPayment(attempt, payment, leaseToken) {
-  return transaction(async (conn) => {
+  const notificationId = await transaction(async (conn) => {
     const group = await store.lockGroup(conn, attempt);
     const current = group.attempt;
     if (!current || current.lease_token !== leaseToken) return;
@@ -100,7 +100,9 @@ async function applyPayment(attempt, payment, leaseToken) {
       }
     }
     await activity('reservepay_settled', { organizationId: current.organization_id, attemptId: current.public_id, code: payment.status }, conn);
+    return require('./payment-status-notification.service').enqueue(conn, current, nextState);
   });
+  if (notificationId) await require('./payment-status-notification.service').deliver(attempt.organization_id, attempt.id).catch(() => {});
 }
 
 async function reconcile(attempt, { force = false } = {}) {

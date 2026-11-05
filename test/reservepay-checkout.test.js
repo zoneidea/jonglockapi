@@ -20,6 +20,7 @@ function reset() {
 }
 async function execute(sql, p) {
   const q = sql.replace(/\s+/g, ' ').trim();
+  if (q.includes('FROM market_payment_settings')) return [[]];
   if (q.startsWith('SELECT * FROM bookings')) return [bookings.filter((b) => b.id === p.bookingId && b.organization_id === p.organizationId && b.mobile_user_id === p.userId)];
   if (q.startsWith('SELECT * FROM payment_attempts')) return [[...(attempt ? [attempt] : [])]];
   if (q.startsWith('SELECT id FROM payments')) return [[]];

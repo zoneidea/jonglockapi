@@ -76,6 +76,7 @@ stub('../src/config/db', {
     try { return await fn({ execute }); } catch (error) { state = snapshot; throw error; }
   },
 });
+stub('../src/services/payment-status-notification.service', { enqueue: async () => null, deliver: async () => {} });
 stub('../src/services/payment-activity.service', { activity: async (action, metadata) => logs.push({ action, metadata }) });
 stub('../src/services/reservepay.service', { isConfigured: () => true, findPayment: async () => {
   lookups += 1;
