@@ -139,6 +139,8 @@ function mapMarket(row) {
     description: row.description || '',
     terms: row.terms || '',
     mainImageUrl: row.main_image_url || galleryImages[0] || '',
+    latitude: row.latitude == null ? null : Number(row.latitude),
+    longitude: row.longitude == null ? null : Number(row.longitude),
     address: row.address || '',
     openingHours: row.opening_hours || '',
     phone: row.phone || '',
@@ -465,7 +467,7 @@ router.get(
     const rows = await query(
       `SELECT
           m.id, m.organization_id, o.code AS organization_code, m.code, m.name, m.description, m.terms, m.main_image_url,
-          m.address, m.opening_hours, m.open_days_json, m.phone, m.line_id, m.email, m.open_date, m.close_date,
+          m.latitude, m.longitude, m.address, m.opening_hours, m.open_days_json, m.phone, m.line_id, m.email, m.open_date, m.close_date,
           EXISTS (
             SELECT 1
             FROM market_holidays mh
@@ -509,7 +511,7 @@ router.get(
     const rows = await query(
       `SELECT
           m.id, m.organization_id, o.code AS organization_code, m.code, m.name, m.description, m.terms, m.main_image_url,
-          m.address, m.opening_hours, m.open_days_json, m.phone, m.line_id, m.email, m.open_date, m.close_date,
+          m.latitude, m.longitude, m.address, m.opening_hours, m.open_days_json, m.phone, m.line_id, m.email, m.open_date, m.close_date,
           EXISTS (
             SELECT 1
             FROM market_holidays mh

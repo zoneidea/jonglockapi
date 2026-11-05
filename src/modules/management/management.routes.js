@@ -1,3 +1,4 @@
+const { marketCoordinatesSchema } = require('../../utils/market-coordinates');
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
@@ -2745,7 +2746,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const rows = await query(
       `SELECT m.id, m.code, m.name, m.description, m.main_image_url, m.address, m.opening_hours, m.phone, m.line_id, m.email, m.terms,
-              m.status, m.open_date, m.close_date, m.open_days_json
+              m.status, m.open_date, m.close_date, m.open_days_json, m.latitude, m.longitude
        FROM markets m
        LEFT JOIN admin_market_assignments ama
          ON ama.market_id = m.id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
@@ -2831,9 +2832,10 @@ router.patch(
         }),
       })
       .parse({ params: req.params, body: req.body });
+    const coordinates = marketCoordinatesSchema.parse(req.body);
     const body = parsed.body;
     const currentRows = await query(
-      `SELECT main_image_url
+      `SELECT main_image_url, latitude, longitude
        FROM markets
        WHERE id = :marketId AND organization_id = :organizationId AND deleted_at IS NULL
        LIMIT 1`,
@@ -2854,7 +2856,9 @@ router.patch(
            phone = :phone,
            line_id = :lineId,
            email = :email,
-           terms = :terms
+           terms = :terms,
+           latitude = :latitude,
+           longitude = :longitude
        WHERE id = :marketId AND organization_id = :organizationId AND deleted_at IS NULL`,
       {
         organizationId: req.auth.organizationId,
@@ -2862,6 +2866,8 @@ router.patch(
         name: body.name || null,
         description: body.description,
         mainImageUrl,
+        latitude: coordinates.latitude === undefined ? current.latitude : coordinates.latitude,
+        longitude: coordinates.longitude === undefined ? current.longitude : coordinates.longitude,
         address: body.address,
         openingHours: body.openingHours,
         openDaysJson: JSON.stringify(openDays.length ? openDays : ALL_MARKET_OPEN_DAYS),

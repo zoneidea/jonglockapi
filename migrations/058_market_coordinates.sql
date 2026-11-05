@@ -1,0 +1,3 @@
+ALTER TABLE markets
+  ADD COLUMN latitude DECIMAL(9,6) NULL,
+  ADD COLUMN longitude DECIMAL(10,6) NULL;
