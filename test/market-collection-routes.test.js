@@ -26,7 +26,11 @@ stub('../src/config/db', {query:async(sql, params = {}) => {
     return [];
   }
   throw new Error('Unexpected SQL in collection test');
-}});
+}, transaction: async handler => handler({execute: async sql => {
+  assert.match(sql, /m.collection_mode = 'system'/);
+  assert.match(sql, /FOR UPDATE/);
+  return [[]];
+}})});
 stub('../src/middlewares/auth', {authenticate:(req,_res,next) => {req.auth={organizationId:7,sub:3,userType:'admin',role:req.get('x-test-role') || 'supervisor'};next();},signToken:()=>''});
 stub('../src/services/subscription.service', {assertPlanQuota:async()=>{},requireSubscriptionForMutations:()=> (_req,_res,next)=>next()});
 const app = express(); app.use(express.json());
@@ -54,6 +58,8 @@ test('collection mode persists with defaults, supervisor access and customer dis
     const list=await (await fetch(`${base}/public/markets`)).json(); assert.deepEqual(list.data.map(m=>m.id),[1]);
     const hidden=await (await fetch(`${base}/public/markets/2`)).json(); assert.equal(hidden.data,null);
     const plans=await (await fetch(`${base}/public/markets/2/floor-plans`)).json(); assert.deepEqual(plans.data,[]);
+    const hold=await fetch(`${base}/public/booths/20/hold`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dates:['2026-12-01'],user:{email:'test@example.test'}})});
+    assert.equal(hold.status,404);
     const news=await (await fetch(`${base}/public/announcements?type=news`)).json(); assert.deepEqual(news.data.map(n=>n.id),[1,3]);
   } finally {await new Promise(resolve=>server.close(resolve));}
 });
