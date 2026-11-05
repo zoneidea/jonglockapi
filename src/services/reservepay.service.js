@@ -42,7 +42,8 @@ async function requestMerchantApi(endpoint, body = {}) {
   if (!response.ok) {
     // Error responses are JSON arrays of error objects, e.g. [{ code: 'INVALID_ARGUMENTS', ... }].
     const first = Array.isArray(json) ? json[0] : json;
-    const code = /^[A-Z0-9_]{1,80}$/.test(String(first?.code || '')) ? first.code : `HTTP_${response.status}`;
+    const candidate = typeof first === 'string' ? first : first?.code;
+    const code = /^[A-Z0-9_]{1,80}$/.test(String(candidate || '')) ? candidate : `HTTP_${response.status}`;
     const error = new AppError(502, `Payment provider error (${code})`, 'PAYMENT_PROVIDER_ERROR');
     error.providerCode = code;
     // Do not attach provider payloads to errors: the shared error handler logs them.

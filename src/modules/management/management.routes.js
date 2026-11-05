@@ -6242,6 +6242,7 @@ router.get(
       body: z.object({}).passthrough().optional().default({}),
       query: z.object({
         paidOnly: z.enum(['0', '1']).optional(),
+        paymentChannel: z.string().regex(/^[A-Z0-9_]{1,80}$/).optional(),
         status: z.enum(['paid']).optional(),
         startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
         endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
@@ -6254,7 +6255,7 @@ router.get(
   ),
   asyncHandler(async (req, res) => {
     await expireStaleBookings({ execute: query }, req.auth.organizationId);
-    const { startDate, endDate, marketId, dateField, sortBy } = req.validated.query;
+    const { startDate, endDate, marketId, dateField, sortBy, paymentChannel } = req.validated.query;
     const paidOnly = req.validated.query.paidOnly === '1' || req.validated.query.status === 'paid';
     const orderBy = {
       booking_public_id: 'COALESCE(b.public_id, ac_b.public_id) ASC',
@@ -6269,6 +6270,7 @@ router.get(
     });
     const rows = await query(
       `SELECT p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at,
+              p.provider_reference, pa.public_id AS payment_attempt_public_id, pa.payment_method, pa.payment_method_display_name,
               p.audit_check_id,
               COALESCE(b.public_id, ac_b.public_id) AS booking_public_id,
               CASE WHEN p.audit_check_id IS NOT NULL THEN 'audit_fine' ELSE 'booking' END AS payment_kind,
@@ -6288,6 +6290,7 @@ router.get(
               GROUP_CONCAT(DISTINCT DATE_FORMAT(bi.booking_date, '%Y-%m-%d') ORDER BY bi.booking_date SEPARATOR ', ') AS booking_dates,
               GROUP_CONCAT(DISTINCT CONCAT(COALESCE(bo.code, ''), CASE WHEN bo.name IS NULL OR bo.name = '' THEN '' ELSE CONCAT(' ', bo.name) END) ORDER BY bo.sort_order, bo.code SEPARATOR ', ') AS booths
        FROM payments p
+       LEFT JOIN payment_attempts pa ON pa.id = p.payment_attempt_id AND pa.organization_id = p.organization_id
        LEFT JOIN bookings b ON b.id = p.booking_id AND b.organization_id = p.organization_id
        LEFT JOIN audit_checks ac ON ac.id = p.audit_check_id AND ac.organization_id = p.organization_id
        LEFT JOIN booking_items ac_bi ON ac_bi.id = ac.booking_item_id AND ac_bi.organization_id = ac.organization_id
@@ -6317,6 +6320,8 @@ router.get(
        WHERE p.organization_id = :organizationId
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          AND (:marketId IS NULL OR m.id = :marketId)
+         AND (:paymentChannel IS NULL OR pa.payment_method = :paymentChannel
+           OR (:paymentChannel = 'MANUAL_TRANSFER' AND p.provider = 'manual'))
          AND (:paidOnly = 0 OR p.status = 'paid')
          AND (:paidOnly = 0 OR (
            (p.booking_id IS NOT NULL AND b.status = 'paid')
@@ -6324,6 +6329,7 @@ router.get(
          ))
          ${dateFilter.sql}
        GROUP BY p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at,
+                p.provider_reference, pa.public_id, pa.payment_method, pa.payment_method_display_name,
                 p.audit_check_id, b.public_id, b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
                 ac.id, ac.fine_amount, ac.accessories_fine_amount, ac.damage_fine_amount, ac.vat_amount, ac.total_fine_amount,
                 ac_b.public_id,
@@ -6338,6 +6344,7 @@ router.get(
         adminUserId: req.auth.sub,
         hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(req.auth.role) ? 1 : 0,
         paidOnly: paidOnly ? 1 : 0,
+        paymentChannel: paymentChannel || null,
         marketId: marketId || null,
         ...dateFilter.params,
       },

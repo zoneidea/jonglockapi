@@ -62,6 +62,9 @@ test('JWT routes reject anonymous/audit access and malformed or unowned payment 
       assert.equal((await post('/mobile/initiate', invalid, 'customer', 'key')).status, 400);
     }
     assert.equal((await post('/mobile/initiate', valid, 'customer')).status, 400);
+    for (const bookingIds of [[101, 101], [Number.MAX_SAFE_INTEGER + 1], []]) {
+      assert.equal((await post('/mobile/active', { bookingIds }, 'customer')).status, 400);
+    }
     assert.equal(initiated, 0);
     assert.equal((await post('/mobile/status', { attemptId: 'foreign' }, 'customer')).status, 404);
     assert.equal((await post('/mobile/status', { paymentId: 'arbitrary' }, 'customer')).status, 400);

@@ -31,9 +31,31 @@ router.post('/methods', body(z.object({ platform: z.enum(['IOS', 'ANDROID']) }).
     ...await gateway.getPlatformPaymentMethods(req.paymentBody.platform), checkoutEnabled: env.RESERVEPAY_CHECKOUT_ENABLED,
   })));
 
+const bookingIdsSchema = z.array(z.number().int().positive().max(Number.MAX_SAFE_INTEGER)).min(1).max(50)
+  .refine((ids) => new Set(ids).size === ids.length);
+
+router.post('/active', body(z.object({ bookingIds: bookingIdsSchema }).strict()),
+  asyncHandler(async (req, res) => {
+    const { query } = require('../../config/db');
+    const params = { organizationId: req.auth.organizationId, userId: req.auth.sub };
+    const placeholders = req.paymentBody.bookingIds.map((id, index) => { params[`b${index}`] = id; return `:b${index}`; }).join(',');
+    const attempts = await query(`SELECT DISTINCT pa.* FROM payment_attempts pa
+      JOIN payments p ON p.payment_attempt_id = pa.id AND p.organization_id = pa.organization_id
+      WHERE pa.organization_id = :organizationId AND pa.mobile_user_id = :userId
+        AND pa.state IN ('creating','pending','unknown','review') AND p.booking_id IN (${placeholders})
+      ORDER BY pa.id DESC LIMIT 2`, params);
+    if (attempts.length > 1) throw new AppError(409, 'Multiple payments require separate checkout', 'PAYMENT_GROUP_CONFLICT');
+    if (!attempts.length) return ok(res, { attempt: null });
+    const attempt = attempts[0];
+    const ids = await store.bookingIds(attempt.organization_id, attempt.id);
+    if (ids.length !== req.paymentBody.bookingIds.length || ids.some((id) => !req.paymentBody.bookingIds.includes(Number(id)))) {
+      throw new AppError(409, 'Resume the complete payment group', 'PAYMENT_GROUP_CONFLICT');
+    }
+    return ok(res, { attempt: publicAttempt(await reconcile(attempt), ids) });
+  }));
+
 const initiateSchema = z.object({
-  bookingIds: z.array(z.number().int().positive().max(Number.MAX_SAFE_INTEGER)).min(1).max(50)
-    .refine((ids) => new Set(ids).size === ids.length),
+  bookingIds: bookingIdsSchema,
   paymentSessionId: z.string().min(1).max(128).regex(/^[\x21-\x7e]+$/),
   amount: z.string().regex(/^[1-9]\d{0,15}$/),
 }).strict();

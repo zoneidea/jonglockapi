@@ -66,9 +66,13 @@ async function applyPayment(attempt, payment, leaseToken) {
     const paidAt = nextState === 'paid' ? (unixDate(payment.captured_at) || new Date()) : null;
     const params = { organizationId: current.organization_id, id: current.id, state: nextState,
       providerStatus: payment.status, paymentId: payment.payment_id, paidAt,
+      paymentMethod: typeof payment.payment_method === 'string' && /^[A-Z0-9_]{1,80}$/.test(payment.payment_method) ? payment.payment_method : null,
+      paymentMethodName: typeof payment.payment_method_display_name === 'string' ? payment.payment_method_display_name.slice(0, 160) : null,
       expiresAt: unixDate(payment.expires_at) };
     await conn.execute(`UPDATE payment_attempts SET provider_reference = :paymentId, state = :state,
       provider_status = :providerStatus, provider_expires_at = :expiresAt, paid_at = :paidAt,
+      payment_method = COALESCE(:paymentMethod, payment_method),
+      payment_method_display_name = COALESCE(:paymentMethodName, payment_method_display_name),
       last_checked_at = NOW(), last_error_code = NULL, lease_token = NULL, lease_until = NULL,
       next_check_at = CASE WHEN :state = 'pending' THEN DATE_ADD(NOW(), INTERVAL 30 SECOND) ELSE NULL END
       WHERE organization_id = :organizationId AND id = :id`, params);

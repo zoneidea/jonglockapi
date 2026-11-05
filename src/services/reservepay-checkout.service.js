@@ -110,10 +110,6 @@ async function prepare(auth, body, key) {
       return { attempt: attempts[0], created: true };
     });
   } catch (error) {
-    if (['INVALID_ARGUMENTS', 'NOT_SUPPORTED', 'CUSTOMER_REQUIRED', 'CUSTOMER_MISMATCH'].includes(error.providerCode)) {
-      await failInitialization(attempt, error.providerCode);
-      return publicAttempt(await store.getAttempt(attempt.organization_id, attempt.id));
-    }
     if (error.code !== 'ER_DUP_ENTRY') throw error;
     const winner = await existing(auth, key);
     if (winner) return { attempt: sameRequest(winner, hash), created: false };
@@ -140,6 +136,10 @@ async function initiate(auth, body, key) {
     });
     if (typeof paymentId !== 'string' || !paymentId.length || paymentId.length > 255) throw new Error('INVALID_PROVIDER_RESPONSE');
   } catch (error) {
+    if (['INVALID_ARGUMENTS', 'NOT_SUPPORTED', 'CUSTOMER_REQUIRED', 'CUSTOMER_MISMATCH'].includes(error.providerCode)) {
+      await failInitialization(attempt, error.providerCode);
+      return publicAttempt(await store.getAttempt(attempt.organization_id, attempt.id));
+    }
     // A rejection or lost response is never proof that the merchant has not charged.
     // Recovery only looks up the saved external_id; it never initiates again.
     await query(`UPDATE payment_attempts SET state = 'unknown', lease_token = NULL, lease_until = NULL,

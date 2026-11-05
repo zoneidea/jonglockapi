@@ -1391,7 +1391,7 @@ router.post(
           o.name AS organization_name, o.payment_promptpay_id, o.payment_bank_name,
           o.payment_bank_account_name, o.payment_bank_account_no, o.payment_qrcode_image_url, o.payment_instructions,
           p.id AS payment_id, p.public_id AS payment_public_id, p.status AS payment_status,
-          p.provider_reference, p.proof_image_url, p.proof_uploaded_at, p.payer_note
+          p.provider, p.provider_reference, p.proof_image_url, p.proof_uploaded_at, p.payer_note
        FROM bookings b
        JOIN mobile_users mu
          ON mu.id = b.mobile_user_id
@@ -1414,7 +1414,8 @@ router.post(
     const booking = bookings[0];
     if (!booking) throw badRequest('Booking not found');
     if (!['pending_payment', 'payment_processing'].includes(booking.status)) throw badRequest('Booking is not payable');
-    if (!booking.expires_at || new Date(booking.expires_at).getTime() <= Date.now()) throw badRequest('Booking has expired');
+    if (!(booking.status === 'payment_processing' && booking.provider === 'reservepay')
+      && (!booking.expires_at || new Date(booking.expires_at).getTime() <= Date.now())) throw badRequest('Booking has expired');
 
     return ok(res, {
       bookingId: booking.id,
@@ -1840,10 +1841,13 @@ router.post(
        JOIN organizations o ON o.id = b.organization_id
        WHERE mu.email_hash = :emailHash
          AND b.source IN ('mobile', 'management')
-         AND b.cart_visible = 1
-         AND b.status = 'pending_payment'
-         AND b.expires_at IS NOT NULL
-         AND b.expires_at > NOW()
+         AND ((b.cart_visible = 1 AND b.status = 'pending_payment' AND b.expires_at > NOW())
+           OR (b.status = 'payment_processing' AND EXISTS (
+             SELECT 1 FROM payments gp JOIN payment_attempts ga
+               ON ga.id = gp.payment_attempt_id AND ga.organization_id = gp.organization_id
+             WHERE gp.organization_id = b.organization_id AND gp.booking_id = b.id
+               AND gp.provider = 'reservepay' AND ga.state IN ('creating','pending','unknown','review')
+           )))
        ORDER BY b.expires_at ASC, b.created_at DESC
        LIMIT 100`,
       { emailHash },

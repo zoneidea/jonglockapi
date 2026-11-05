@@ -16,8 +16,14 @@ const { PAYMENT_EXPIRES_MINUTES } = require('../../constants/booking');
 const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
 const { assertPlanQuota, requireSubscriptionForMutations } = require('../../services/subscription.service');
 const authService = require('../auth/auth.service');
+const { exchangeCustomerIdentity } = require('../auth/google-customer.service');
 
 const router = express.Router();
+
+router.post('/auth/google', validate(z.object({
+  body: z.object({ googleIdToken: z.string().min(1).max(16384), organizationId: z.number().int().positive() }).strict(),
+  query: z.object({}).passthrough(), params: z.object({}).passthrough(),
+})), asyncHandler(async (req, res) => ok(res, await exchangeCustomerIdentity(req.validated.body))));
 
 function arrayPlaceholders(values, prefix) {
   return values.map((_, index) => `:${prefix}${index}`).join(', ');

@@ -38,7 +38,7 @@ test('MySQL migrations, tenant FKs, concurrent checkout, duplicate event and ato
         provider VARCHAR(80), payload_json JSON, received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`,
     ];
     for (const sql of base) await pool.query(sql);
-    for (const file of ['051_reservepay_attempts.sql', '052_reservepay_payment_mapping.sql', '053_reservepay_callback_inbox.sql']) {
+    for (const file of ['051_reservepay_attempts.sql', '052_reservepay_payment_mapping.sql', '053_reservepay_callback_inbox.sql', '054_reservepay_payment_channel.sql']) {
       const sql = fs.readFileSync(path.join(__dirname, '../migrations', file), 'utf8');
       for (const statement of sql.split(/;\s*$/m).map((s) => s.trim()).filter(Boolean)) await pool.query(statement);
     }
@@ -75,8 +75,9 @@ test('MySQL migrations, tenant FKs, concurrent checkout, duplicate event and ato
     const eventSql = "INSERT INTO payment_callbacks (provider,merchant_id,event_id,payload_json,processing_status) VALUES ('reservepay','merchant','evt_duplicate','{}','pending') ON DUPLICATE KEY UPDATE event_id=event_id";
     await pool.query(eventSql); await pool.query(eventSql);
     assert.equal((await query('SELECT COUNT(*) AS count FROM payment_callbacks', {}))[0].count, 1);
-    const verified = { payment_id: 'provider', external_id: attempt.external_id, amount: 35000, currency: 'THB', status: 'SUCCESSFUL' };
+    const verified = { payment_id: 'provider', external_id: attempt.external_id, amount: 35000, currency: 'THB', status: 'SUCCESSFUL', payment_method: 'PROMPTPAY', payment_method_display_name: 'PromptPay QR' };
     await applyPayment(attempt, verified, attempt.lease_token);
+    assert.equal((await query('SELECT payment_method FROM payment_attempts', {}))[0].payment_method, 'PROMPTPAY');
     assert.ok((await query('SELECT status FROM bookings', {})).every((b) => b.status === 'paid'));
     assert.ok((await query('SELECT status FROM payments', {})).every((p) => p.status === 'paid'));
     assert.ok((await query('SELECT status FROM booth_date_locks', {})).every((p) => p.status === 'paid'));

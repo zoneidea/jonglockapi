@@ -214,3 +214,19 @@ webhook route ที่วางก่อน global logger ต้องมี sa
 การออกแบบ login bridge สำหรับ public profile และการจ่ายข้ามองค์กรต้องแยกอนุมัติหากจำเป็น ไม่ถือว่า contract นี้อนุมัติให้ขยาย authentication ทั้งระบบหรือแก้ app/frontend/landing
 
 ขั้นตอน deploy, recovery ของ migration และคำสั่งทดสอบอยู่ใน [ReservePay rollout](RESERVEPAY_ROLLOUT.md)
+
+## Mobile checkout and channel reports (2026-11-05)
+
+Existing Google Sign-In and customer JWT layers are used; email typed on the device is never payment authentication.
+
+- `POST /api/mobile/auth/google`: `{googleIdToken, organizationId}` using the existing native Google session. Verify Google signature/issuer/expiry and the configured OAuth audience, require verified Gmail or Workspace identity, resolve one active `mobile_users` record by encrypted email blind index and organization, then return `{token, expiresIn:900, user:{id,organizationId,email}}`. Use the public GOOGLE_WEB_CLIENT_ID matching the app; this flow requires no Firebase Admin credential. Never accept a client email or customer ID as proof. JWT stays in checkout memory; no JWT/card/session data in AsyncStorage or logs.
+- `POST /api/mobile/payments/reservepay/active` with customer Bearer JWT and `{bookingIds}` returns `{attempt:null}` or an owned active attempt for exactly the complete booking group. Writes/status still use the existing initiate/status contracts. Attempt responses now include `paymentSessionId` and `paymentMethod` for authenticated resume only; session fields are redacted by event logging.
+- Resume an existing attempt before creating a new SDK session. Retry uncertain initiate responses with the identical body and `Idempotency-Key`. UI timeout or closing the payment panel does not cancel the provider payment, expire bookings or authorize another charge. Only backend `status=paid` triggers the success screen. Processing gateway bookings remain available in the cart for recovery.
+- `GET /api/public/payments/reservepay/card-form?platform=IOS|ANDROID` hosts the surrounding form; ReservePay's SDK and hosted iframes collect/tokenize card details. Only the single-use card token passes to the native app. No raw card fields enter native state, backend requests or logs. This page exposes public installation IDs only and uses a nonce CSP.
+- Native app return URL is `jonglock://payment-return` on both platforms. Channels are discovered per installation. Cross-organization carts and audit fines remain separate from booking gateway payments.
+
+Run migration `054_reservepay_payment_channel.sql` before deploying the new backend. It adds nullable `payment_method` and `payment_method_display_name` to attempts. Populate these only from matching Merchant `find-payment` responses, never from an app claim or webhook status. Existing history stays nullable and is displayed as unspecified, without guessing a channel.
+
+`GET /api/management/accounting/payments` adds `payment_method`, `payment_method_display_name`, `provider_reference`, `payment_attempt_public_id`, and optional `paymentChannel` filter (`MANUAL_TRANSFER` for manual proof). Existing organization and market access checks apply. Amount remains the allocated booking payment amount, so a multi-booking gateway transaction is not counted at its full amount for every booking. Reports export provider, channel and reference; summaries count each paid gateway attempt once.
+
+Rollout: migration 054, backend including the matching Google OAuth audience, then app/web builds. Keep old columns and routes during rollout. Rollback code can ignore nullable channel fields; do not drop payment history or disable recovery. Existing public initiate/status stay 410. Test verified/unverified identities, tenant isolation, duplicate initiation, lost responses/resume, backend-pending after SDK completion, card success/decline/3DS, QR expiry and channel report totals before live merchant use.

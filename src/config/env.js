@@ -26,6 +26,8 @@ const envSchema = z.object({
   CRON_SECRET: z.string().default(''),
   FIREBASE_SERVICE_ACCOUNT_JSON: z.string().default(''),
   FIREBASE_PROJECT_ID: z.string().default(''),
+  // Public OAuth audience; must match GoogleSignin.configure({ webClientId }) in the app.
+  GOOGLE_WEB_CLIENT_ID: z.string().default('1087957238231-4mv90nlc1fkl0bv32rakoq3tue8k4h0c.apps.googleusercontent.com'),
   FIREBASE_CLIENT_EMAIL: z.string().default(''),
   FIREBASE_PRIVATE_KEY: z.string().default(''),
   // ReservePay payment gateway. RESERVEPAY_API_KEY is secret: keep it in the server env only.

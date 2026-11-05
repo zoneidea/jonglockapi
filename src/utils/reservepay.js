@@ -36,6 +36,8 @@ function publicAttempt(row, bookingIds) {
   return {
     attemptId: row.public_id,
     paymentId: row.provider_reference || null,
+    paymentSessionId: row.payment_session_id,
+    paymentMethod: row.payment_method || null,
     status: row.state,
     providerStatus: row.provider_status || null,
     amount: String(row.amount_minor),
