@@ -41,3 +41,22 @@ monitor quota and rotate as needed. Do not log request URLs, keys or provider er
 Sources: https://www.weatherapi.com/docs/realtime-api/ and
 https://www.weatherapi.com/docs/weather-icons/ . No native dependency/build required
 for this feature; management web requires its normal production build/deployment.
+
+## Production rollout — 2026-11-05
+
+Backend e3a09f9 pulled through Plesk; migration 058 applied successfully and only
+api.jonglock.com restarted. Frontend c06b4c5 built on the server into
+`.management-releases/weather-058-20261105`; previous dist copied to
+`.management-releases/before-weather-058-20261105`. Validated staged JS before
+copying 12 assets and atomically activating index.html; existing .htaccess and old
+assets retained. Live management /market-info displays both coordinate inputs and
+the current-location button. No market coordinate was guessed or saved during QA.
+Public markets API returned HTTP 200 and coordinate fields for all four markets;
+all four remain unset and retain the normal mobile background until configured.
+App 4ef960ac0 pushed; local ignored WeatherAPI credential configured. WeatherAPI
+current endpoint returned HTTP 200 with Thai condition text for a public Bangkok
+test coordinate. Backend tests: 103 passed, one optional MySQL integration skipped;
+mobile: 44 passed; TypeScript and scoped lint passed (one preexisting warning).
+Web production build passed locally and on server. No iOS/Android native build run.
+Runtime animation and browser geolocation permission flow need on-device validation
+after administrators save actual market coordinates.
