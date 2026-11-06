@@ -6,7 +6,7 @@ Production merchant: `187407900159`.
 | --- | --- | --- |
 | WEB | ins_tMTYC3Zqge | jonglock.com |
 | IOS | ins_Ii6PObcOPA | th.co.zoneidea.jonglock |
-| ANDROID | ins_exa5BribK8 | th.co.zoneidea.jonglock |
+| ANDROID | ins_XQ2Tgq9XHz | th.co.zoneidea |
 
 API key and webhook verification key were saved as encrypted, write-only Plesk
 Secrets for api.jonglock.com. No credential values are recorded in this document,
@@ -53,3 +53,16 @@ environment and remove/replace the two new Plesk Secrets so the preserved server
 .env sandbox configuration takes effect, then restart and verify both methods
 endpoints. Do not roll back across live pending payments: recovery is scoped to
 the configured merchant, so those must be resolved first. Do not delete history.
+
+## Android installation correction — 2026-11-06
+
+User replaced the initial Android installation ins_exa5BribK8 with
+ins_XQ2Tgq9XHz. Provider list-installations confirmed platform ANDROID,
+enabled=true and identifier th.co.zoneidea, matching the release applicationId.
+Updated only RESERVEPAY_INSTALLATION_ID_ANDROID in Plesk; other IDs and Secrets
+were preserved. Plesk Save/Restart initially left the serving Passenger worker
+using the old ID (methods returned 503 PAYMENT_NOT_CONFIGURED). Touching the
+application's tmp/restart.txt reloaded that worker. Live Android methods then
+returned 200, merchant 187407900159, installation ins_XQ2Tgq9XHz,
+installationEnabled=true and checkoutEnabled=true. Mobile fetches this config
+from the backend; no installation ID is embedded in the Android bundle.
