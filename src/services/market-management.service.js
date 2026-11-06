@@ -2,7 +2,7 @@ const { notFound, conflict } = require('../utils/errors');
 
 async function lockMarket(connection, { organizationId, marketId }) {
   const [rows] = await connection.execute(
-    `SELECT id, status, deleted_at FROM markets
+    `SELECT id, status, deleted_at, main_image_url FROM markets
      WHERE organization_id = :organizationId AND id = :marketId FOR UPDATE`,
     { organizationId, marketId },
   );
@@ -11,13 +11,22 @@ async function lockMarket(connection, { organizationId, marketId }) {
 }
 
 async function updateMarketBasics(connection, scope, changes) {
-  await lockMarket(connection, scope);
+  const current = await lockMarket(connection, scope);
   await connection.execute(
-    `UPDATE markets SET name = :name, status = :status
+    `UPDATE markets SET name = :name, status = :status,
+       collection_mode = COALESCE(:collectionMode, collection_mode),
+       main_image_url = COALESCE(:mainImageUrl, main_image_url),
+       open_days_json = COALESCE(:openDaysJson, open_days_json)
      WHERE organization_id = :organizationId AND id = :marketId AND deleted_at IS NULL`,
-    { ...scope, name: changes.name, status: changes.status },
+    { ...scope, name: changes.name, status: changes.status,
+      collectionMode: changes.collectionMode ?? null, mainImageUrl: changes.mainImageUrl ?? null,
+      openDaysJson: changes.openDays ? JSON.stringify([...new Set(changes.openDays)]) : null },
   );
-  return { id: scope.marketId, name: changes.name, status: changes.status };
+  return { id: scope.marketId, name: changes.name, status: changes.status,
+    ...(changes.collectionMode ? { collectionMode: changes.collectionMode } : {}),
+    ...(changes.openDays ? { openDays: [...new Set(changes.openDays)] } : {}),
+    ...(changes.mainImageUrl ? { mainImageUrl: changes.mainImageUrl, previousMainImageUrl: current.main_image_url } : {}),
+  };
 }
 
 async function softDeleteMarket(connection, scope) {

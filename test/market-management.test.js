@@ -57,3 +57,30 @@ test('soft deletion preserves dependent rows and marks inactive with timestamp',
 test('write errors propagate for transaction rollback', async () => {
   await assert.rejects(softDeleteMarket(connection([market, [], [], [], new Error('write failure')]), scope), /write failure/);
 });
+
+test('basic edit updates collection, image and weekdays without replacing contact fields', async () => {
+  const conn = connection([[{id:9, main_image_url:'/uploads/old.jpg'}], {affectedRows:1}]);
+  const result = await updateMarketBasics(conn, scope, {name:'New',status:'active',collectionMode:'self',openDays:['mon','fri','mon'],mainImageUrl:'/uploads/new.jpg'});
+  assert.deepEqual(result.openDays,['mon','fri']);
+  assert.equal(result.previousMainImageUrl,'/uploads/old.jpg');
+  assert.equal(conn.calls[1].params.collectionMode,'self');
+  assert.equal(conn.calls[1].params.openDaysJson,'["mon","fri"]');
+  assert.equal(conn.calls[1].params.mainImageUrl,'/uploads/new.jpg');
+  assert.doesNotMatch(conn.calls[1].sql,/address|phone|email|description|terms/);
+});
+test('older basic payloads preserve collection, image and weekdays', async () => {
+  const conn = connection([market,{affectedRows:1}]);
+  await updateMarketBasics(conn,scope,{name:'New',status:'active'});
+  assert.equal(conn.calls[1].params.collectionMode,null);
+  assert.equal(conn.calls[1].params.mainImageUrl,null);
+  assert.equal(conn.calls[1].params.openDaysJson,null);
+});
+test('basic update validates JSON and multipart weekday/collection fields', () => {
+  const {marketBasicUpdateSchema:schema}=require('../src/utils/market-basic-update');
+  const base={name:'Market',status:'active'};
+  assert.deepEqual(schema.parse({...base,openDays:'["mon","sat"]'}).openDays,['mon','sat']);
+  assert.equal(schema.safeParse({...base,openDays:'[]'}).success,false);
+  assert.equal(schema.safeParse({...base,openDays:'not json'}).success,false);
+  assert.equal(schema.safeParse({...base,collectionMode:'unknown'}).success,false);
+  assert.equal(schema.safeParse({...base,organizationId:99}).success,false);
+});

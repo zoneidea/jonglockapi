@@ -2783,17 +2783,23 @@ router.patch(
   '/markets/:marketId/basic',
   requireRoles(ROLES.SUPERVISOR, ROLES.ADMIN),
   requireMarketAccess(),
-  validate(z.object({
-    params: z.object({ marketId: z.coerce.number().int().positive() }),
-    query: z.object({}).passthrough(),
-    body: z.object({ name: z.string().trim().min(1).max(255), status: z.enum(['active', 'inactive']) }).strict(),
-  })),
+  imageUpload.single('mainImage'),
   asyncHandler(async (req, res) => {
-    const { updateMarketBasics } = require('../../services/market-management.service');
-    const result = await transaction((conn) => updateMarketBasics(conn,
-      { organizationId: req.auth.organizationId, marketId: req.validated.params.marketId }, req.validated.body));
-    clearPublicReadCache();
-    return ok(res, result, 'market updated');
+    const mainImageUrl = req.file ? publicUploadUrl(req, req.file.path) : undefined;
+    try {
+      const marketId = z.coerce.number().int().positive().parse(req.params.marketId);
+      const body = require('../../utils/market-basic-update').marketBasicUpdateSchema.parse(req.body);
+      const { updateMarketBasics } = require('../../services/market-management.service');
+      const result = await transaction((conn) => updateMarketBasics(conn,
+        { organizationId: req.auth.organizationId, marketId }, { ...body, mainImageUrl }));
+      const { previousMainImageUrl, ...response } = result;
+      if (mainImageUrl && previousMainImageUrl !== mainImageUrl) removeUploadedFile(previousMainImageUrl);
+      clearPublicReadCache();
+      return ok(res, response, 'market updated');
+    } catch (error) {
+      if (mainImageUrl) removeUploadedFile(mainImageUrl);
+      throw error;
+    }
   }),
 );
 
@@ -3297,7 +3303,7 @@ router.post(
       body: z.object({
         name: z.string().min(1),
         description: z.string().max(500).optional().default(''),
-        floorPlanId: z.coerce.number().int().positive().optional().nullable(),
+        floorPlanId: z.coerce.number().int().positive(),
         rowsCount: z.coerce.number().int().min(1).max(200).default(20),
         columnsCount: z.coerce.number().int().min(1).max(200).default(30),
         cellSize: z.coerce.number().int().min(16).max(120).default(48),
@@ -3309,46 +3315,12 @@ router.post(
   asyncHandler(async (req, res) => {
     const { marketId } = req.validated.params;
     const body = req.validated.body;
-    let floorPlanName = '';
-    if (body.floorPlanId) {
-      const floorPlanRows = await query(
-        `SELECT id, name
-         FROM floor_plans
-         WHERE id = :floorPlanId
-           AND organization_id = :organizationId
-           AND market_id = :marketId
-         LIMIT 1`,
-        {
-          floorPlanId: body.floorPlanId,
-          organizationId: req.auth.organizationId,
-          marketId,
-        },
-      );
-      if (!floorPlanRows[0]) throw badRequest('Floor plan not found for this market');
-      floorPlanName = floorPlanRows[0].name || '';
-    }
     const layoutJson = createDefaultMarketLayoutJson(body.rowsCount, body.columnsCount, body.cellSize);
-    const result = await query(
-      `INSERT INTO market_layouts (
-        organization_id, market_id, floor_plan_id, name, description, rows_count, columns_count, cell_size,
-        layout_json, status, is_active, created_by, updated_by
-      ) VALUES (
-        :organizationId, :marketId, :floorPlanId, :name, :description, :rowsCount, :columnsCount, :cellSize,
-        :layoutJson, 'draft', 1, :adminUserId, :adminUserId
-      )`,
-      {
-        organizationId: req.auth.organizationId,
-        marketId,
-        floorPlanId: body.floorPlanId || null,
-        name: body.name.trim(),
-        description: body.description || '',
-        rowsCount: body.rowsCount,
-        columnsCount: body.columnsCount,
-        cellSize: body.cellSize,
-        layoutJson: JSON.stringify(layoutJson),
-        adminUserId: req.auth.sub || null,
-      },
-    );
+    const { createMarketLayout } = require('../../services/market-layout-create.service');
+    const result = await transaction((connection) => createMarketLayout(connection, {
+      organizationId: req.auth.organizationId, marketId, adminUserId: req.auth.sub || null,
+    }, body, layoutJson));
+    const floorPlanName = result.floorPlanName;
     clearPublicReadCache();
     return created(res, {
       id: result.insertId,
