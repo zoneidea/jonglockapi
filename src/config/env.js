@@ -35,6 +35,7 @@ const envSchema = z.object({
   RESERVEPAY_API_KEY: z.string().default(''),
   RESERVEPAY_WEBHOOK_KEY: z.string().default(''),
   RESERVEPAY_MERCHANT_ID: z.string().default(''),
+  RESERVEPAY_INSTALLATION_ID_WEB: z.string().default(''),
   RESERVEPAY_INSTALLATION_ID_IOS: z.string().default(''),
   RESERVEPAY_INSTALLATION_ID_ANDROID: z.string().default(''),
   // Keep false until payments update bookings (webhook / find-payment) end to end.
