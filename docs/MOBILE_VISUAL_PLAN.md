@@ -33,3 +33,19 @@ web build, new native dependencies or native build is required.
 To enable, create a Visual Plan referencing the correct booth plan, place objects
 and publish it in management. Old layouts with no reference are not automatically
 reassigned; recreate them with an explicit reference. No production data is guessed.
+
+## Production rollout — 2026-11-06
+
+Backend 3bbbdc7 pulled through Plesk and only api.jonglock.com restarted. App
+0902645bc pushed; no native build or management web deployment needed. TypeScript
+passed; app tests 52 passed; backend tests 113 passed with one optional MySQL suite
+skipped. Scoped app lint has only the preexisting markets.ts curly warning; backend
+lint passed.
+
+Live API requests returned HTTP 200/data null for all currently available booth
+plans (market/floor-plan IDs 33/13, 33/12, 29/9, 28/7). None currently has a matching
+active published referenced Visual Plan. Accordingly the app retains original booth
+selection/image fallback until an administrator publishes a properly referenced
+layout. No production layout/booking/payment data was created or reassigned during
+validation. Native on-device rendering with real published data remains to be checked
+after that configuration; component interaction and filtering were covered by tests.
