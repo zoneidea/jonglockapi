@@ -552,6 +552,19 @@ router.get(
 );
 
 router.get(
+  '/markets/:marketId/floor-plans/:floorPlanId/visual-plan',
+  cachePublicMarkets,
+  validate(z.object({
+    params: z.object({marketId:z.coerce.number().int().positive(),floorPlanId:z.coerce.number().int().positive()}),
+    query: z.object({}).passthrough(),
+  })),
+  asyncHandler(async (req, res) => {
+    const { getPublishedMarketLayout } = require('../../services/public-market-layout.service');
+    return ok(res, await getPublishedMarketLayout(req.validated.params.marketId, req.validated.params.floorPlanId));
+  }),
+);
+
+router.get(
   '/markets/:marketId/floor-plans',
   cachePublicMarkets,
   asyncHandler(async (req, res) => {
