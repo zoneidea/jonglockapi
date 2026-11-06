@@ -67,3 +67,31 @@ were saved, image uploaded, layout created/published/deleted during QA. Existing
 layouts with no reference remain unchanged; new drafts require a booth-plan ID.
 Backend suite: 110 passed, one optional MySQL integration skipped; lint passed.
 Frontend production builds passed locally and on server. No native app build.
+
+## Save/publish CORS repair — 2026-11-06
+
+Production `.htaccess` at `/var/www/vhosts/jonglock.com/httpdocs/api/.htaccess`
+added restrictive headers (`Content-Type` only, `GET, POST, OPTIONS`) alongside
+the correct headers from `src/app.js`. Browser preflight therefore blocked the
+authenticated PATCH used by both Save draft and Publish with `Failed to fetch`.
+
+Removed only the two `Header set Access-Control-Allow-Headers` and
+`Header set Access-Control-Allow-Methods` directives. The existing proxy-owned
+Allow-Origin directive is unchanged; Node continues to own methods/headers in
+`CORS_ORIGIN_SOURCE=proxy` mode. Keep these directives out of future deployment
+templates to prevent duplicate/conflicting headers. No application build or
+database migration was needed.
+
+The original file is backed up privately at
+`/var/www/vhosts/jonglock.com/.config-backups/api-htaccess-1793928697797`.
+Its backup permissions are 0600. When restoring, explicitly restore the live
+`.htaccess` permissions to 0644; copying the private backup's mode causes Apache
+to return 403. Live permissions were corrected to 0644 and the API restarted.
+Initial readiness probes timed out; later `/health` returned 200.
+
+Verified live OPTIONS for PATCH on both management route aliases and POST on
+the publish route: HTTP 204, exactly one Allow-Origin, Allow-Methods and
+Allow-Headers value; PATCH and Authorization are present. In the management
+browser, saved and published the existing `โซนล็อค 2` layout. Reloaded the page
+and reopened it: published status, booths B023–B032 and both parking objects
+were retained, with no Failed to fetch notice. No native app build.
