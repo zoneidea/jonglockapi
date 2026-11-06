@@ -48,3 +48,22 @@ The active frontend entry is `VisualPlanPage_New.jsx`, exported by Markets/index
 These are management APIs; this change does not add a customer/mobile visual-map
 endpoint or change the mobile booth booking flow. Existing request/activity logging
 and public-cache invalidation are retained.
+
+## Production rollout — 2026-11-06
+
+Backend 7770f05 pulled through Plesk and api.jonglock.com restarted. Frontend
+67709fd built locally and on server, staged at
+`.management-releases/market-layout-20261106`. Previous dist backed up to
+`.management-releases/before-market-layout-20261106`. Staged bundles validated
+before copying assets and atomically activating index; .htaccess/old assets retained.
+Console reported LAYOUT_UI_ACTIVATED. No migration required.
+
+Live QA: market edit modal shows collection radios, current image/upload and weekday
+checkboxes; radio/day changes confirmed then cancelled. Visual Plan list shows two
+existing layouts and Delete actions. Delete confirmation displayed retention wording
+and was cancelled. New draft dropdown showed the two available booth plans and a
+selection updated correctly; creation was cancelled. No production market settings
+were saved, image uploaded, layout created/published/deleted during QA. Existing
+layouts with no reference remain unchanged; new drafts require a booth-plan ID.
+Backend suite: 110 passed, one optional MySQL integration skipped; lint passed.
+Frontend production builds passed locally and on server. No native app build.
