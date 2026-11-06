@@ -38,7 +38,11 @@ async function claim(organizationId, { allowConflict = false } = {}) {
       lease_until = DATE_ADD(NOW(), INTERVAL 120 SECOND), sync_state = 'syncing'
       WHERE organization_id = :organizationId AND (lease_until IS NULL OR lease_until < NOW())`, { organizationId, token });
     if (!result.affectedRows) throw new AppError(409, 'กำลังบันทึกการตั้งค่า กรุณาลองใหม่สักครู่', 'SETTINGS_BUSY');
-    const [active] = await conn.execute(`SELECT id FROM bookings WHERE organization_id = :organizationId AND status = 'payment_processing' LIMIT 1`, { organizationId });
+    // Legacy booking/debt statuses do not prove that a gateway payment is in flight.
+    // Keep unresolved attempts protected, including unknown/review and older merchants.
+    const [active] = await conn.execute(`SELECT id FROM payment_attempts
+      WHERE organization_id = :organizationId AND provider = 'reservepay'
+        AND state IN ('creating','pending','unknown','review') LIMIT 1`, { organizationId });
     if (active.length) throw new AppError(409, 'มีรายการรอผลชำระเงิน กรุณารอให้สิ้นสุดก่อนเปลี่ยนช่องทางหรือบัญชีรับเงิน', 'PAYMENT_IN_PROGRESS');
   });
   const rows = await query(`SELECT ${fields} FROM organization_payment_settings WHERE organization_id = :organizationId`, { organizationId });

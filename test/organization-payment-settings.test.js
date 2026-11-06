@@ -5,7 +5,7 @@ function stub(path, exports) {
 }
 stub('../src/config/env', { FIELD_ENCRYPTION_KEY: Buffer.alloc(32, 17).toString('base64'), FIELD_HASH_SECRET: 'test-only-secret' });
 const { decryptField, encryptField } = require('../src/utils/crypto');
-let sourceRow; let row; let calls; let busy; let active; let bankCreated; let loseBankResponse;
+let sourceRow; let row; let calls; let busy; let active; let legacyProcessing; let bankCreated; let loseBankResponse;
 const recipient = { bankCode: '004', accountNumber: '1234567890', accountName: 'Test Recipient', email: 'recipient@example.test', phone: '' };
 const notFound = () => Object.assign(new Error('not found'), { providerCode: 'NOT_FOUND' });
 async function query(sql, p) {
@@ -20,7 +20,12 @@ async function query(sql, p) {
     if (busy) return { affectedRows: 0 };
     row.lease_token = p.token; row.sync_state = 'syncing'; return { affectedRows: 1 };
   }
-  if (sql.startsWith('SELECT id FROM bookings')) return active ? [{ id: 1 }] : [];
+  if (sql.startsWith('SELECT id FROM bookings')) return active || legacyProcessing ? [{ id: 1 }] : [];
+  if (sql.startsWith('SELECT id FROM payment_attempts')) {
+    assert.ok(sql.includes("provider = 'reservepay'"));
+    assert.ok(sql.includes("state IN ('creating','pending','unknown','review')"));
+    return active ? [{ id: 1 }] : [];
+  }
   if (sql.includes('migration_conflict = 0')) Object.assign(row, {mode:p.mode, sync_state:p.state, details_enc:p.details, recipient_details_enc:p.recipient, contact_id:p.contactId, bank_account_id:p.bankId, generation:p.generation, source_market_id:p.marketId, migration_conflict:0});
   else if (sql.includes('recipient_details_enc = :encrypted')) row.recipient_details_enc = p.encrypted;
   else if (sql.includes('details_enc = :details')) Object.assign(row, { details_enc: p.details, contact_id: p.contactId, bank_account_id: p.bankAccountId });
@@ -57,7 +62,7 @@ stub('../src/services/reservepay.service', { callMerchantApi: async (endpoint, b
   return true;
 } });
 const settings = require('../src/services/organization-payment-settings.service');
-function reset() { sourceRow = null; row = null; calls = []; busy = false; active = false; bankCreated = false; loseBankResponse = false; }
+function reset() { sourceRow = null; row = null; calls = []; busy = false; active = false; legacyProcessing = false; bankCreated = false; loseBankResponse = false; }
 test('registers and encrypts a recipient; repeated saves never duplicate the account or call update-bank-account', async () => {
   reset();
   const saved = await settings.saveSettings(7, { mode: 'gateway', details: recipient });
@@ -83,6 +88,14 @@ test('active payments and concurrent saves block recipient changes before contac
   active = false; busy = true;
   await assert.rejects(settings.saveSettings(7, { mode: 'gateway', details: recipient }), { code: 'SETTINGS_BUSY' });
   assert.equal(calls.length, 0);
+});
+test('legacy processing bookings without a live gateway attempt do not block organization settings', async () => {
+  reset(); legacyProcessing = true;
+  const result = await settings.saveSettings(7, { mode: 'gateway', details: recipient });
+  assert.equal(result.mode, 'gateway');
+  assert.equal(result.syncState, 'ready');
+  assert.equal(legacyProcessing, true);
+  assert.equal(calls.filter(call => call.endpoint === 'add-contact').length, 1);
 });
 test('manual policy disables gateway and gateway policy disables direct manual payment', async () => {
   reset(); row = { mode: 'manual', sync_state: 'inactive' };

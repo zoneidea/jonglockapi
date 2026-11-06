@@ -95,3 +95,19 @@ remove provider contacts to roll back the code.
   App verification covers TypeScript and 41 Jest checks, including mixed-market
   checkout and manual/gateway channel visibility; device/payment verification
   remains separate from this configuration deployment.
+
+## Legacy receivables and settings changes — 2026-11-06
+
+Changing organization payment settings now checks organization-scoped ReservePay
+payment_attempts in creating/pending/unknown/review states, rather than treating
+every booking marked payment_processing as a live gateway payment. Legacy manual
+bookings or unpaid fines without a live gateway attempt do not block recipient
+setup. Their debt, booking status and payment history are not modified or erased.
+No age cutoff or booking-ID exception is used, and unresolved attempts from any
+merchant remain protected. The settings row lock still serializes checkout and
+settings changes. No API contract, frontend build or database migration needed.
+
+Regression coverage confirms legacy processing bookings can coexist with saving
+settings, live attempts and concurrent saves reject before contacting ReservePay,
+and recipient encryption/idempotent registration are retained. Seventeen focused
+organization settings/routes and gateway checkout tests and backend lint passed.
