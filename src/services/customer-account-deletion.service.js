@@ -6,6 +6,7 @@ const { blindIndex } = require('../utils/crypto');
 const { AppError } = require('../utils/errors');
 const { logger } = require('../config/logger');
 const { getFirebaseAuth, getFirebaseFirestore } = require('./firebase-admin.service');
+const { clearUnstartedPayments } = require('./customer-unstarted-payments.service');
 
 function profileFiles(profile) {
   let gallery = [];
@@ -31,6 +32,9 @@ async function deleteCustomerAccount(identity) {
   const result = await transaction(async conn => {
     const [profiles] = await conn.execute('SELECT * FROM public_user_profiles WHERE email_hash = :emailHash FOR UPDATE', { emailHash });
     const [users] = await conn.execute('SELECT id, organization_id FROM mobile_users WHERE email_hash = :emailHash ORDER BY organization_id, id FOR UPDATE', { emailHash });
+    for (const user of users) {
+      await clearUnstartedPayments(conn, { userId: user.id, organizationId: user.organization_id });
+    }
     // Temporary locks contain the owner's email/name; remove them as well as SQL profile data.
     for (;;) {
       const snapshot = await firestore.collection('booth_temp_locks').where('ownerId', '==', identity.email).limit(400).get();

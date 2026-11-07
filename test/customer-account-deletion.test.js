@@ -6,6 +6,9 @@ const {randomUUID} = require('node:crypto');
 function stub(file, exports) { const id = require.resolve(file); require.cache[id] = { id, filename:id, loaded:true, exports }; }
 let configured; let fail; let profiles; let users; let operations; let files; let cloudDeleted;
 let linkedNotificationOwners;
+stub('../src/services/customer-unstarted-payments.service', {clearUnstartedPayments: async (_conn, scope) => {
+  assert.ok(users.some(user => user.id === scope.userId && user.organization_id === scope.organizationId));
+}});
 stub('../src/utils/crypto', { blindIndex: value => `hash:${value}` });
 stub('../src/config/logger', { logger: { info: () => {} } });
 stub('../src/services/firebase-admin.service', {

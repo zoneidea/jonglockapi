@@ -23,7 +23,13 @@ Organization customer rows are anonymized and marked deleted, preserving foreign
 keys for booking/payment ledgers. Identifiers, encrypted personal fields,
 password credentials and consent fields are cleared/replaced. Existing customer
 JWTs are rejected by the active-account check even before token expiry.
-No booking, payment, payout or organizational recipient data is deleted.
+Unpaid payment rows that have not started a gateway are deleted. Their bookings
+are cancelled/hidden from the cart and unpaid booth locks are released. Cleanup
+locks owned bookings and payments and skips any gateway attempt/reference,
+received payment, transfer evidence, fine payment or accounting document.
+Gateway history, settled financial records, payouts and organizational recipient
+data remain intact. Payment notification delivery links are removed before their
+parent mobile notifications to respect the migration 055 foreign key.
 
 Firebase Admin removes the owner's temporary Firestore booth locks (which contain
 email/name) and any linked phone-verification Firebase Auth identity. Local
@@ -41,6 +47,7 @@ contains no personal identifiers. A structured completion log contains no email.
 
 Tests cover verified-owner-only access, strict confirmation, no email spoofing,
 idempotence, cross-organization anonymization, file/cloud cleanup, preservation
-of financial tables, transactional failures and rejection of deleted-user JWTs.
+of settled/gateway financial records, unstarted-payment cleanup, notification
+foreign-key deletion order, transactional failures and deleted-user JWT rejection.
 Do not test this endpoint against a real production customer without that
 customer's explicit deletion confirmation; use disposable review accounts.
