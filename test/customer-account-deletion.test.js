@@ -5,6 +5,7 @@ const path = require('node:path');
 const {randomUUID} = require('node:crypto');
 function stub(file, exports) { const id = require.resolve(file); require.cache[id] = { id, filename:id, loaded:true, exports }; }
 let configured; let fail; let profiles; let users; let operations; let files; let cloudDeleted;
+let linkedNotificationOwners;
 stub('../src/utils/crypto', { blindIndex: value => `hash:${value}` });
 stub('../src/config/logger', { logger: { info: () => {} } });
 stub('../src/services/firebase-admin.service', {
@@ -26,6 +27,16 @@ stub('../src/config/db', {transaction: async fn => {
       assert.equal(p.emailHash,'hash:owner@gmail.com'); return [profiles];
     }
     if (sql.startsWith('SELECT id, organization_id FROM mobile_users')) return [users];
+    if (sql.startsWith('DELETE psn FROM payment_status_notifications')) {
+      assert.match(sql, /mn.id = psn.notification_id/);
+      assert.match(sql, /mn.organization_id = psn.organization_id/);
+      assert.match(sql, /mn.organization_id = :organizationId AND mn.mobile_user_id = :userId/);
+      linkedNotificationOwners.delete(`${p.organizationId}:${p.userId}`);
+      return [{affectedRows:1}];
+    }
+    if (sql.startsWith('DELETE FROM mobile_notifications')) {
+      assert.ok(!linkedNotificationOwners.has(`${p.organizationId}:${p.userId}`), 'Payment notification foreign keys must be removed before parent notifications');
+    }
     if (fail && sql.startsWith('UPDATE mobile_users')) throw new Error('Storage failure');
     if (sql.startsWith('UPDATE mobile_users')) {
       assert.equal(p.organizationId,users.find(user=>user.id===p.userId).organization_id);
@@ -47,6 +58,7 @@ function reset() {
   files=names.map(name=>path.join(dir,name)); files.forEach(file=>fs.writeFileSync(file,'test'));
   profiles=[{id:3,firebase_uid:'phone-owner',avatar_url:`/uploads/public-profiles/${names[0]}`,store_logo_url:'https://third.example/logo.png',store_gallery_json:JSON.stringify([`/uploads/public-profiles/${names[1]}`,'/uploads/other/private.png'])}];
   users=[{id:9,organization_id:7},{id:10,organization_id:8}];
+  linkedNotificationOwners=new Set(['7:9','8:10','7:99']);
 }
 test.afterEach(()=>{files?.forEach(file=>fs.rmSync(file,{force:true}));});
 test('deletes owned profile, personal files, push tokens and cloud locks while preserving financial tables',async()=>{
@@ -57,6 +69,16 @@ test('deletes owned profile, personal files, push tokens and cloud locks while p
   assert.ok(files.every(file=>file.includes('/uploads/public-profiles/')));
   assert.equal(operations.filter(item=>item.sql.startsWith('UPDATE mobile_users')).length,2);
   assert.ok(!operations.some(item=>/\b(bookings|payments|payment_attempts)\b/.test(item.sql)));
+});
+test('removes payment notification references before parent rows, scoped to the deleted account',async()=>{
+  reset(); await deleteCustomerAccount({email:'owner@gmail.com'});
+  for (const user of [{id:9,organization_id:7},{id:10,organization_id:8}]) {
+    const owned=operations.filter(item=>item.p.userId===user.id && item.p.organizationId===user.organization_id);
+    const child=owned.findIndex(item=>item.sql.startsWith('DELETE psn FROM payment_status_notifications'));
+    const parent=owned.findIndex(item=>item.sql.startsWith('DELETE FROM mobile_notifications'));
+    assert.ok(child>=0 && child<parent);
+  }
+  assert.deepEqual([...linkedNotificationOwners],['7:99']);
 });
 test('deletion is idempotent and cannot recreate a deleted profile',async()=>{
   reset(); await deleteCustomerAccount({email:'owner@gmail.com'});

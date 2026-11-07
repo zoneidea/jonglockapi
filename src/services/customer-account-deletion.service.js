@@ -58,6 +58,10 @@ async function deleteCustomerAccount(identity) {
     for (const user of users) {
       const scope = { userId: user.id, organizationId: user.organization_id };
       await conn.execute('DELETE FROM mobile_device_tokens WHERE organization_id = :organizationId AND mobile_user_id = :userId', scope);
+      // Remove delivery links before their parent notifications (migration 055 FK).
+      await conn.execute(`DELETE psn FROM payment_status_notifications psn
+        INNER JOIN mobile_notifications mn ON mn.id = psn.notification_id AND mn.organization_id = psn.organization_id
+        WHERE mn.organization_id = :organizationId AND mn.mobile_user_id = :userId`, scope);
       await conn.execute('DELETE FROM mobile_notifications WHERE organization_id = :organizationId AND mobile_user_id = :userId', scope);
       await conn.execute('DELETE FROM notifications WHERE organization_id = :organizationId AND mobile_user_id = :userId', scope);
       // Keep relational IDs for booking/payment records, but remove identifying data and login credentials.
