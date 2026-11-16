@@ -71,6 +71,8 @@ QR ใช้รูปที่องค์กรตั้งค่าไว้�
 
 รายละเอียด payload, response, สิทธิ์, idempotency และขั้นตอนทดสอบอยู่ใน [API Contract ของแอป Audit](https://github.com/zoneidea/jonglockaudit/blob/main/docs/API_CONTRACT.md)
 
+Audit Web จำการเข้าสู่ระบบผ่าน HttpOnly cookie ได้ด้วย rememberMe และ GET /api/mobile/audit/auth/session ตรวจบัญชี/สิทธิ์ปัจจุบันใหม่ก่อนคืน bearer token POST /api/mobile/audit/auth/logout ล้าง cookie อายุเซสชันยึด JWT เดิม ไม่มี migration เพิ่ม ให้ deploy Backend ก่อน Web และใช้ HTTPS พร้อม CORS credentials ที่ไม่ซ้ำ
+
 สถานะ UAT และขั้นตอน deploy รอบ Audit Web: [AUDIT_UAT_ROLLOUT.md](docs/AUDIT_UAT_ROLLOUT.md)
 
 ## Initial Supervisor

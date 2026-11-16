@@ -13,6 +13,7 @@ const { decryptField } = require('../../utils/crypto');
 const authService = require('../auth/auth.service');
 
 const router = express.Router();
+const auditSession = require('../../services/audit-session.service');
 
 router.post(
   '/auth/login',
@@ -21,6 +22,7 @@ router.post(
       body: z.object({
         username: z.string().min(1),
         password: z.string().min(1),
+        rememberMe: z.boolean().optional().default(false),
       }),
       query: z.object({}).passthrough(),
       params: z.object({}).passthrough(),
@@ -28,9 +30,23 @@ router.post(
   ),
   asyncHandler(async (req, res) => {
     const result = await authService.loginAudit(req.validated.body);
+    res.set('Cache-Control', 'no-store');
+    if (req.validated.body.rememberMe) auditSession.remember(res, result.token);
+    else auditSession.clear(res);
     return ok(res, result);
   }),
 );
+
+router.get('/auth/session', asyncHandler(async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {return ok(res, await auditSession.restore(req));}
+  catch (error) {if (error.statusCode === 401) auditSession.clear(res); throw error;}
+}));
+router.post('/auth/logout', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  auditSession.clear(res);
+  return ok(res, {loggedOut: true});
+});
 
 router.use(authenticate, requireRoles(ROLES.AUDIT));
 
