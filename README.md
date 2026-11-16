@@ -69,6 +69,8 @@ QR ใช้รูปที่องค์กรตั้งค่าไว้�
 
 รายละเอียด payload, response, สิทธิ์, idempotency และขั้นตอนทดสอบอยู่ใน [API Contract ของแอป Audit](https://github.com/zoneidea/jonglockaudit/blob/main/docs/API_CONTRACT.md)
 
+สถานะ UAT และขั้นตอน deploy รอบ Audit Web: [AUDIT_UAT_ROLLOUT.md](docs/AUDIT_UAT_ROLLOUT.md)
+
 ## Initial Supervisor
 
 ```bash
