@@ -8,7 +8,7 @@ const { ROLES } = require('../../constants/roles');
 const { asyncHandler } = require('../../utils/async-handler');
 const { ok, created } = require('../../utils/api-response');
 const { badRequest, notFound } = require('../../utils/errors');
-const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings } = require('../../utils/vat');
+const { applyVatToAmount, calculateVatBreakdown, getOrganizationVatSettings, isVatEnabled, vatRate } = require('../../utils/vat');
 const { decryptField } = require('../../utils/crypto');
 const authService = require('../auth/auth.service');
 
@@ -316,8 +316,8 @@ router.get(
         checkedInAt: item.checked_in_at || null,
       },
       vat: {
-        enabled: Boolean(vatSettings.enabled),
-        rate: Number(vatSettings.rate || 0),
+        enabled: isVatEnabled(vatSettings),
+        rate: vatRate(vatSettings),
       },
       usedAccessories: bookingAccessories.map((accessory) => ({
         id: accessory.id,

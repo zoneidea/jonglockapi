@@ -403,6 +403,10 @@ function safeIsoDate(value) {
   return /^\d{4}-\d{2}-\d{2}$/.test(text) ? text : null;
 }
 
+function currentDateBangkok() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Bangkok', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+}
+
 function buildAccountingDateFilter({ dateField, startDate, endDate, aliases = {} }) {
   const clauses = [];
   const params = {};
@@ -1244,17 +1248,19 @@ async function fetchPaymentAccountingDetail(conn, organizationId, paymentId, adm
     `SELECT p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at,
             p.audit_check_id,
             COALESCE(b.id, ac_b.id) AS booking_id,
-            COALESCE(b.public_id, ac_b.public_id) AS booking_public_id,
-            CASE WHEN p.audit_check_id IS NOT NULL THEN 'audit_fine' ELSE 'booking' END AS payment_kind,
+            COALESCE(b.public_id, ac_b.public_id, col.public_id) AS booking_public_id,
+            CASE WHEN p.audit_check_id IS NOT NULL THEN 'audit_fine' WHEN col.id IS NOT NULL THEN 'audit_collection' ELSE 'booking' END AS payment_kind,
             CASE WHEN p.audit_check_id IS NOT NULL
               THEN COALESCE(ac.fine_amount, 0) + COALESCE(ac.accessories_fine_amount, 0) + COALESCE(ac.damage_fine_amount, 0)
+              WHEN col.id IS NOT NULL THEN col.subtotal_amount
               ELSE b.subtotal_amount
             END AS subtotal_amount,
-            CASE WHEN p.audit_check_id IS NOT NULL THEN 0 ELSE b.discount_amount END AS discount_amount,
-            CASE WHEN p.audit_check_id IS NOT NULL THEN ac.vat_amount ELSE b.vat_amount END AS vat_amount,
-            CASE WHEN p.audit_check_id IS NOT NULL THEN ac.total_fine_amount ELSE b.total_amount END AS total_amount,
+            CASE WHEN p.audit_check_id IS NOT NULL OR col.id IS NOT NULL THEN 0 ELSE b.discount_amount END AS discount_amount,
+            CASE WHEN p.audit_check_id IS NOT NULL THEN ac.vat_amount WHEN col.id IS NOT NULL THEN col.vat_amount ELSE b.vat_amount END AS vat_amount,
+            CASE WHEN p.audit_check_id IS NOT NULL THEN ac.total_fine_amount WHEN col.id IS NOT NULL THEN col.total_amount ELSE b.total_amount END AS total_amount,
             m.id AS market_id, m.name AS market_name,
             mu.username_enc, mu.first_name_enc, mu.last_name_enc,
+            col.customer_reference_enc, MAX(CAST(col.lines_json AS CHAR)) AS collection_lines_json,
             o.name AS organization_name, o.address AS organization_address, o.email AS organization_email, o.phone AS organization_phone,
             o.vat_enabled, o.vat_rate, o.registered_name, o.registered_tax_id, o.registered_subdistrict,
             o.registered_district, o.registered_province, o.registered_postcode,
@@ -1262,11 +1268,12 @@ async function fetchPaymentAccountingDetail(conn, organizationId, paymentId, adm
             GROUP_CONCAT(DISTINCT CONCAT(COALESCE(bo.code, ''), CASE WHEN bo.name IS NULL OR bo.name = '' THEN '' ELSE CONCAT(' ', bo.name) END) ORDER BY bo.sort_order, bo.code SEPARATOR ', ') AS booths
      FROM payments p
      LEFT JOIN bookings b ON b.id = p.booking_id AND b.organization_id = p.organization_id
+     LEFT JOIN audit_collections col ON col.payment_id = p.id AND col.organization_id = p.organization_id
      LEFT JOIN audit_checks ac ON ac.id = p.audit_check_id AND ac.organization_id = p.organization_id
      LEFT JOIN booking_items ac_bi ON ac_bi.id = ac.booking_item_id AND ac_bi.organization_id = ac.organization_id
      LEFT JOIN bookings ac_b ON ac_b.id = ac_bi.booking_id AND ac_b.organization_id = ac_bi.organization_id
      JOIN organizations o ON o.id = p.organization_id
-     JOIN markets m ON m.id = COALESCE(b.market_id, ac.market_id) AND m.organization_id = p.organization_id
+     JOIN markets m ON m.id = COALESCE(b.market_id, ac.market_id, col.market_id) AND m.organization_id = p.organization_id
      LEFT JOIN mobile_users mu ON mu.id = COALESCE(b.mobile_user_id, ac_b.mobile_user_id) AND mu.organization_id = p.organization_id
      LEFT JOIN booking_items bi
        ON bi.organization_id = p.organization_id
@@ -1282,11 +1289,13 @@ async function fetchPaymentAccountingDetail(conn, organizationId, paymentId, adm
        AND p.status = 'paid'
        AND (p.booking_id IS NULL OR b.status = 'paid')
        AND (p.audit_check_id IS NULL OR ac.fine_payment_status = 'paid')
+       AND (p.audit_check_id IS NOT NULL OR col.id IS NULL OR col.status = 'paid')
        AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
      GROUP BY p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at,
               p.audit_check_id, b.id, b.public_id, b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
               ac.id, ac.fine_amount, ac.accessories_fine_amount, ac.damage_fine_amount, ac.vat_amount, ac.total_fine_amount,
               ac_b.id, ac_b.public_id,
+              col.id, col.public_id, col.subtotal_amount, col.vat_amount, col.total_amount, col.customer_reference_enc,
               m.id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc,
               o.name, o.address, o.email, o.phone, o.vat_enabled, o.vat_rate, o.registered_name,
               o.registered_tax_id, o.registered_subdistrict, o.registered_district, o.registered_province, o.registered_postcode
@@ -1297,10 +1306,24 @@ async function fetchPaymentAccountingDetail(conn, organizationId, paymentId, adm
   return rows[0] || null;
 }
 
+async function assertCollectionDocumentAccess(conn, auth, document) {
+  if (document.booking_id || document.audit_check_id || !document.payment_id) return;
+  const [rows] = await conn.execute(`SELECT col.id FROM audit_collections col
+    LEFT JOIN admin_market_assignments ama ON ama.market_id = col.market_id
+      AND ama.organization_id = col.organization_id AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+    WHERE col.payment_id = :paymentId AND col.organization_id = :organizationId
+      AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL) LIMIT 1`, {
+    organizationId: auth.organizationId, paymentId: document.payment_id, adminUserId: auth.sub,
+    hasGlobalMarketAccess: [ROLES.SUPERVISOR, ROLES.ACCOUNTING].includes(auth.role) ? 1 : 0,
+  });
+  if (!rows.length) throw notFound('Document not found');
+}
+
 async function issueAccountingDocument(conn, { organizationId, paymentId, adminUserId, hasGlobalMarketAccess, documentType }) {
   const payment = await fetchPaymentAccountingDetail(conn, organizationId, paymentId, adminUserId, hasGlobalMarketAccess);
   if (!payment) throw notFound('Paid payment not found');
 
+  const customerName = decryptField(payment.customer_reference_enc) || [decryptField(payment.first_name_enc), decryptField(payment.last_name_enc)].filter(Boolean).join(' ').trim() || decryptField(payment.username_enc) || '-';
   const resolvedType = documentType || (Number(payment.vat_enabled || 0) === 1 ? 'tax_invoice' : 'receipt');
   const [existing] = await conn.execute(
     `SELECT *
@@ -1313,12 +1336,14 @@ async function issueAccountingDocument(conn, { organizationId, paymentId, adminU
      LIMIT 1`,
     { organizationId, paymentId, documentType: resolvedType },
   );
-  if (existing[0]) return { ...payment, document: existing[0] };
+  if (existing[0]) return { ...payment, customer_reference_enc: undefined, customer_name: customerName, document: existing[0] };
 
   const issueDate = currentDateBangkok();
   const documentNo = await nextAccountingDocumentNo(conn, organizationId, resolvedType, issueDate);
-  const customerName = [decryptField(payment.first_name_enc), decryptField(payment.last_name_enc)].filter(Boolean).join(' ').trim() || decryptField(payment.username_enc) || '-';
-  const lineItems = [
+  const collectionLines = normalizeJsonValue(payment.collection_lines_json);
+  const lineItems = payment.payment_kind === 'audit_collection' && Array.isArray(collectionLines) ? collectionLines.map((line) => ({
+    description: line.name, detail: `${line.quantity} x ${Number(line.unitPrice).toFixed(2)}`, amount: Number(line.lineTotal),
+  })) : [
     {
       description: payment.payment_kind === 'audit_fine' ? 'ค่าปรับ/ค่าบริการตรวจสอบตลาด' : 'ค่าจอง Booth',
       detail: payment.booths || '-',
@@ -1340,7 +1365,7 @@ async function issueAccountingDocument(conn, { organizationId, paymentId, adminU
     registeredPostcode: payment.registered_postcode,
   };
   const customerSnapshot = {
-    name: customerName,
+    ...(payment.payment_kind === 'audit_collection' ? { nameEnc: payment.customer_reference_enc } : { name: customerName }),
     marketName: payment.market_name,
     bookingPublicId: payment.booking_public_id,
     bookingDates: payment.booking_dates,
@@ -1368,15 +1393,15 @@ async function issueAccountingDocument(conn, { organizationId, paymentId, adminU
       discountAmount: payment.discount_amount || 0,
       vatAmount: payment.vat_amount || 0,
       totalAmount: payment.amount || payment.total_amount || 0,
-      customerName,
+      customerName: payment.payment_kind === 'audit_collection' ? 'ผู้ค้าหน้าตลาด' : customerName,
       organizationSnapshotJson: toJson(organizationSnapshot),
       customerSnapshotJson: toJson(customerSnapshot),
       lineItemsJson: toJson(lineItems),
       adminUserId,
     },
   );
-  const [documents] = await conn.execute(`SELECT * FROM accounting_documents WHERE id = :id LIMIT 1`, { id: createdDocument.insertId });
-  return { ...payment, customer_name: customerName, document: documents[0] };
+  const [documents] = await conn.execute(`SELECT * FROM accounting_documents WHERE id = :id AND organization_id = :organizationId LIMIT 1`, { id: createdDocument.insertId, organizationId });
+  return { ...payment, customer_reference_enc: undefined, customer_name: customerName, document: documents[0] };
 }
 
 router.post(
@@ -6255,9 +6280,9 @@ router.get(
     const { startDate, endDate, marketId, dateField, sortBy, paymentChannel } = req.validated.query;
     const paidOnly = req.validated.query.paidOnly === '1' || req.validated.query.status === 'paid';
     const orderBy = {
-      booking_public_id: 'COALESCE(b.public_id, ac_b.public_id) ASC',
-      booking_date: 'MIN(bi.booking_date) DESC, COALESCE(b.public_id, ac_b.public_id) ASC',
-      payment_date: 'COALESCE(p.paid_at, p.created_at) DESC, COALESCE(b.public_id, ac_b.public_id) ASC',
+      booking_public_id: 'COALESCE(b.public_id, ac_b.public_id, col.public_id) ASC',
+      booking_date: 'COALESCE(MIN(bi.booking_date), DATE(col.created_at)) DESC, COALESCE(b.public_id, ac_b.public_id, col.public_id) ASC',
+      payment_date: 'COALESCE(p.paid_at, p.created_at) DESC, COALESCE(b.public_id, ac_b.public_id, col.public_id) ASC',
     }[sortBy];
     const dateFilter = buildAccountingDateFilter({
       dateField,
@@ -6265,21 +6290,25 @@ router.get(
       endDate,
       aliases: { payment: 'p', booking: 'p', item: 'bi' },
     });
+    dateFilter.sql = dateFilter.sql.replace(/\bbi\.booking_date\b/g, 'COALESCE(bi.booking_date, DATE(col.created_at))');
     const rows = await query(
       `SELECT p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at,
-              p.provider_reference, pa.public_id AS payment_attempt_public_id, pa.payment_method, pa.payment_method_display_name,
+              p.provider_reference, pa.public_id AS payment_attempt_public_id,
+              COALESCE(pa.payment_method, CASE WHEN p.provider_reference = 'CASH' THEN 'CASH' ELSE NULL END) AS payment_method,
+              COALESCE(pa.payment_method_display_name, CASE WHEN p.provider_reference = 'CASH' THEN 'เงินสด' ELSE NULL END) AS payment_method_display_name,
               p.audit_check_id,
-              COALESCE(b.public_id, ac_b.public_id) AS booking_public_id,
-              CASE WHEN p.audit_check_id IS NOT NULL THEN 'audit_fine' ELSE 'booking' END AS payment_kind,
+              COALESCE(b.public_id, ac_b.public_id, col.public_id) AS booking_public_id,
+              CASE WHEN p.audit_check_id IS NOT NULL THEN 'audit_fine' WHEN col.id IS NOT NULL THEN 'audit_collection' ELSE 'booking' END AS payment_kind,
               CASE WHEN p.audit_check_id IS NOT NULL
                 THEN COALESCE(ac.fine_amount, 0) + COALESCE(ac.accessories_fine_amount, 0) + COALESCE(ac.damage_fine_amount, 0)
+                WHEN col.id IS NOT NULL THEN col.subtotal_amount
                 ELSE b.subtotal_amount
               END AS subtotal_amount,
-              CASE WHEN p.audit_check_id IS NOT NULL THEN 0 ELSE b.discount_amount END AS discount_amount,
-              CASE WHEN p.audit_check_id IS NOT NULL THEN ac.vat_amount ELSE b.vat_amount END AS vat_amount,
-              CASE WHEN p.audit_check_id IS NOT NULL THEN ac.total_fine_amount ELSE b.total_amount END AS total_amount,
+              CASE WHEN p.audit_check_id IS NOT NULL OR col.id IS NOT NULL THEN 0 ELSE b.discount_amount END AS discount_amount,
+              CASE WHEN p.audit_check_id IS NOT NULL THEN ac.vat_amount WHEN col.id IS NOT NULL THEN col.vat_amount ELSE b.vat_amount END AS vat_amount,
+              CASE WHEN p.audit_check_id IS NOT NULL THEN ac.total_fine_amount WHEN col.id IS NOT NULL THEN col.total_amount ELSE b.total_amount END AS total_amount,
               m.id AS market_id, m.name AS market_name,
-              mu.username_enc, mu.first_name_enc, mu.last_name_enc,
+              mu.username_enc, mu.first_name_enc, mu.last_name_enc, col.customer_reference_enc,
               ad.id AS document_id, ad.document_type, ad.document_no, ad.document_status, ad.issue_date,
               o.name AS organization_name, o.address AS organization_address, o.email AS organization_email, o.phone AS organization_phone,
               o.vat_enabled, o.vat_rate, o.registered_name, o.registered_tax_id, o.registered_subdistrict,
@@ -6289,11 +6318,12 @@ router.get(
        FROM payments p
        LEFT JOIN payment_attempts pa ON pa.id = p.payment_attempt_id AND pa.organization_id = p.organization_id
        LEFT JOIN bookings b ON b.id = p.booking_id AND b.organization_id = p.organization_id
+       LEFT JOIN audit_collections col ON col.payment_id = p.id AND col.organization_id = p.organization_id
        LEFT JOIN audit_checks ac ON ac.id = p.audit_check_id AND ac.organization_id = p.organization_id
        LEFT JOIN booking_items ac_bi ON ac_bi.id = ac.booking_item_id AND ac_bi.organization_id = ac.organization_id
        LEFT JOIN bookings ac_b ON ac_b.id = ac_bi.booking_id AND ac_b.organization_id = ac_bi.organization_id
        LEFT JOIN organizations o ON o.id = p.organization_id
-       LEFT JOIN markets m ON m.id = COALESCE(b.market_id, ac.market_id) AND m.organization_id = p.organization_id
+       LEFT JOIN markets m ON m.id = COALESCE(b.market_id, ac.market_id, col.market_id) AND m.organization_id = p.organization_id
        LEFT JOIN mobile_users mu ON mu.id = COALESCE(b.mobile_user_id, ac_b.mobile_user_id) AND mu.organization_id = p.organization_id
        LEFT JOIN accounting_documents ad
          ON ad.id = (
@@ -6318,11 +6348,13 @@ router.get(
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          AND (:marketId IS NULL OR m.id = :marketId)
          AND (:paymentChannel IS NULL OR pa.payment_method = :paymentChannel
-           OR (:paymentChannel = 'MANUAL_TRANSFER' AND p.provider = 'manual'))
+           OR (:paymentChannel = 'CASH' AND p.provider = 'manual' AND p.provider_reference = 'CASH')
+           OR (:paymentChannel = 'MANUAL_TRANSFER' AND p.provider = 'manual' AND COALESCE(p.provider_reference, '') <> 'CASH'))
          AND (:paidOnly = 0 OR p.status = 'paid')
          AND (:paidOnly = 0 OR (
            (p.booking_id IS NOT NULL AND b.status = 'paid')
            OR (p.audit_check_id IS NOT NULL AND ac.fine_payment_status = 'paid')
+           OR (p.booking_id IS NULL AND p.audit_check_id IS NULL AND col.status = 'paid')
          ))
          ${dateFilter.sql}
        GROUP BY p.id, p.public_id, p.provider, p.status, p.amount, p.paid_at, p.created_at,
@@ -6330,6 +6362,7 @@ router.get(
                 p.audit_check_id, b.public_id, b.subtotal_amount, b.discount_amount, b.vat_amount, b.total_amount,
                 ac.id, ac.fine_amount, ac.accessories_fine_amount, ac.damage_fine_amount, ac.vat_amount, ac.total_fine_amount,
                 ac_b.public_id,
+                col.id, col.public_id, col.subtotal_amount, col.vat_amount, col.total_amount, col.customer_reference_enc, col.created_at,
                 m.id, m.name, mu.username_enc, mu.first_name_enc, mu.last_name_enc,
                 ad.id, ad.document_type, ad.document_no, ad.document_status, ad.issue_date,
                 o.name, o.address, o.email, o.phone, o.vat_enabled, o.vat_rate, o.registered_name,
@@ -6350,7 +6383,8 @@ router.get(
       res,
       rows.map((row) => ({
         ...row,
-        customer_name: [decryptField(row.first_name_enc), decryptField(row.last_name_enc)].filter(Boolean).join(' ').trim() || decryptField(row.username_enc) || '-',
+        customer_name: decryptField(row.customer_reference_enc) || [decryptField(row.first_name_enc), decryptField(row.last_name_enc)].filter(Boolean).join(' ').trim() || decryptField(row.username_enc) || '-',
+        customer_reference_enc: undefined,
         username_enc: undefined,
         first_name_enc: undefined,
         last_name_enc: undefined,
@@ -6380,13 +6414,14 @@ router.get(
     const rows = await query(
       `SELECT ad.id, ad.document_type, ad.document_no, ad.document_status, ad.issue_date,
               ad.subtotal_amount, ad.discount_amount, ad.vat_amount, ad.withholding_tax_amount, ad.total_amount,
-              ad.customer_name, ad.cancel_reason, ad.cancelled_at,
-              p.public_id AS payment_public_id, COALESCE(b.public_id, ac_b.public_id) AS booking_public_id,
+              ad.customer_name, col.customer_reference_enc, ad.cancel_reason, ad.cancelled_at,
+              p.public_id AS payment_public_id, COALESCE(b.public_id, ac_b.public_id, col.public_id) AS booking_public_id,
               source.document_no AS source_document_no,
               issuer.name_enc AS issued_by_name_enc,
               canceller.name_enc AS cancelled_by_name_enc
        FROM accounting_documents ad
-       LEFT JOIN payments p ON p.id = ad.payment_id
+       LEFT JOIN payments p ON p.id = ad.payment_id AND p.organization_id = ad.organization_id
+       LEFT JOIN audit_collections col ON col.payment_id = p.id AND col.organization_id = ad.organization_id
        LEFT JOIN bookings b ON b.id = ad.booking_id
        LEFT JOIN audit_checks ac ON ac.id = ad.audit_check_id AND ac.organization_id = ad.organization_id
        LEFT JOIN booking_items ac_bi ON ac_bi.id = ac.booking_item_id AND ac_bi.organization_id = ac.organization_id
@@ -6395,7 +6430,7 @@ router.get(
        LEFT JOIN admin_users issuer ON issuer.id = ad.issued_by_admin_id
        LEFT JOIN admin_users canceller ON canceller.id = ad.cancelled_by_admin_id
        LEFT JOIN admin_market_assignments ama
-         ON ama.market_id = COALESCE(b.market_id, ac.market_id) AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         ON ama.market_id = COALESCE(b.market_id, ac.market_id, col.market_id) AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE ad.organization_id = :organizationId
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          AND (:startDate IS NULL OR ad.issue_date >= :startDate)
@@ -6406,7 +6441,7 @@ router.get(
            :keyword = ''
            OR ad.document_no LIKE :keywordLike
            OR ad.customer_name LIKE :keywordLike
-           OR COALESCE(b.public_id, ac_b.public_id) LIKE :keywordLike
+           OR COALESCE(b.public_id, ac_b.public_id, col.public_id) LIKE :keywordLike
            OR p.public_id LIKE :keywordLike
          )
        ORDER BY ad.issue_date DESC, ad.id DESC
@@ -6425,6 +6460,8 @@ router.get(
     );
     return ok(res, rows.map((row) => ({
       ...row,
+      customer_name: decryptField(row.customer_reference_enc) || row.customer_name,
+      customer_reference_enc: undefined,
       document_type_label: accountingDocumentTypeLabel(row.document_type),
       issued_by_name: decryptField(row.issued_by_name_enc) || '-',
       cancelled_by_name: decryptField(row.cancelled_by_name_enc) || '-',
@@ -6451,18 +6488,19 @@ router.get(
     const { startDate, endDate } = req.validated.query;
     const rows = await query(
       `SELECT ad.id, ad.document_type, ad.document_no, ad.document_status, ad.issue_date,
-              ad.customer_name, ad.subtotal_amount, ad.discount_amount, ad.vat_amount, ad.total_amount,
+              ad.customer_name, col.customer_reference_enc, ad.subtotal_amount, ad.discount_amount, ad.vat_amount, ad.total_amount,
               source.document_no AS source_document_no,
-              COALESCE(b.public_id, ac_b.public_id) AS booking_public_id, p.public_id AS payment_public_id
+              COALESCE(b.public_id, ac_b.public_id, col.public_id) AS booking_public_id, p.public_id AS payment_public_id
        FROM accounting_documents ad
        LEFT JOIN accounting_documents source ON source.id = ad.source_document_id
        LEFT JOIN bookings b ON b.id = ad.booking_id
        LEFT JOIN audit_checks ac ON ac.id = ad.audit_check_id AND ac.organization_id = ad.organization_id
        LEFT JOIN booking_items ac_bi ON ac_bi.id = ac.booking_item_id AND ac_bi.organization_id = ac.organization_id
        LEFT JOIN bookings ac_b ON ac_b.id = ac_bi.booking_id AND ac_b.organization_id = ac_bi.organization_id
-       LEFT JOIN payments p ON p.id = ad.payment_id
+       LEFT JOIN payments p ON p.id = ad.payment_id AND p.organization_id = ad.organization_id
+       LEFT JOIN audit_collections col ON col.payment_id = p.id AND col.organization_id = ad.organization_id
        LEFT JOIN admin_market_assignments ama
-         ON ama.market_id = COALESCE(b.market_id, ac.market_id) AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         ON ama.market_id = COALESCE(b.market_id, ac.market_id, col.market_id) AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE ad.organization_id = :organizationId
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
          AND ad.document_type IN ('tax_invoice', 'credit_note')
@@ -6483,6 +6521,8 @@ router.get(
       const sign = row.document_type === 'credit_note' ? -1 : 1;
       return {
         ...row,
+        customer_name: decryptField(row.customer_reference_enc) || row.customer_name,
+        customer_reference_enc: undefined,
         document_type_label: accountingDocumentTypeLabel(row.document_type),
         taxable_amount: sign * Math.max(Number(row.subtotal_amount || 0) - Number(row.discount_amount || 0), 0),
         vat_report_amount: sign * Number(row.vat_amount || 0),
@@ -6602,11 +6642,11 @@ router.get(
     });
     const rows = await query(
       `SELECT p.id, p.public_id AS payment_public_id, p.provider, p.provider_reference,
-              CASE WHEN p.audit_check_id IS NOT NULL THEN 'audit_fine' ELSE 'booking' END AS payment_kind,
+              CASE WHEN p.audit_check_id IS NOT NULL THEN 'audit_fine' WHEN col.id IS NOT NULL THEN 'audit_collection' ELSE 'booking' END AS payment_kind,
               p.status AS payment_status, p.amount AS payment_amount, p.paid_at, p.created_at,
-              COALESCE(b.public_id, ac_b.public_id) AS booking_public_id,
-              CASE WHEN p.audit_check_id IS NOT NULL THEN ac.fine_payment_status ELSE b.status END AS booking_status,
-              CASE WHEN p.audit_check_id IS NOT NULL THEN ac.total_fine_amount ELSE b.total_amount END AS booking_amount,
+              COALESCE(b.public_id, ac_b.public_id, col.public_id) AS booking_public_id,
+              CASE WHEN p.audit_check_id IS NOT NULL THEN ac.fine_payment_status WHEN col.id IS NOT NULL THEN col.status ELSE b.status END AS booking_status,
+              CASE WHEN p.audit_check_id IS NOT NULL THEN ac.total_fine_amount WHEN col.id IS NOT NULL THEN col.total_amount ELSE b.total_amount END AS booking_amount,
               m.name AS market_name,
               ad.document_no, ad.document_type,
               (
@@ -6617,10 +6657,11 @@ router.get(
               ) AS callback_count
        FROM payments p
        LEFT JOIN bookings b ON b.id = p.booking_id AND b.organization_id = p.organization_id
+       LEFT JOIN audit_collections col ON col.payment_id = p.id AND col.organization_id = p.organization_id
        LEFT JOIN audit_checks ac ON ac.id = p.audit_check_id AND ac.organization_id = p.organization_id
        LEFT JOIN booking_items ac_bi ON ac_bi.id = ac.booking_item_id AND ac_bi.organization_id = ac.organization_id
        LEFT JOIN bookings ac_b ON ac_b.id = ac_bi.booking_id AND ac_b.organization_id = ac_bi.organization_id
-       LEFT JOIN markets m ON m.id = COALESCE(b.market_id, ac.market_id) AND m.organization_id = p.organization_id
+       LEFT JOIN markets m ON m.id = COALESCE(b.market_id, ac.market_id, col.market_id) AND m.organization_id = p.organization_id
        LEFT JOIN accounting_documents ad
          ON ad.id = (
            SELECT ad2.id
@@ -6677,10 +6718,10 @@ router.get(
     const { startDate, endDate } = req.validated.query;
     const rows = await query(
       `SELECT ad.id, 'credit_note' AS refund_type, ad.document_no, ad.document_status, ad.issue_date,
-              ad.customer_name, NULL AS username_enc, NULL AS first_name_enc, NULL AS last_name_enc,
+              ad.customer_name, NULL AS username_enc, NULL AS first_name_enc, NULL AS last_name_enc, col.customer_reference_enc,
               ad.total_amount, ad.cancel_reason AS reason,
               source.document_no AS source_document_no,
-              COALESCE(b.public_id, ac_b.public_id) AS booking_public_id, p.public_id AS payment_public_id,
+              COALESCE(b.public_id, ac_b.public_id, col.public_id) AS booking_public_id, p.public_id AS payment_public_id,
               issuer.name_enc AS issued_by_name_enc
        FROM accounting_documents ad
        LEFT JOIN accounting_documents source ON source.id = ad.source_document_id
@@ -6688,10 +6729,11 @@ router.get(
        LEFT JOIN audit_checks ac ON ac.id = ad.audit_check_id AND ac.organization_id = ad.organization_id
        LEFT JOIN booking_items ac_bi ON ac_bi.id = ac.booking_item_id AND ac_bi.organization_id = ac.organization_id
        LEFT JOIN bookings ac_b ON ac_b.id = ac_bi.booking_id AND ac_b.organization_id = ac_bi.organization_id
-       LEFT JOIN payments p ON p.id = ad.payment_id
+       LEFT JOIN payments p ON p.id = ad.payment_id AND p.organization_id = ad.organization_id
+       LEFT JOIN audit_collections col ON col.payment_id = p.id AND col.organization_id = ad.organization_id
        LEFT JOIN admin_users issuer ON issuer.id = ad.issued_by_admin_id
        LEFT JOIN admin_market_assignments ama
-         ON ama.market_id = COALESCE(b.market_id, ac.market_id) AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         ON ama.market_id = COALESCE(b.market_id, ac.market_id, col.market_id) AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE ad.organization_id = :organizationId
          AND ad.document_type = 'credit_note'
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
@@ -6701,18 +6743,19 @@ router.get(
        SELECT p.id, 'payment_refund' AS refund_type, p.public_id AS document_no, p.status AS document_status,
               DATE(COALESCE(p.paid_at, p.created_at)) AS issue_date,
               NULL AS customer_name,
-              mu.username_enc, mu.first_name_enc, mu.last_name_enc,
+              mu.username_enc, mu.first_name_enc, mu.last_name_enc, col.customer_reference_enc,
               p.amount AS total_amount, COALESCE(b.comment, ac.note) AS reason,
-              NULL AS source_document_no, COALESCE(b.public_id, ac_b.public_id) AS booking_public_id, p.public_id AS payment_public_id,
+              NULL AS source_document_no, COALESCE(b.public_id, ac_b.public_id, col.public_id) AS booking_public_id, p.public_id AS payment_public_id,
               NULL AS issued_by_name_enc
        FROM payments p
        LEFT JOIN bookings b ON b.id = p.booking_id AND b.organization_id = p.organization_id
+       LEFT JOIN audit_collections col ON col.payment_id = p.id AND col.organization_id = p.organization_id
        LEFT JOIN audit_checks ac ON ac.id = p.audit_check_id AND ac.organization_id = p.organization_id
        LEFT JOIN booking_items ac_bi ON ac_bi.id = ac.booking_item_id AND ac_bi.organization_id = ac.organization_id
        LEFT JOIN bookings ac_b ON ac_b.id = ac_bi.booking_id AND ac_b.organization_id = ac_bi.organization_id
        LEFT JOIN mobile_users mu ON mu.id = COALESCE(b.mobile_user_id, ac_b.mobile_user_id) AND mu.organization_id = p.organization_id
        LEFT JOIN admin_market_assignments ama
-         ON ama.market_id = COALESCE(b.market_id, ac.market_id) AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
+         ON ama.market_id = COALESCE(b.market_id, ac.market_id, col.market_id) AND ama.admin_user_id = :adminUserId AND ama.status = 'active'
        WHERE p.organization_id = :organizationId
          AND p.status IN ('refunded', 'cancelled')
          AND (:hasGlobalMarketAccess = 1 OR ama.id IS NOT NULL)
@@ -6730,9 +6773,10 @@ router.get(
     );
     return ok(res, rows.map((row) => ({
       ...row,
-      customer_name: row.refund_type === 'payment_refund'
+      customer_name: decryptField(row.customer_reference_enc) || (row.refund_type === 'payment_refund'
         ? [decryptField(row.first_name_enc), decryptField(row.last_name_enc)].filter(Boolean).join(' ').trim() || decryptField(row.username_enc) || '-'
-        : row.customer_name || '-',
+        : row.customer_name || '-'),
+      customer_reference_enc: undefined,
       issued_by_name: decryptField(row.issued_by_name_enc) || '-',
       username_enc: undefined,
       first_name_enc: undefined,
@@ -6781,7 +6825,7 @@ router.patch(
   asyncHandler(async (req, res) => {
     const result = await transaction(async (conn) => {
       const [documents] = await conn.execute(
-        `SELECT id, document_type, document_no, payment_id
+        `SELECT id, document_type, document_no, payment_id, booking_id, audit_check_id
          FROM accounting_documents
          WHERE id = :documentId
            AND organization_id = :organizationId
@@ -6792,6 +6836,7 @@ router.patch(
       );
       const document = documents[0];
       if (!document) throw notFound('Issued document not found');
+      await assertCollectionDocumentAccess(conn, req.auth, document);
 
       await conn.execute(
         `UPDATE accounting_documents
@@ -6839,6 +6884,7 @@ router.post(
       );
       const source = documents[0];
       if (!source) throw notFound('Source document not found');
+      await assertCollectionDocumentAccess(conn, req.auth, source);
 
       const [existing] = await conn.execute(
         `SELECT *

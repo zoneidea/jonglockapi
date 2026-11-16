@@ -5,6 +5,14 @@ const { blindIndex } = require('../utils/crypto');
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 const REDACTED = '[REDACTED]';
 const SENSITIVE_KEYS = new Set([
+  'search',
+  'customerreference',
+  'customer_reference_enc',
+  'note',
+  'note_enc',
+  'qrpayload',
+  'qrimageurl',
+  'proof_enc',
   'recipientdetails',
   'details',
   'settings',

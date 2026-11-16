@@ -55,6 +55,20 @@ npm run lint
 npm test
 ```
 
+## Jonglock Audit แยกและ POS
+
+แอปแยกอยู่ที่ [jonglockaudit](https://github.com/zoneidea/jonglockaudit) และใช้ API ออดิทเดิมร่วมกับ `GET /api/mobile/audit/markets`, `GET /api/mobile/audit/markets/:marketId/collection-catalog`, `POST /api/mobile/audit/collections`, `POST /api/mobile/audit/checks/:auditCheckId/collection`, `GET /api/mobile/audit/collections` และ API สถานะ/แนบสลิปของแต่ละ collection
+
+ติดตั้ง migrations `060_audit_collections.sql`, `061_audit_web_merchants.sql` และ `062_audit_collection_requests.sql` ด้วย `npm run migrate` ก่อนเปิด code รุ่นนี้ โดยมี initializer ของ collections, merchants และ request fence รองรับการ initialize ซ้ำบน host ใหม่ ห้ามย้อนกลับด้วยการลบตารางที่มีรายการรับเงินจริง
+
+POS ใช้บริการเสริม active ของตลาด `collection_mode = self` โดยไม่ต้องมีบูธหรือการจอง ราคาจริงและ VAT คำนวณที่ Backend; ข้อมูลผู้ค้า หมายเหตุ QR และสลิปเก็บเข้ารหัส
+
+Web App รองรับเงินสด (ต้องยืนยัน expectedAmount) และพร้อมเพย์ พร้อมค้นชื่อผู้ค้าเดิมในตลาดหรือสร้าง ID ใหม่ ชื่อเข้ารหัสและไม่สร้างบัญชี login ปลอม
+
+QR ใช้รูปที่องค์กรตั้งค่าไว้ก่อน PromptPay ID และใช้การตั้งค่ารับเงิน manual ขององค์กร ไม่ข้ามนโยบาย gateway-only การแนบสลิปจะรอให้ supervisor/admin/accounting ตรวจผ่าน `/api/management/markets/:marketId/audit-collections`, `/api/management/audit-collections/:collectionId/proof` และ PATCH `/api/management/audit-collections/:collectionId/proof-status` ก่อนยืนยัน `paid` รายการ POS ที่อนุมัติแล้วรวมในรายงานบัญชีและออกเอกสารผ่าน API เดิมได้ โดยยังไม่เพิ่มหน้าจอ frontend management ใหม่
+
+รายละเอียด payload, response, สิทธิ์, idempotency และขั้นตอนทดสอบอยู่ใน [API Contract ของแอป Audit](https://github.com/zoneidea/jonglockaudit/blob/main/docs/API_CONTRACT.md)
+
 ## Initial Supervisor
 
 ```bash
