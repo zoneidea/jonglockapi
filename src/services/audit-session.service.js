@@ -1,7 +1,6 @@
 const jwt = require('jsonwebtoken');
 const env = require('../config/env');
 const {query} = require('../config/db');
-const {signToken} = require('../middlewares/auth');
 const {decryptField} = require('../utils/crypto');
 const {unauthorized} = require('../utils/errors');
 const name = 'jonglock_audit_session';
@@ -35,7 +34,7 @@ async function restore(req) {
   const marketIds = assignments.map(row => Number(row.market_id));
   const remaining = payload.exp - Math.floor(Date.now() / 1000);
   if (remaining <= 0) throw unauthorized('เซสชันหมดอายุ');
-  const token = signToken({sub: user.id, userType: 'audit', role: 'audit', organizationId: user.organization_id, marketIds}, {expiresIn: remaining});
+  const token = jwt.sign({sub: user.id, userType: 'audit', role: 'audit', organizationId: user.organization_id, marketIds, exp: payload.exp}, env.JWT_SECRET, {issuer: 'jonglock-backend'});
   return {token, user: {id: user.id, role: 'audit', name: decryptField(user.name_enc), organizationId: user.organization_id,
     organizationCode: user.organization_code, organizationName: user.organization_name, marketIds}};
 }
