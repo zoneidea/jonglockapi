@@ -63,6 +63,8 @@ npm test
 
 POS ใช้บริการเสริม active ของตลาด `collection_mode = self` โดยไม่ต้องมีบูธหรือการจอง ราคาจริงและ VAT คำนวณที่ Backend; ข้อมูลผู้ค้า หมายเหตุ QR และสลิปเก็บเข้ารหัส
 
+POS รองรับ `rentAmount` เป็นค่าเช่าแผงก่อน VAT และเรียกเก็บค่าเช่าอย่างเดียวได้โดยไม่ต้องมีบริการเสริม บันทึกลง lines_json เดิมจึงไม่ต้องเพิ่ม migration ให้ deploy Backend ก่อน Web App รุ่นที่ส่ง field นี้
+
 Web App รองรับเงินสด (ต้องยืนยัน expectedAmount) และพร้อมเพย์ พร้อมค้นชื่อผู้ค้าเดิมในตลาดหรือสร้าง ID ใหม่ ชื่อเข้ารหัสและไม่สร้างบัญชี login ปลอม
 
 QR ใช้รูปที่องค์กรตั้งค่าไว้ก่อน PromptPay ID และใช้การตั้งค่ารับเงิน manual ขององค์กร ไม่ข้ามนโยบาย gateway-only การแนบสลิปจะรอให้ supervisor/admin/accounting ตรวจผ่าน `/api/management/markets/:marketId/audit-collections`, `/api/management/audit-collections/:collectionId/proof` และ PATCH `/api/management/audit-collections/:collectionId/proof-status` ก่อนยืนยัน `paid` รายการ POS ที่อนุมัติแล้วรวมในรายงานบัญชีและออกเอกสารผ่าน API เดิมได้ โดยยังไม่เพิ่มหน้าจอ frontend management ใหม่

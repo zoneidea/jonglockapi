@@ -157,6 +157,9 @@ async function create(auth, input, key) {
     if (check) {
       total = { totalAmount: Number(check.total_fine_amount), vatAmount: Number(check.vat_amount || 0), subtotalAmount: Number(check.total_fine_amount) - Number(check.vat_amount || 0) };
     } else {
+      const rentAmount = input.draft.rentAmount ?? 0;
+      if (!Number.isFinite(rentAmount) || rentAmount < 0 || rentAmount > 99999999.99
+        || Math.abs(rentAmount * 100 - Math.round(rentAmount * 100)) > 0.000001) throw badRequest('ค่าเช่าแผงไม่ถูกต้อง');
       const ids = input.draft.lines.map(line => line.itemId);
       if (new Set(ids).size !== ids.length) throw badRequest('Duplicate catalog items');
       const available = await execute(conn, `SELECT id, name, price FROM accessories WHERE organization_id = :organizationId
@@ -166,6 +169,7 @@ async function create(auth, input, key) {
         if (!item) throw badRequest('Catalog item is not available');
         return { itemId: line.itemId, name: item.name, quantity: line.quantity, unitPrice: Number(item.price), lineTotal: Math.round(Number(item.price) * 100) * line.quantity / 100 };
       });
+      if (rentAmount > 0) lines.unshift({kind: 'rent', name: 'ค่าเช่าแผง', quantity: 1, unitPrice: rentAmount, lineTotal: rentAmount});
       total = calculateVatBreakdown(lines.reduce((sum, line) => sum + line.lineTotal, 0), 0, await getOrganizationVatSettings(conn, auth.organizationId));
     }
     if (!(total.totalAmount > 0) || total.totalAmount > 99999999.99) throw badRequest('Invalid collection total');

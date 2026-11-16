@@ -21,8 +21,10 @@ const id = value => parse(z.coerce.number().int().positive(), value);
 const key = req => parse(z.string().min(16).max(160).regex(/^[A-Za-z0-9_-]+$/), req.get('Idempotency-Key'));
 const pos = z.object({ marketId: z.number().int().positive(), customerReference: z.string().trim().min(1).max(200), note: z.string().max(2000).default(''),
   merchantId: z.number().int().positive().optional(), customerId: z.number().int().positive().optional(), persistMerchant: z.boolean().optional(),
+  rentAmount: z.number().finite().min(0).max(99999999.99).refine(value => Math.abs(value * 100 - Math.round(value * 100)) < 0.000001, 'Invalid rent precision').optional(),
   paymentMethod: z.enum(['cash', 'promptpay']).default('promptpay'), expectedAmount: z.number().positive().max(99999999.99).optional(),
-  lines: z.array(z.object({ itemId: z.number().int().positive(), quantity: z.number().int().min(1).max(999) }).strict()).min(1).max(100) }).strict()
+  lines: z.array(z.object({ itemId: z.number().int().positive(), quantity: z.number().int().min(1).max(999) }).strict()).max(100).default([]) }).strict()
+  .refine(body => body.lines.length > 0 || (body.rentAmount || 0) > 0, 'Add rent or catalog items')
   .refine(body => !(body.merchantId && body.customerId), 'Choose one merchant identity');
 
 mobile.use(authenticate, requireRoles('audit'), collectionLog);

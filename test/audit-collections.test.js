@@ -195,3 +195,34 @@ test('an existing unpaid audit PromptPay bill converts to one cash receipt; revi
   await assert.rejects(service.create(auth, {kind: 'audit', auditCheckId: 22, paymentMethod: 'cash', expectedAmount: 30}, 'audit-waiting-cash1'), {code: 'COLLECTION_NOT_PAYABLE'});
   assert.equal(payments.length, before + 1);
 });
+
+test('POS rent is a stored bill line, taxed with services, and cash retries do not duplicate payments', async () => {
+  const combined = await service.create(auth, {...input, draft: {...input.draft, rentAmount: 100.25}}, 'rent-combined-00001');
+  assert.equal(combined.amount, 139.69);
+  const bill = collections.find(row => row.id === combined.id);
+  const lines = JSON.parse(bill.lines_json);
+  assert.deepEqual(lines[0], {kind: 'rent', name: 'ค่าเช่าแผง', quantity: 1, unitPrice: 100.25, lineTotal: 100.25});
+  assert.equal(lines[1].unitPrice, 10.10);
+  const cashInput = {...input, draft: {...input.draft, rentAmount: 100.25, lines: []}, paymentMethod: 'cash', expectedAmount: 107.27};
+  const cash = await service.create(auth, cashInput, 'rent-cash-only-001');
+  assert.equal(cash.amount, 107.27); assert.equal(cash.status, 'paid');
+  const count = payments.length;
+  const replay = await service.create(auth, cashInput, 'rent-cash-only-001');
+  assert.equal(replay.id, cash.id); assert.equal(payments.length, count);
+  await assert.rejects(service.create(auth, {...cashInput, expectedAmount: 100.25}, 'rent-stale-total-01'), e => e.code === 'COLLECTION_TOTAL_CHANGED');
+});
+test('HTTP accepts rent without catalog items and rejects invalid rent or empty bills before writes', async () => {
+  const server = app.listen(0, '127.0.0.1'); await new Promise(resolve => server.once('listening', resolve));
+  const url = `http://127.0.0.1:${server.address().port}/mobile/collections`;
+  const send = (body, key) => fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json', 'Idempotency-Key': key}, body: JSON.stringify(body)});
+  try {
+    const created = await send({marketId: 2, customerReference: 'Rent only', rentAmount: 100.25, paymentMethod: 'cash', expectedAmount: 107.27}, 'rent-http-only-001');
+    assert.equal(created.status, 201); assert.equal((await created.json()).data.amount, 107.27);
+    const count = collections.length;
+    for (const rentAmount of [-1, 0, 1.001, 100000000, '100']) {
+      const invalid = await send({marketId: 2, customerReference: 'Invalid', lines: [], rentAmount}, 'rent-invalid-00001');
+      assert.equal(invalid.status, 400);
+    }
+    assert.equal(collections.length, count);
+  } finally {await new Promise(resolve => server.close(resolve));}
+});
